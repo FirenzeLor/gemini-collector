@@ -1,0 +1,145 @@
+import React from "react";
+import { Conversation } from "../data/mockData";
+import { useTheme } from "../theme";
+
+interface TopBarProps {
+  selectedConversation: Conversation | null;
+  sidebarCollapsed: boolean;
+  onToggleSidebar: () => void;
+  isDark: boolean;
+  onToggleDark: () => void;
+  onLogout: () => void;
+}
+
+export function TopBar({
+  selectedConversation, sidebarCollapsed, onToggleSidebar,
+  isDark, onToggleDark, onLogout,
+}: TopBarProps) {
+  const t = useTheme();
+
+  return (
+    <div
+      data-tauri-drag-region
+      style={{
+        height: 52,
+        flexShrink: 0,
+        display: "flex",
+        alignItems: "center",
+        paddingLeft: 12,
+        paddingRight: 12,
+        position: "relative",
+        background: t.topBarBg,
+      }}
+    >
+      {/* Toggle sidebar button */}
+      <button
+        onClick={onToggleSidebar}
+        title={sidebarCollapsed ? "展开侧边栏" : "收起侧边栏"}
+        style={{
+          ...iconBtn(t.btnHoverBg),
+          marginLeft: sidebarCollapsed ? 68 : 0,
+          transition: "background 0.15s, margin-left 0.25s cubic-bezier(0.4,0,0.2,1)",
+        }}
+        onMouseEnter={(e) => ((e.currentTarget as HTMLElement).style.background = t.btnHoverBg)}
+        onMouseLeave={(e) => ((e.currentTarget as HTMLElement).style.background = "transparent")}
+      >
+        <SidebarIcon collapsed={sidebarCollapsed} color={t.textSub} />
+      </button>
+
+      {/* Title - centered in right panel */}
+      {selectedConversation && (
+        <div style={{ position: "absolute", left: "50%", transform: "translateX(-50%)", textAlign: "center", pointerEvents: "none", whiteSpace: "nowrap" }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: t.text }}>{selectedConversation.title}</div>
+          <div style={{ fontSize: 11, color: t.textSub, marginTop: 1 }}>
+            {selectedConversation.messages.length} 条消息 · {selectedConversation.updatedAt}
+          </div>
+        </div>
+      )}
+
+      {/* Right: dark mode toggle + logout */}
+      <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 4 }}>
+        {/* Dark mode toggle */}
+        <button
+          onClick={onToggleDark}
+          title={isDark ? "切换到亮色模式" : "切换到暗色模式"}
+          style={iconBtn(t.btnHoverBg)}
+          onMouseEnter={(e) => ((e.currentTarget as HTMLElement).style.background = t.btnHoverBg)}
+          onMouseLeave={(e) => ((e.currentTarget as HTMLElement).style.background = "transparent")}
+        >
+          {isDark ? <SunIcon color={t.textSub} /> : <MoonIcon color={t.textSub} />}
+        </button>
+
+        {/* Logout */}
+        <button
+          onClick={onLogout}
+          title="退出账号"
+          style={iconBtn(t.btnHoverBg)}
+          onMouseEnter={(e) => ((e.currentTarget as HTMLElement).style.background = t.btnHoverBg)}
+          onMouseLeave={(e) => ((e.currentTarget as HTMLElement).style.background = "transparent")}
+        >
+          <LogoutIcon color={t.textSub} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function iconBtn(hoverBg: string): React.CSSProperties {
+  return {
+    width: 28,
+    height: 28,
+    borderRadius: 7,
+    border: "none",
+    background: "transparent",
+    cursor: "pointer",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    flexShrink: 0,
+    transition: "background 0.15s",
+  };
+}
+
+function SidebarIcon({ collapsed, color }: { collapsed: boolean; color: string }) {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+      style={{ transform: collapsed ? "rotate(180deg)" : "none", transition: "transform 0.25s cubic-bezier(0.4,0,0.2,1)" }}>
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+      <line x1="9" y1="3" x2="9" y2="21" />
+    </svg>
+  );
+}
+
+function MoonIcon({ color }: { color: string }) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+    </svg>
+  );
+}
+
+function SunIcon({ color }: { color: string }) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="5" />
+      <line x1="12" y1="1" x2="12" y2="3" />
+      <line x1="12" y1="21" x2="12" y2="23" />
+      <line x1="4.22" y1="4.22" x2="5.64" y2="5.64" />
+      <line x1="18.36" y1="18.36" x2="19.78" y2="19.78" />
+      <line x1="1" y1="12" x2="3" y2="12" />
+      <line x1="21" y1="12" x2="23" y2="12" />
+      <line x1="4.22" y1="19.78" x2="5.64" y2="18.36" />
+      <line x1="18.36" y1="5.64" x2="19.78" y2="4.22" />
+    </svg>
+  );
+}
+
+function LogoutIcon({ color }: { color: string }) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+      <polyline points="16 17 21 12 16 7" />
+      <line x1="21" y1="12" x2="9" y2="12" />
+    </svg>
+  );
+}
