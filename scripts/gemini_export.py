@@ -290,9 +290,15 @@ def discover_email_authuser_mapping(cookies):
 # 主导出类
 # ============================================================================
 class GeminiExporter:
-    def __init__(self, cookies: dict, user=None):
+    def __init__(self, cookies: dict, user=None, account_id=None, account_email=None):
         self.cookies = cookies
         self.user_spec = str(user).strip() if user is not None else None
+        self.account_id_override = str(account_id).strip() if account_id else None
+        if self.account_id_override == "":
+            self.account_id_override = None
+        self.account_email_override = str(account_email).strip().lower() if account_email else None
+        if self.account_email_override == "":
+            self.account_email_override = None
         self.authuser = None
         self.client = httpx.Client(
             cookies=cookies,
@@ -412,6 +418,14 @@ class GeminiExporter:
         if last_err:
             raise last_err
         raise RuntimeError("GET 请求失败")
+
+    @staticmethod
+    def email_to_account_id(email):
+        """账号目录 ID：沿用原规则（邮箱小写后将非字母数字替换为下划线）。"""
+        if not isinstance(email, str):
+            email = str(email or "")
+        normalized = email.strip().lower()
+        return re.sub(r"[^a-z0-9]", "_", normalized)
 
     @staticmethod
     def _to_iso_utc(ts):
@@ -536,51 +550,64 @@ class GeminiExporter:
     # ------------------------------------------------------------------
     # 获取聊天列表
     # ------------------------------------------------------------------
+    def get_chats_page(self, cursor=None):
+        """
+        拉取单页聊天列表。
+
+        cursor 为 None 时拉第一页；否则按 next token 拉后续页。
+        返回: (items, next_cursor)
+        """
+        if cursor is None:
+            payload = json.dumps([BATCH_SIZE, None, [0, None, 1]])
+        else:
+            payload = json.dumps([BATCH_SIZE, cursor])
+
+        result = self._batchexecute("MaZiqc", payload, source_path="/app")
+
+        if not result or not isinstance(result, list):
+            return [], None
+
+        next_token = result[1] if len(result) > 1 and isinstance(result[1], str) and result[1] else None
+        raw_chats = result[2] if len(result) > 2 and isinstance(result[2], list) else []
+
+        items = []
+        for chat in raw_chats:
+            if isinstance(chat, list) and len(chat) > 1:
+                conv_id = chat[0]
+                title = chat[1] if len(chat) > 1 else ""
+                latest_update_ts = self._extract_chat_latest_update(chat)
+                items.append({
+                    "id": conv_id,
+                    "title": title,
+                    "latest_update_ts": latest_update_ts,
+                    "latest_update_iso": self._to_iso_utc(latest_update_ts),
+                })
+
+        return items, next_token
+
     def get_all_chats(self):
         """获取所有聊天列表（含分页）"""
         print("[*] 获取聊天列表...")
         all_chats = []
         page = 0
-
-        # 第一页
-        payload = json.dumps([BATCH_SIZE, None, [0, None, 1]])
-        result = self._batchexecute("MaZiqc", payload, source_path="/app")
+        cursor = None
 
         while True:
             page += 1
-
-            if not result or not isinstance(result, list):
-                print(f"  [debug] 异常响应: type={type(result)}, value={str(result)[:200]}")
+            items, next_token = self.get_chats_page(cursor)
+            if not items and not next_token:
+                if page == 1:
+                    print("  [debug] 首屏未拿到聊天列表")
                 break
 
-            if len(result) < 3 or not result[2]:
-                print(f"  [debug] 结果为空或结构异常: len={len(result)}, "
-                      f"preview={json.dumps(result, ensure_ascii=False)[:300]}")
+            all_chats.extend(items)
+            print(f"  第 {page} 页: {len(items)} 个对话 (累计 {len(all_chats)})")
+
+            if not next_token:
                 break
 
-            chats = result[2]
-            for chat in chats:
-                if isinstance(chat, list) and len(chat) > 1:
-                    conv_id = chat[0]  # e.g. "c_5c762430d8391f18"
-                    title = chat[1] if len(chat) > 1 else ""
-                    latest_update_ts = self._extract_chat_latest_update(chat)
-                    all_chats.append({
-                        "id": conv_id,
-                        "title": title,
-                        "latest_update_ts": latest_update_ts,
-                        "latest_update_iso": self._to_iso_utc(latest_update_ts),
-                    })
-
-            print(f"  第 {page} 页: {len(chats)} 个对话 (累计 {len(all_chats)})")
-
-            # 检查分页 token
-            next_token = result[1] if len(result) > 1 else None
-            if not next_token or not isinstance(next_token, str):
-                break
-
+            cursor = next_token
             time.sleep(REQUEST_DELAY)
-            payload = json.dumps([BATCH_SIZE, next_token])
-            result = self._batchexecute("MaZiqc", payload, source_path="/app")
 
         print(f"  共 {len(all_chats)} 个对话")
         return all_chats
@@ -1091,6 +1118,27 @@ class GeminiExporter:
             if authuser_candidate.isdigit():
                 authuser_str = authuser_candidate
 
+        if self.account_id_override:
+            if self.account_email_override:
+                email = self.account_email_override
+            elif self.user_spec and "@" in self.user_spec:
+                email = self.user_spec.lower()
+
+            name = email.split("@")[0] if email else self.account_id_override
+            avatar_text = (name[0].upper() if name else "?")
+            return {
+                "id": self.account_id_override,
+                "email": email or "",
+                "name": name,
+                "avatarText": avatar_text,
+                "avatarColor": "#667eea",
+                "conversationCount": 0,
+                "remoteConversationCount": None,
+                "lastSyncAt": None,
+                "lastSyncResult": None,
+                "authuser": authuser_str,
+            }
+
         if self.user_spec and "@" in self.user_spec:
             email = self.user_spec.lower()
         else:
@@ -1107,7 +1155,7 @@ class GeminiExporter:
                 pass
 
         if email:
-            safe_id = re.sub(r"[^a-z0-9]", "_", email.lower())
+            safe_id = self.email_to_account_id(email)
             name = email.split("@")[0]
             return {
                 "id": safe_id,
@@ -1212,6 +1260,75 @@ class GeminiExporter:
         (Path(account_dir) / "sync_state.json").write_text(
             json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+
+    @staticmethod
+    def _load_sync_state(account_dir):
+        """读取 accounts/{id}/sync_state.json，失败时返回空 dict。"""
+        sync_file = Path(account_dir) / "sync_state.json"
+        if not sync_file.exists():
+            return {}
+        try:
+            data = json.loads(sync_file.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _load_conversations_index(account_dir):
+        """
+        读取 accounts/{id}/conversations.json。
+        返回: (ordered_ids, index_map)
+        """
+        conv_file = Path(account_dir) / "conversations.json"
+        if not conv_file.exists():
+            return [], {}
+        try:
+            data = json.loads(conv_file.read_text(encoding="utf-8"))
+        except Exception:
+            return [], {}
+
+        items = data.get("items", []) if isinstance(data, dict) else []
+        if not isinstance(items, list):
+            return [], {}
+
+        ordered_ids = []
+        index_map = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            cid = item.get("id")
+            if not isinstance(cid, str) or not cid:
+                continue
+            ordered_ids.append(cid)
+            index_map[cid] = item
+        return ordered_ids, index_map
+
+    @staticmethod
+    def _build_summary_from_chat_listing(chat, existing=None):
+        """将列表页 chat 条目转换为 conversations.json 的 summary 条目。"""
+        existing = existing if isinstance(existing, dict) else {}
+        bare_id = str(chat.get("id", "")).replace("c_", "")
+        title = chat.get("title")
+        if not isinstance(title, str):
+            title = existing.get("title", "")
+        updated_at = chat.get("latest_update_iso") or existing.get("updatedAt")
+        remote_ts = chat.get("latest_update_ts")
+        remote_hash = str(remote_ts) if remote_ts is not None else existing.get("remoteHash")
+
+        msg_count = existing.get("messageCount", 0)
+        if not isinstance(msg_count, int):
+            msg_count = 0
+
+        return {
+            "id": bare_id,
+            "title": title or "",
+            "lastMessage": existing.get("lastMessage", ""),
+            "messageCount": msg_count,
+            "hasMedia": bool(existing.get("hasMedia", False)),
+            "updatedAt": updated_at,
+            "syncedAt": existing.get("syncedAt"),
+            "remoteHash": remote_hash,
+        }
 
     @staticmethod
     def _load_media_manifest_new(account_dir):
@@ -1416,6 +1533,136 @@ class GeminiExporter:
     # ------------------------------------------------------------------
     # 主导出流程
     # ------------------------------------------------------------------
+    def export_list_only(self, output_dir=None):
+        """
+        仅同步会话列表（分页），不拉取对话详情。
+
+        - 复用 MaZiqc 列表接口
+        - 每页完成后写入 conversations.json + sync_state.json
+        - 支持从 sync_state.fullSync.listingCursor 断点续传
+        """
+        base_dir = Path(output_dir) if output_dir else OUTPUT_DIR
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        self.init_auth()
+
+        account_info = self._resolve_account_info()
+        account_id = account_info["id"]
+        account_dir = base_dir / "accounts" / account_id
+        conv_dir = account_dir / "conversations"
+        media_dir = account_dir / "media"
+
+        account_dir.mkdir(parents=True, exist_ok=True)
+        conv_dir.mkdir(parents=True, exist_ok=True)
+        media_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"[*] 账号: {account_info['email'] or account_id}")
+        print(f"[*] 仅同步列表到: {account_dir.absolute()}")
+
+        existing_order, existing_index = self._load_conversations_index(account_dir)
+        sync_state = self._load_sync_state(account_dir)
+        full_sync = sync_state.get("fullSync") if isinstance(sync_state, dict) else None
+
+        resume_cursor = None
+        started_at = datetime.datetime.now(datetime.UTC).isoformat()
+        if isinstance(full_sync, dict):
+            phase = full_sync.get("phase")
+            if phase and phase != "done":
+                cursor_candidate = full_sync.get("listingCursor")
+                if isinstance(cursor_candidate, str) and cursor_candidate:
+                    resume_cursor = cursor_candidate
+                started_at = full_sync.get("startedAt") or started_at
+
+        if resume_cursor:
+            print("[*] 检测到未完成列表同步，继续断点拉取...")
+            ordered_ids = list(existing_order)
+            conv_index = dict(existing_index)
+        else:
+            print("[*] 从第一页开始全量刷新列表...")
+            ordered_ids = []
+            conv_index = {}
+
+        ordered_set = set(ordered_ids)
+
+        def persist_state(phase, cursor, error=None):
+            now_iso = datetime.datetime.now(datetime.UTC).isoformat()
+            summaries = [conv_index[cid] for cid in ordered_ids if cid in conv_index]
+            listing_total = len(summaries) if phase == "done" else None
+            listing_fetched = len(summaries)
+            completed_at = now_iso if phase == "done" else None
+
+            self._write_conversations_index(account_dir, account_id, now_iso, summaries)
+            self._write_sync_state(account_dir, {
+                "version": 1,
+                "accountId": account_id,
+                "updatedAt": now_iso,
+                "concurrency": 1,
+                "fullSync": {
+                    "phase": phase,
+                    "startedAt": started_at,
+                    "listingCursor": cursor,
+                    "listingTotal": listing_total,
+                    "listingFetched": listing_fetched,
+                    "conversationsToFetch": [],
+                    "conversationsFetched": 0,
+                    "conversationsFailed": [],
+                    "completedAt": completed_at,
+                    "errorMessage": error,
+                },
+                "pendingConversations": [],
+            })
+
+            # 列表同步阶段先按已落盘的列表数量展示会话数；详情抓取后可再由全量/增量流程覆盖。
+            account_info["conversationCount"] = len(summaries)
+            account_info["remoteConversationCount"] = len(summaries) if phase == "done" else account_info.get("remoteConversationCount")
+            account_info["lastSyncAt"] = now_iso
+            if phase == "done":
+                account_info["lastSyncResult"] = "success"
+            elif error:
+                account_info["lastSyncResult"] = "partial" if summaries else "failed"
+            else:
+                account_info["lastSyncResult"] = "partial" if summaries else account_info.get("lastSyncResult")
+
+            self._write_accounts_json(base_dir, account_info)
+            self._write_account_meta(account_dir, account_info)
+
+        cursor = resume_cursor
+        page = 0
+
+        try:
+            while True:
+                page += 1
+                chats, next_cursor = self.get_chats_page(cursor)
+
+                if not chats and not next_cursor:
+                    persist_state("done", None, None)
+                    print("[*] 列表同步完成（无更多分页）")
+                    break
+
+                for chat in chats:
+                    bare_id = str(chat.get("id", "")).replace("c_", "")
+                    if not bare_id:
+                        continue
+                    existing = conv_index.get(bare_id) or existing_index.get(bare_id)
+                    conv_index[bare_id] = self._build_summary_from_chat_listing(chat, existing)
+                    if bare_id not in ordered_set:
+                        ordered_set.add(bare_id)
+                        ordered_ids.append(bare_id)
+
+                phase = "done" if not next_cursor else "listing"
+                persist_state(phase, next_cursor, None)
+                print(f"  第 {page} 页: {len(chats)} 个对话 (累计 {len(ordered_ids)})")
+
+                if not next_cursor:
+                    print("[*] 列表同步完成")
+                    break
+
+                cursor = next_cursor
+                time.sleep(REQUEST_DELAY)
+        except Exception as e:
+            persist_state("listing", cursor, str(e))
+            raise
+
     def export_all(self, output_dir=None, chat_ids=None):
         """
         导出所有（或指定的）聊天数据
@@ -1949,9 +2196,12 @@ def main():
     parser.add_argument("--list-only", action="store_true", help="仅测试获取聊天列表")
     parser.add_argument("--list-users", action="store_true", help="列出本地账号邮箱与 authuser 映射")
     parser.add_argument("--user", help="指定 Google 账号（支持 0/1/2 或邮箱）")
+    parser.add_argument("--account-id", help="强制写入指定账号目录 ID（用于 GUI 侧绑定）")
+    parser.add_argument("--account-email", help="账号邮箱提示（用于写入 meta，不影响请求）")
     parser.add_argument("--check-chat-id", help="检查指定对话是否更新（需配合 --last-update-ts）")
     parser.add_argument("--last-update-ts", type=int, help="上次记录的对话更新时间（秒级时间戳）")
     parser.add_argument("--incremental", action="store_true", help="增量更新导出（命中首个未更新会话后停止）")
+    parser.add_argument("--sync-list-only", action="store_true", help="仅同步会话列表（支持分页断点续传）")
     parser.add_argument("--accounts-only", action="store_true", help="仅导入账号信息并写入本地，不拉取对话")
     args = parser.parse_args()
 
@@ -1978,7 +2228,12 @@ def main():
     print(f"[*] 已提取 {len(cookies)} 个 cookies")
 
     # 2. 账号映射列表
-    exporter = GeminiExporter(cookies, user=args.user)
+    exporter = GeminiExporter(
+        cookies,
+        user=args.user,
+        account_id=args.account_id,
+        account_email=args.account_email,
+    )
     if args.list_users:
         rows = exporter.list_user_options()
         print(json.dumps(rows, ensure_ascii=False, indent=2))
@@ -2031,8 +2286,9 @@ def main():
             if not email:
                 return None
             name = email.split("@")[0]
+            account_id = GeminiExporter.email_to_account_id(email)
             return {
-                "id": re.sub(r"[^a-z0-9]", "_", email),
+                "id": account_id,
                 "email": email,
                 "name": name,
                 "avatarText": name[0].upper() if name else "?",
@@ -2125,6 +2381,10 @@ def main():
 
     if args.incremental:
         exporter.export_incremental(output_dir=args.output)
+        return
+
+    if args.sync_list_only:
+        exporter.export_list_only(output_dir=args.output)
         return
 
     exporter.export_all(output_dir=args.output, chat_ids=args.chat_ids)

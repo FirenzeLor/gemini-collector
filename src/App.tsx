@@ -4,7 +4,7 @@ import { TopBar } from "./components/TopBar";
 import { Sidebar } from "./components/Sidebar";
 import { ChatView } from "./components/ChatView";
 import { AccountPicker } from "./components/AccountPicker";
-import { mockConversations, mockConversationSummaries, Account } from "./data/mockData";
+import { Account, Conversation, ConversationSummary } from "./data/mockData";
 import { ThemeContext, lightTheme, darkTheme } from "./theme";
 
 type Screen = "account-picker" | "chat";
@@ -18,18 +18,65 @@ function parseAccountsPayload(json: string): Account[] {
   }
 }
 
+function parseSummariesPayload(json: string): ConversationSummary[] {
+  try {
+    const parsed: unknown = JSON.parse(json);
+    if (!Array.isArray(parsed)) return [];
+    const items = parsed as ConversationSummary[];
+    return [...items].sort((a, b) => {
+      const ta = Date.parse(a.updatedAt ?? "");
+      const tb = Date.parse(b.updatedAt ?? "");
+      const va = Number.isNaN(ta) ? -Infinity : ta;
+      const vb = Number.isNaN(tb) ? -Infinity : tb;
+      return vb - va;
+    });
+  } catch {
+    return [];
+  }
+}
+
 function App() {
   const [screen, setScreen] = useState<Screen>("account-picker");
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [accountsLoading, setAccountsLoading] = useState(true);
   const [currentAccount, setCurrentAccount] = useState<Account | null>(null);
-  const [selectedId, setSelectedId] = useState<string | null>(mockConversations[0]?.id ?? null);
+  const [conversationSummaries, setConversationSummaries] = useState<ConversationSummary[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [isDark, setIsDark] = useState(false);
 
   const theme = isDark ? darkTheme : lightTheme;
-  const selectedConversation = mockConversations.find((c) => c.id === selectedId) ?? null;
+
+  const selectedSummary = conversationSummaries.find((c) => c.id === selectedId) ?? null;
+  const selectedConversation: Conversation | null = selectedSummary
+    ? {
+        id: selectedSummary.id,
+        accountId: currentAccount?.id ?? "",
+        title: selectedSummary.title,
+        createdAt: selectedSummary.updatedAt,
+        updatedAt: selectedSummary.updatedAt,
+        syncedAt: selectedSummary.syncedAt ?? selectedSummary.updatedAt,
+        remoteHash: selectedSummary.remoteHash,
+        messages: [],
+      }
+    : null;
+
+  async function reloadAccounts(): Promise<Account[]> {
+    const loaded = parseAccountsPayload(await invoke<string>("load_accounts"));
+    setAccounts(loaded);
+    return loaded;
+  }
+
+  async function loadSummaries(accountId: string): Promise<void> {
+    const loaded = parseSummariesPayload(
+      await invoke<string>("load_conversation_summaries", { accountId }),
+    );
+    setConversationSummaries(loaded);
+    setSelectedId((prev) =>
+      prev && loaded.some((c) => c.id === prev) ? prev : (loaded[0]?.id ?? null),
+    );
+  }
 
   // On startup: load local accounts, auto-import from browser cookies if empty.
   useEffect(() => {
@@ -67,6 +114,40 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    const accountId = currentAccount?.id;
+    if (!accountId) {
+      setConversationSummaries([]);
+      setSelectedId(null);
+      return;
+    }
+
+    async function loadForCurrent() {
+      try {
+        const loaded = parseSummariesPayload(
+          await invoke<string>("load_conversation_summaries", { accountId }),
+        );
+        if (cancelled) return;
+        setConversationSummaries(loaded);
+        setSelectedId((prev) =>
+          prev && loaded.some((c) => c.id === prev) ? prev : (loaded[0]?.id ?? null),
+        );
+      } catch (e) {
+        console.error("加载对话列表失败:", e);
+        if (!cancelled) {
+          setConversationSummaries([]);
+          setSelectedId(null);
+        }
+      }
+    }
+
+    void loadForCurrent();
+    return () => {
+      cancelled = true;
+    };
+  }, [currentAccount?.id]);
+
   function handleSelectAccount(account: Account) {
     setCurrentAccount(account);
     setScreen("chat");
@@ -74,13 +155,23 @@ function App() {
 
   function handleSwitchAccount(account: Account) {
     setCurrentAccount(account);
-    setSelectedId(mockConversations[0]?.id ?? null);
   }
 
-  function handleSync() {
-    if (syncing) return;
+  async function handleSync() {
+    if (syncing || !currentAccount) return;
     setSyncing(true);
-    setTimeout(() => setSyncing(false), 2000);
+    try {
+      await invoke("run_list_sync", { accountId: currentAccount.id });
+      const refreshedAccounts = await reloadAccounts();
+      const refreshedCurrent =
+        refreshedAccounts.find((a) => a.id === currentAccount.id) ?? currentAccount;
+      setCurrentAccount(refreshedCurrent);
+      await loadSummaries(refreshedCurrent.id);
+    } catch (e) {
+      console.error("同步列表失败:", e);
+    } finally {
+      setSyncing(false);
+    }
   }
 
   if (screen === "account-picker") {
@@ -100,9 +191,8 @@ function App() {
   return (
     <ThemeContext.Provider value={theme}>
       <div style={{ display: "flex", height: "100vh", width: "100vw", overflow: "hidden", background: theme.appBg }}>
-        {/* Left column */}
         <Sidebar
-          conversations={mockConversationSummaries}
+          conversations={conversationSummaries}
           selectedId={selectedId}
           onSelect={setSelectedId}
           collapsed={sidebarCollapsed}
@@ -112,7 +202,6 @@ function App() {
           accounts={accounts}
           onSwitchAccount={handleSwitchAccount}
         />
-        {/* Right column */}
         <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
           <TopBar
             selectedConversation={selectedConversation}
@@ -120,7 +209,12 @@ function App() {
             onToggleSidebar={() => setSidebarCollapsed((v) => !v)}
             isDark={isDark}
             onToggleDark={() => setIsDark((v) => !v)}
-            onLogout={() => setScreen("account-picker")}
+            onLogout={() => {
+              setCurrentAccount(null);
+              setConversationSummaries([]);
+              setSelectedId(null);
+              setScreen("account-picker");
+            }}
           />
           <ChatView conversation={selectedConversation} />
         </div>
