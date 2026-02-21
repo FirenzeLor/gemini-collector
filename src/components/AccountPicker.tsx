@@ -88,7 +88,22 @@ function AccountRow({ account, showDivider, onClick }: { account: Account; showD
         {account.avatarText}
       </div>
       <div style={{ flex: 1, overflow: "hidden" }}>
-        <div style={{ fontSize: 14, fontWeight: 600, color: t.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{account.name}</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <div style={{ fontSize: 14, fontWeight: 600, color: t.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{account.name}</div>
+          {account.listSyncPending && (
+            <span
+              title="列表同步未完成"
+              style={{
+                width: 8,
+                height: 8,
+                borderRadius: "50%",
+                background: "#ef4444",
+                boxShadow: "0 0 0 2px rgba(239,68,68,0.16)",
+                flexShrink: 0,
+              }}
+            />
+          )}
+        </div>
         <div style={{ fontSize: 12, color: t.textSub, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginTop: 1 }}>{account.email}</div>
       </div>
       <div style={{ textAlign: "right", flexShrink: 0 }}>
