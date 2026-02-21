@@ -33,6 +33,7 @@ interface AccountRegistry {
     email: string;
     addedAt: string;  // ISO 8601
     dataDir: string;  // "accounts/{id}"
+    authuser?: string | null; // Gemini authuser (u/{n})，用于后续拉取
   }[];
 }
 ```
@@ -51,6 +52,7 @@ interface AccountMeta {
   remoteConversationCount: number | null;
   lastSyncAt: string | null;
   lastSyncResult: "success" | "partial" | "failed" | null;
+  authuser?: string | null; // Gemini authuser (u/{n})
 }
 ```
 
@@ -102,6 +104,8 @@ interface ConvMessage {
   text: string;
   attachments: Attachment[];
   timestamp: string;
+  model?: string;    // 仅 role=="model" 时存在，标识所用模型版本
+  thinking?: string; // 仅 role=="model" 且有思考过程时存在（界面暂未使用）
 }
 
 interface Attachment {

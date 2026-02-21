@@ -1,9 +1,9 @@
-import React, { useState } from "react";
-import { Conversation, Account } from "../data/mockData";
+import { useState } from "react";
+import { ConversationSummary, Account } from "../data/mockData";
 import { useTheme } from "../theme";
 
 interface SidebarProps {
-  conversations: Conversation[];
+  conversations: ConversationSummary[];
   selectedId: string | null;
   onSelect: (id: string) => void;
   collapsed: boolean;
@@ -12,15 +12,45 @@ interface SidebarProps {
   currentAccount: Account;
   accounts: Account[];
   onSwitchAccount: (account: Account) => void;
+  onSyncConversation?: (id: string) => void;
+}
+
+// Format ISO 8601 date for sidebar: time if today, "MM-DD" otherwise
+function formatConvTime(iso: string): string {
+  try {
+    const d = new Date(iso);
+    const now = new Date();
+    if (d.toDateString() === now.toDateString()) {
+      return d.toTimeString().slice(0, 5);
+    }
+    return `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  } catch {
+    return iso;
+  }
 }
 
 export function Sidebar({
   conversations, selectedId, onSelect, collapsed,
   syncing, onSync, currentAccount, accounts, onSwitchAccount,
+  onSyncConversation,
 }: SidebarProps) {
   const t = useTheme();
   const [showSwitcher, setShowSwitcher] = useState(false);
+  const [syncingIds, setSyncingIds] = useState<Set<string>>(new Set());
   const otherAccounts = accounts.filter((a) => a.id !== currentAccount.id);
+
+  function handleSyncConv(id: string) {
+    if (syncingIds.has(id)) return;
+    setSyncingIds((prev) => new Set(prev).add(id));
+    onSyncConversation?.(id);
+    setTimeout(() => {
+      setSyncingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+    }, 2000);
+  }
 
   return (
     <div style={{
@@ -43,7 +73,14 @@ export function Sidebar({
           对话历史
         </div>
         {conversations.map((conv) => (
-          <ConversationItem key={conv.id} conversation={conv} selected={conv.id === selectedId} onClick={() => onSelect(conv.id)} />
+          <ConversationItem
+            key={conv.id}
+            conversation={conv}
+            selected={conv.id === selectedId}
+            onClick={() => onSelect(conv.id)}
+            syncing={syncingIds.has(conv.id)}
+            onSync={() => handleSyncConv(conv.id)}
+          />
         ))}
       </div>
 
@@ -118,9 +155,14 @@ export function Sidebar({
   );
 }
 
-function ConversationItem({ conversation, selected, onClick }: { conversation: Conversation; selected: boolean; onClick: () => void }) {
+function ConversationItem({ conversation, selected, onClick, syncing, onSync }: {
+  conversation: ConversationSummary;
+  selected: boolean;
+  onClick: () => void;
+  syncing: boolean;
+  onSync: () => void;
+}) {
   const t = useTheme();
-  const msgCount = conversation.messages.length;
 
   return (
     <div
@@ -135,21 +177,20 @@ function ConversationItem({ conversation, selected, onClick }: { conversation: C
           {conversation.title}
         </div>
         <div style={{ fontSize: 11, color: t.textMuted, display: "flex", alignItems: "center", gap: 4 }}>
-          <span>{conversation.updatedAt}</span>
-          <span>{conversation.updatedTime}</span>
+          <span>{formatConvTime(conversation.updatedAt)}</span>
           <span style={{ color: t.textMuted, opacity: 0.6 }}>·</span>
-          <span>{msgCount} 条</span>
+          <span>{conversation.messageCount} 条</span>
         </div>
       </div>
-      {/* Sync icon - right aligned, same as bottom sync icon */}
+      {/* Sync icon - right aligned */}
       <button
-        onClick={(e) => e.stopPropagation()}
+        onClick={(e) => { e.stopPropagation(); onSync(); }}
         title="同步此对话"
-        style={{ width: 26, height: 26, borderRadius: 7, border: "none", background: "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, transition: "background 0.15s" }}
-        onMouseEnter={(e) => { e.stopPropagation(); (e.currentTarget as HTMLElement).style.background = t.btnHoverBg; }}
+        style={{ width: 26, height: 26, borderRadius: 7, border: "none", background: "transparent", cursor: syncing ? "default" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, transition: "background 0.15s" }}
+        onMouseEnter={(e) => { e.stopPropagation(); if (!syncing) (e.currentTarget as HTMLElement).style.background = t.btnHoverBg; }}
         onMouseLeave={(e) => { e.stopPropagation(); (e.currentTarget as HTMLElement).style.background = "transparent"; }}
       >
-        <SyncIcon spinning={false} color={t.textMuted} />
+        <SyncIcon spinning={syncing} color={syncing ? "#0071e3" : t.textMuted} />
       </button>
     </div>
   );

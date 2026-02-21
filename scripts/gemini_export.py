@@ -16,6 +16,7 @@ import re
 import sys
 import time
 import datetime
+import codecs
 import uuid
 from pathlib import Path
 from urllib.parse import urlencode, quote, urlparse, parse_qsl, urlunparse, urljoin
@@ -52,6 +53,7 @@ GOOGLE_MEDIA_COOKIE_NAMES = [
 
 PROTECTED_MEDIA_HOSTS = {
     "lh3.google.com",
+    "lh3.googleusercontent.com",
     "contribution.usercontent.google.com",
 }
 
@@ -126,7 +128,7 @@ def get_cookies_from_local_browser():
 
         try:
             collected_items = []
-            for domain_name in [".google.com", "gemini.google.com"]:
+            for domain_name in [".google.com", "accounts.google.com", "gemini.google.com"]:
                 jar = loader(domain_name=domain_name)
                 for c in jar:
                     collected_items.append(c)
@@ -199,94 +201,89 @@ def parse_batchexecute_response(resp_text):
     return items
 
 
-def _extract_emails_from_accountchooser_html(html):
-    """从 AccountChooser 页面提取邮箱列表。"""
-    if not html:
-        return []
+def discover_email_authuser_mapping_via_listaccounts(cookies):
+    """
+    使用 ListAccounts 接口获取邮箱与 authuser 映射。
 
-    emails = []
-    seen = set()
+    该接口当前依赖请求上下文，缺少 Origin 往往会返回 HTTP 400。
+    """
+    list_accounts_url = "https://accounts.google.com/ListAccounts"
+    params = {
+        "authuser": "0",
+        "listPages": "1",
+        "fwput": "10",
+        "rdr": "2",
+        "pid": "658",
+        "gpsia": "1",
+        "source": "ogb",
+        "atic": "1",
+        "mo": "1",
+        "mn": "1",
+        "hl": "zh-CN",
+        "ts": "641",
+    }
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Referer": f"{GEMINI_BASE}/app",
+        "Origin": GEMINI_BASE,
+    }
 
-    # 优先使用结构化字段
-    for m in re.finditer(r'data-email="([^"]+@[^"]+)"', html, flags=re.IGNORECASE):
-        e = m.group(1).strip().lower()
-        if e and e not in seen:
-            seen.add(e)
-            emails.append(e)
+    with httpx.Client(cookies=cookies, follow_redirects=True, timeout=30.0, headers=headers) as client:
+        resp = client.get(list_accounts_url, params=params)
 
-    # 回退到通用邮箱正则
-    for m in re.finditer(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', html):
-        e = m.group(0).strip().lower()
-        if e and e not in seen:
-            seen.add(e)
-            emails.append(e)
+    if resp.status_code != 200:
+        raise RuntimeError(f"ListAccounts HTTP {resp.status_code}")
 
-    return emails
+    m = re.search(r"postMessage\('(.+?)'\s*,\s*'[^']*'\)", resp.text, flags=re.S)
+    if not m:
+        raise RuntimeError("ListAccounts 响应缺少 postMessage payload")
 
+    payload_raw = m.group(1).replace("\\/", "/")
+    payload = codecs.decode(payload_raw, "unicode_escape")
+    parsed = json.loads(payload)
 
-def _extract_authuser_from_url(url):
-    """从 Gemini 跳转 URL 中提取 authuser。"""
-    if not url:
-        return None
+    rows = parsed[1] if isinstance(parsed, list) and len(parsed) > 1 and isinstance(parsed[1], list) else []
+    result = []
+    seen_email = set()
+    for row in rows:
+        if not isinstance(row, list) or len(row) < 4:
+            continue
 
-    parsed = urlparse(url)
-    path = parsed.path or ""
+        email = row[3] if isinstance(row[3], str) else ""
+        if not email:
+            continue
+        email = email.strip().lower()
+        if email in seen_email:
+            continue
+        seen_email.add(email)
 
-    m = re.search(r"/u/(\d+)/app", path)
-    if m:
-        return m.group(1)
+        authuser_raw = row[7] if len(row) > 7 else None
+        authuser = None
+        if isinstance(authuser_raw, int):
+            authuser = str(authuser_raw)
+        elif isinstance(authuser_raw, str) and authuser_raw.isdigit():
+            authuser = authuser_raw
 
-    if path == "/app" or path.startswith("/app/"):
-        return "0"
+        redirect_url = None
+        if authuser is not None:
+            redirect_url = f"{GEMINI_BASE}/app" if authuser == "0" else f"{GEMINI_BASE}/u/{authuser}/app"
 
-    for k, v in parse_qsl(parsed.query, keep_blank_values=True):
-        if k == "authuser" and v.isdigit():
-            return v
+        result.append({
+            "email": email,
+            "authuser": authuser,
+            "redirect_url": redirect_url,
+        })
 
-    return None
+    return result
 
 
 def discover_email_authuser_mapping(cookies):
-    """仅通过本地 cookies 获取邮箱与 authuser 的映射。"""
-    chooser_url = "https://accounts.google.com/AccountChooser"
-    continue_url = f"{GEMINI_BASE}/app"
-
-    def _get_with_retry(client, url, params, attempts=6):
-        last_err = None
-        for i in range(attempts):
-            try:
-                return client.get(url, params=params)
-            except Exception as e:
-                last_err = e
-                time.sleep(0.4 * (i + 1))
-        if last_err:
-            raise last_err
-        raise RuntimeError("请求失败")
-
-    with httpx.Client(cookies=cookies, follow_redirects=True, timeout=30.0) as client:
-        resp = _get_with_retry(client, chooser_url, {"continue": continue_url})
-        emails = _extract_emails_from_accountchooser_html(resp.text)
-
-        mappings = []
-        for email in emails:
-            try:
-                r = _get_with_retry(client, chooser_url, {"Email": email, "continue": continue_url})
-            except Exception:
-                mappings.append({
-                    "email": email,
-                    "authuser": None,
-                    "redirect_url": None,
-                })
-                continue
-            final_url = str(r.url)
-            authuser = _extract_authuser_from_url(final_url)
-            mappings.append({
-                "email": email,
-                "authuser": authuser,
-                "redirect_url": final_url,
-            })
-
-    return mappings
+    """通过 ListAccounts 获取本地 cookies 下的账号映射。"""
+    return discover_email_authuser_mapping_via_listaccounts(cookies)
 
 
 # ============================================================================
@@ -324,13 +321,13 @@ class GeminiExporter:
             return
 
         email = self.user_spec.lower()
-        # 优先走 AccountChooser 映射
+        # 优先走 ListAccounts 映射
         try:
             mappings = discover_email_authuser_mapping(self.cookies)
             for item in mappings:
                 if item.get("email") == email and item.get("authuser") is not None:
                     self.authuser = str(item["authuser"])
-                    print(f"  authuser: {self.authuser} (AccountChooser 映射)")
+                    print(f"  authuser: {self.authuser} (ListAccounts 映射)")
                     return
         except Exception:
             pass
@@ -1080,16 +1077,28 @@ class GeminiExporter:
     def _resolve_account_info(self):
         """解析当前账号信息，返回 {id, email, name, ...}"""
         email = None
+        authuser_value = self.authuser
+        if authuser_value is None:
+            try:
+                self._resolve_authuser()
+                authuser_value = self.authuser
+            except Exception:
+                authuser_value = self.authuser
+
+        authuser_str = None
+        if authuser_value is not None:
+            authuser_candidate = str(authuser_value).strip()
+            if authuser_candidate.isdigit():
+                authuser_str = authuser_candidate
 
         if self.user_spec and "@" in self.user_spec:
             email = self.user_spec.lower()
         else:
             try:
                 mappings = discover_email_authuser_mapping(self.cookies)
-                authuser = self.authuser
-                if authuser is not None:
+                if authuser_str is not None:
                     for m in mappings:
-                        if m.get("authuser") == str(authuser):
+                        if m.get("authuser") == authuser_str:
                             email = m.get("email")
                             break
                 if not email and mappings:
@@ -1110,9 +1119,10 @@ class GeminiExporter:
                 "remoteConversationCount": None,
                 "lastSyncAt": None,
                 "lastSyncResult": None,
+                "authuser": authuser_str,
             }
         else:
-            authuser = self.authuser or "0"
+            authuser = authuser_str or "0"
             acc_id = f"user_{authuser}"
             return {
                 "id": acc_id,
@@ -1124,6 +1134,7 @@ class GeminiExporter:
                 "remoteConversationCount": None,
                 "lastSyncAt": None,
                 "lastSyncResult": None,
+                "authuser": authuser_str,
             }
 
     @staticmethod
@@ -1142,11 +1153,16 @@ class GeminiExporter:
                 pass
 
         account_id = account_info["id"]
+        existing_account = existing.get(account_id, {})
+        authuser = account_info.get("authuser")
+        if authuser is None:
+            authuser = existing_account.get("authuser")
         existing[account_id] = {
             "id": account_id,
             "email": account_info.get("email", ""),
-            "addedAt": existing.get(account_id, {}).get("addedAt", now_iso),
+            "addedAt": existing_account.get("addedAt", now_iso),
             "dataDir": f"accounts/{account_id}",
+            "authuser": authuser,
         }
 
         data = {
@@ -1170,6 +1186,7 @@ class GeminiExporter:
             "remoteConversationCount": account_info.get("remoteConversationCount"),
             "lastSyncAt": account_info.get("lastSyncAt"),
             "lastSyncResult": account_info.get("lastSyncResult"),
+            "authuser": account_info.get("authuser"),
         }
         (Path(account_dir) / "meta.json").write_text(
             json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -1890,6 +1907,7 @@ def migrate_old_to_new(old_dir, new_base_dir, account_id, email="", name=""):
         "remoteConversationCount": len(chats) or None,
         "lastSyncAt": now_iso,
         "lastSyncResult": "success",
+        "authuser": None,
     }
     GeminiExporter._write_accounts_json(new_base_dir, account_info)
     GeminiExporter._write_account_meta(account_dir, account_info)
@@ -1934,6 +1952,7 @@ def main():
     parser.add_argument("--check-chat-id", help="检查指定对话是否更新（需配合 --last-update-ts）")
     parser.add_argument("--last-update-ts", type=int, help="上次记录的对话更新时间（秒级时间戳）")
     parser.add_argument("--incremental", action="store_true", help="增量更新导出（命中首个未更新会话后停止）")
+    parser.add_argument("--accounts-only", action="store_true", help="仅导入账号信息并写入本地，不拉取对话")
     args = parser.parse_args()
 
     # 1. 获取 cookies
@@ -1994,6 +2013,114 @@ def main():
             exporter.init_auth()
         chats = exporter.get_all_chats()
         print(f"[*] 聊天列表获取完成: {len(chats)} 个")
+        return
+
+    if args.accounts_only:
+        base_dir = Path(args.output)
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        def _normalize_authuser(v):
+            if v is None:
+                return None
+            s = str(v).strip()
+            return s if s.isdigit() else None
+
+        def _build_account_info_from_hint(email_hint, authuser_hint):
+            email = (email_hint or "").strip().lower()
+            authuser_str = _normalize_authuser(authuser_hint)
+            if not email:
+                return None
+            name = email.split("@")[0]
+            return {
+                "id": re.sub(r"[^a-z0-9]", "_", email),
+                "email": email,
+                "name": name,
+                "avatarText": name[0].upper() if name else "?",
+                "avatarColor": "#667eea",
+                "conversationCount": 0,
+                "remoteConversationCount": None,
+                "lastSyncAt": None,
+                "lastSyncResult": None,
+                "authuser": authuser_str,
+            }
+
+        def _persist_account(account_info):
+            account_id = account_info["id"]
+            account_dir = base_dir / "accounts" / account_id
+            account_dir.mkdir(parents=True, exist_ok=True)
+            (account_dir / "conversations").mkdir(exist_ok=True)
+            (account_dir / "media").mkdir(exist_ok=True)
+            GeminiExporter._write_accounts_json(base_dir, account_info)
+            GeminiExporter._write_account_meta(account_dir, account_info)
+            return account_info
+
+        try:
+            mappings = discover_email_authuser_mapping(cookies)
+        except Exception as e:
+            print(json.dumps({
+                "status": "failed",
+                "imported": [],
+                "failed": [{"user": "mapping", "error": str(e)}],
+            }, ensure_ascii=False))
+            return
+
+        imported_ids = []
+        failed = []
+        seen_ids = set()
+
+        if args.user:
+            user_spec = str(args.user).strip().lower()
+            target = None
+            if user_spec.isdigit():
+                target = next(
+                    (m for m in mappings if _normalize_authuser(m.get("authuser")) == user_spec),
+                    None,
+                )
+            else:
+                target = next(
+                    (m for m in mappings if (m.get("email") or "").strip().lower() == user_spec),
+                    None,
+                )
+
+            if not target:
+                failed.append({"user": args.user, "error": "账号不在 ListAccounts 结果中"})
+            else:
+                email = (target.get("email") or "").strip().lower()
+                authuser = _normalize_authuser(target.get("authuser"))
+                info = _build_account_info_from_hint(email, authuser)
+                if info is None:
+                    failed.append({"user": args.user, "error": "账号缺少有效 authuser"})
+                else:
+                    _persist_account(info)
+                    imported_ids.append(info["id"])
+            status = "ok" if imported_ids else "failed"
+            result = {"status": status, "imported": imported_ids}
+            if failed:
+                result["failed"] = failed
+            print(json.dumps(result, ensure_ascii=False))
+            return
+
+        for item in mappings:
+            email = (item.get("email") or "").strip().lower()
+            authuser = _normalize_authuser(item.get("authuser"))
+            info = _build_account_info_from_hint(email, authuser)
+            if info is None:
+                failed.append({
+                    "user": email or str(item.get("authuser") or ""),
+                    "error": "账号缺少有效 authuser",
+                })
+                continue
+            if info["id"] in seen_ids:
+                continue
+            seen_ids.add(info["id"])
+            _persist_account(info)
+            imported_ids.append(info["id"])
+
+        status = "ok" if imported_ids else "failed"
+        result = {"status": status, "imported": imported_ids}
+        if failed:
+            result["failed"] = failed
+        print(json.dumps(result, ensure_ascii=False))
         return
 
     if args.incremental:

@@ -1,60 +1,79 @@
+// Interfaces match DATA_STRUCTURE.md exactly.
+
 export interface Attachment {
-  type: "image" | "video";
-  url: string;        // remote URL or absolute local path
-  name?: string;
-  isLocal?: boolean;  // true = local file, needs convertFileSrc
-  mimeType?: string;
+  mediaId: string;   // filename with extension in media/ dir
+  mimeType: string;
 }
 
-export interface Message {
+export interface ConvMessage {
+  type: "message";
   id: string;
-  role: "user" | "assistant";
-  content: string;
-  timestamp: string;
-  date: string;
-  model?: string;
-  attachments?: Attachment[];
+  role: "user" | "model";
+  text: string;
+  attachments: Attachment[];
+  timestamp: string;   // ISO 8601
+  model?: string;      // only when role=="model"
+  thinking?: string;   // only when role=="model" and thinking exists
 }
 
 export interface Conversation {
   id: string;
+  accountId: string;
   title: string;
-  lastMessage: string;
-  updatedAt: string;
-  updatedTime: string;
-  messages: Message[];
+  createdAt: string;   // ISO 8601
+  updatedAt: string;   // ISO 8601
+  syncedAt: string;    // ISO 8601
+  remoteHash: string | null;
+  messages: ConvMessage[];
 }
 
-import sessionData from "./session_c8d0a41aba76e19e.json";
-import largeSessionData from "./session_large_test.json";
-import chatListData from "./chat_list_test.json";
+export interface ConversationSummary {
+  id: string;
+  title: string;
+  lastMessage: string;      // plain text, max 80 chars
+  messageCount: number;
+  hasMedia: boolean;
+  updatedAt: string;        // ISO 8601
+  syncedAt: string | null;
+  remoteHash: string | null;
+}
 
-const realSession = sessionData as unknown as Conversation;
-const largeSession = largeSessionData as unknown as Conversation;
-const chatListConvs = (chatListData as { conversations: Conversation[] }).conversations;
+export interface Account {
+  id: string;
+  name: string;
+  email: string;
+  avatarText: string;
+  avatarColor: string;
+  conversationCount: number;
+  remoteConversationCount: number | null;
+  lastSyncAt: string | null;  // ISO 8601
+  lastSyncResult: "success" | "partial" | "failed" | null;
+  authuser?: string | null;
+}
 
 export const mockConversations: Conversation[] = [
-  largeSession,
-  realSession,
-  ...chatListConvs,
   {
     id: "c_001",
+    accountId: "acc_1",
     title: "React Hooks 最佳实践",
-    lastMessage: "useCallback 和 useMemo 应该谨慎使用...",
-    updatedAt: "2026-02-19",
-    updatedTime: "14:36",
+    createdAt: "2026-02-19T14:30:00Z",
+    updatedAt: "2026-02-19T14:36:00Z",
+    syncedAt: "2026-02-19T15:00:00Z",
+    remoteHash: "abc123",
     messages: [
       {
-        id: "m1",
+        type: "message",
+        id: "turn1_u",
         role: "user",
-        content: "能帮我解释一下 React 中 useCallback 和 useMemo 的区别吗？",
-        timestamp: "14:32",
-        date: "2026-02-19",
+        text: "能帮我解释一下 React 中 useCallback 和 useMemo 的区别吗？",
+        attachments: [],
+        timestamp: "2026-02-19T14:32:00Z",
       },
       {
-        id: "m2",
-        role: "assistant",
-        content: `## useCallback vs useMemo
+        type: "message",
+        id: "turn1_m",
+        role: "model",
+        text: `## useCallback vs useMemo
 
 这两个 Hook 都用于性能优化，但用途不同：
 
@@ -84,26 +103,23 @@ const sortedList = useMemo(() => {
 | \`useMemo(fn, deps)\` | 函数返回值 | 计算结果 |
 
 > **注意**：过度使用这两个 Hook 反而会降低性能，应该在真正有性能问题时再考虑使用。`,
-        timestamp: "14:33",
-        date: "2026-02-19",
-        model: "2.0 Flash",
+        attachments: [],
+        timestamp: "2026-02-19T14:33:00Z",
+        model: "Gemini 2.0 Flash",
       },
       {
-        id: "m3",
+        type: "message",
+        id: "turn2_u",
         role: "user",
-        content: "那什么时候应该用 useCallback？给个具体场景",
-        timestamp: "14:35",
-        date: "2026-02-19",
-        attachments: [
-          { type: "image", url: "https://picsum.photos/seed/img1/400/400", name: "screenshot1.png" },
-          { type: "image", url: "https://picsum.photos/seed/img2/400/400", name: "screenshot2.png" },
-          { type: "image", url: "https://picsum.photos/seed/img3/400/400", name: "screenshot3.png" },
-        ],
+        text: "那什么时候应该用 useCallback？给个具体场景",
+        attachments: [],
+        timestamp: "2026-02-19T14:35:00Z",
       },
       {
-        id: "m4",
-        role: "assistant",
-        content: `好的，一个典型场景是**配合 React.memo 使用**：
+        type: "message",
+        id: "turn2_m",
+        role: "model",
+        text: `好的，一个典型场景是**配合 React.memo 使用**：
 
 \`\`\`tsx
 // 子组件用 memo 包裹，避免不必要的重渲染
@@ -117,10 +133,6 @@ function Parent() {
   const [count, setCount] = useState(0);
   const [text, setText] = useState("");
 
-  // ✅ 没有 useCallback：每次 text 变化，handleSubmit 都是新函数引用
-  //    → Button 会不必要地重渲染
-
-  // ✅ 有 useCallback：只有依赖项变化才更新
   const handleSubmit = useCallback(() => {
     submitForm(text);
   }, [text]);
@@ -137,30 +149,34 @@ function Parent() {
 \`\`\`
 
 当 \`count\` 变化时，没有 \`useCallback\` 的话 \`Button\` 也会重渲染（即使 \`text\` 没变）。这才是 \`useCallback\` 真正发挥作用的地方。`,
-        timestamp: "14:36",
-        date: "2026-02-19",
-        model: "2.0 Flash",
+        attachments: [],
+        timestamp: "2026-02-19T14:36:00Z",
+        model: "Gemini 2.0 Flash",
       },
     ],
   },
   {
     id: "c_002",
+    accountId: "acc_1",
     title: "Python 异步编程",
-    lastMessage: "asyncio.gather 可以并发执行多个协程...",
-    updatedAt: "2026-02-18",
-    updatedTime: "10:17",
+    createdAt: "2026-02-18T10:00:00Z",
+    updatedAt: "2026-02-18T10:17:00Z",
+    syncedAt: "2026-02-18T11:00:00Z",
+    remoteHash: "def456",
     messages: [
       {
-        id: "m1",
+        type: "message",
+        id: "turn1_u",
         role: "user",
-        content: "asyncio.gather 和 asyncio.wait 有什么区别？",
-        timestamp: "10:15",
-        date: "2026-02-18",
+        text: "asyncio.gather 和 asyncio.wait 有什么区别？",
+        attachments: [],
+        timestamp: "2026-02-18T10:15:00Z",
       },
       {
-        id: "m2",
-        role: "assistant",
-        content: `## asyncio.gather vs asyncio.wait
+        type: "message",
+        id: "turn1_m",
+        role: "model",
+        text: `## asyncio.gather vs asyncio.wait
 
 ### asyncio.gather
 
@@ -192,30 +208,34 @@ done, pending = await asyncio.wait(
 \`\`\`
 
 **简单并发用 gather，需要精细控制用 wait。**`,
-        timestamp: "10:17",
-        date: "2026-02-18",
-        model: "1.5 Pro",
+        attachments: [],
+        timestamp: "2026-02-18T10:17:00Z",
+        model: "Gemini 1.5 Pro",
       },
     ],
   },
   {
     id: "c_003",
+    accountId: "acc_1",
     title: "Rust 所有权系统",
-    lastMessage: "借用检查器在编译期保证内存安全...",
-    updatedAt: "2026-02-17",
-    updatedTime: "09:03",
+    createdAt: "2026-02-17T09:00:00Z",
+    updatedAt: "2026-02-17T09:03:00Z",
+    syncedAt: "2026-02-17T10:00:00Z",
+    remoteHash: "ghi789",
     messages: [
       {
-        id: "m1",
+        type: "message",
+        id: "turn1_u",
         role: "user",
-        content: "能用简单的例子解释 Rust 的所有权规则吗？",
-        timestamp: "09:00",
-        date: "2026-02-17",
+        text: "能用简单的例子解释 Rust 的所有权规则吗？",
+        attachments: [],
+        timestamp: "2026-02-17T09:00:00Z",
       },
       {
-        id: "m2",
-        role: "assistant",
-        content: `## Rust 所有权三原则
+        type: "message",
+        id: "turn1_m",
+        role: "model",
+        text: `## Rust 所有权三原则
 
 1. 每个值都有唯一的**所有者**
 2. 同一时间只能有**一个所有者**
@@ -245,134 +265,47 @@ println!("{}", s);  // ✅ s 仍然有效
 \`\`\`
 
 这套规则让 Rust 无需 GC 就能保证内存安全。`,
-        timestamp: "09:03",
-        date: "2026-02-17",
-        model: "2.0 Pro",
+        attachments: [],
+        timestamp: "2026-02-17T09:03:00Z",
+        model: "Gemini 2.0 Pro",
       },
     ],
   },
   {
     id: "c_004",
+    accountId: "acc_1",
     title: "数据库索引优化",
-    lastMessage: "复合索引的列顺序很关键...",
-    updatedAt: "2026-02-16",
-    updatedTime: "16:23",
-    messages: [
-      {
-        id: "m1",
-        role: "user",
-        content: "如何为慢查询创建合适的索引？",
-        timestamp: "16:20",
-        date: "2026-02-16",
-      },
-      {
-        id: "m2",
-        role: "assistant",
-        content: `## 慢查询索引优化步骤
-
-### 1. 先用 EXPLAIN 分析
-
-\`\`\`sql
-EXPLAIN SELECT * FROM orders
-WHERE user_id = 123 AND status = 'pending'
-ORDER BY created_at DESC;
-\`\`\`
-
-关注 \`type\` 列：\`ALL\` = 全表扫描（需要优化），\`ref\`/\`range\` = 已用索引。
-
-### 2. 复合索引列顺序原则
-
-遵循**最左前缀**原则，同时按选择性排序：
-
-- **等值条件**的列放前面
-- **范围条件**的列放后面
-- **ORDER BY** 的列尽量纳入索引
-
-\`\`\`sql
--- ✅ 针对上面查询的优化索引
-CREATE INDEX idx_orders_user_status_time
-ON orders(user_id, status, created_at);
-\`\`\`
-
-### 3. 验证效果
-
-再次 EXPLAIN 确认 \`type\` 变为 \`ref\` 或更好。`,
-        timestamp: "16:23",
-        date: "2026-02-16",
-        model: "1.5 Flash",
-      },
-    ],
+    createdAt: "2026-02-16T16:00:00Z",
+    updatedAt: "2026-02-16T16:23:00Z",
+    syncedAt: "2026-02-16T17:00:00Z",
+    remoteHash: null,
+    messages: [],
   },
   {
     id: "c_005",
+    accountId: "acc_1",
     title: "Docker 多阶段构建",
-    lastMessage: "最终镜像只包含运行时必要文件...",
-    updatedAt: "2026-02-15",
-    updatedTime: "11:40",
-    messages: [],
-  },
-  {
-    id: "c_006",
-    title: "TypeScript 高级类型",
-    lastMessage: "条件类型和映射类型的组合使用...",
-    updatedAt: "2026-02-14",
-    updatedTime: "20:15",
-    messages: [],
-  },
-  {
-    id: "c_007",
-    title: "系统设计：消息队列",
-    lastMessage: "Kafka 的 partition 机制保证顺序消费...",
-    updatedAt: "2026-02-13",
-    updatedTime: "08:52",
-    messages: [],
-  },
-  {
-    id: "c_008",
-    title: "CSS Grid 布局技巧",
-    lastMessage: "grid-template-areas 让布局更直观...",
-    updatedAt: "2026-02-12",
-    updatedTime: "19:07",
+    createdAt: "2026-02-15T11:00:00Z",
+    updatedAt: "2026-02-15T11:40:00Z",
+    syncedAt: "2026-02-15T12:00:00Z",
+    remoteHash: null,
     messages: [],
   },
 ];
 
-export interface Account {
-  id: string;
-  name: string;
-  email: string;
-  avatarText: string;
-  avatarColor: string;
-  conversationCount: number;
-  lastSync: string;
+export function conversationToSummary(conv: Conversation): ConversationSummary {
+  const lastMsg = conv.messages[conv.messages.length - 1];
+  return {
+    id: conv.id,
+    title: conv.title,
+    lastMessage: lastMsg ? lastMsg.text.replace(/\n/g, " ").slice(0, 80) : "",
+    messageCount: conv.messages.length,
+    hasMedia: conv.messages.some((m) => m.attachments.length > 0),
+    updatedAt: conv.updatedAt,
+    syncedAt: conv.syncedAt,
+    remoteHash: conv.remoteHash,
+  };
 }
 
-export const mockAccounts: Account[] = [
-  {
-    id: "acc_1",
-    name: "user1",
-    email: "user1@example.com",
-    avatarText: "R",
-    avatarColor: "linear-gradient(135deg, #667eea 0%, #764ba2 100%)",
-    conversationCount: 8,
-    lastSync: "2026-02-19",
-  },
-  {
-    id: "acc_2",
-    name: "work_account",
-    email: "work@company.com",
-    avatarText: "W",
-    avatarColor: "linear-gradient(135deg, #f093fb 0%, #f5576c 100%)",
-    conversationCount: 23,
-    lastSync: "2026-02-18",
-  },
-  {
-    id: "acc_3",
-    name: "alice_dev",
-    email: "alice@example.com",
-    avatarText: "A",
-    avatarColor: "linear-gradient(135deg, #4facfe 0%, #00f2fe 100%)",
-    conversationCount: 5,
-    lastSync: "2026-02-15",
-  },
-];
+export const mockConversationSummaries: ConversationSummary[] =
+  mockConversations.map(conversationToSummary);

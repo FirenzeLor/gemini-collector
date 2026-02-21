@@ -4,19 +4,21 @@ import { useTheme } from "../theme";
 
 interface AccountPickerProps {
   accounts: Account[];
+  loading: boolean;
   onSelect: (account: Account) => void;
   isDark: boolean;
   onToggleDark: () => void;
 }
 
-export function AccountPicker({ accounts, onSelect, isDark, onToggleDark }: AccountPickerProps) {
+export function AccountPicker({ accounts, loading, onSelect, isDark, onToggleDark }: AccountPickerProps) {
   const t = useTheme();
 
   return (
     <div style={{ width: "100vw", height: "100vh", background: t.appBg, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", position: "relative" }}>
       {/* Drag region for window */}
       <div data-tauri-drag-region style={{ position: "absolute", top: 0, left: 0, right: 0, height: 52 }} />
-      {/* Dark mode toggle - top right */}
+
+      {/* Dark mode toggle */}
       <button
         onClick={onToggleDark}
         title={isDark ? "切换到亮色模式" : "切换到暗色模式"}
@@ -29,6 +31,7 @@ export function AccountPicker({ accounts, onSelect, isDark, onToggleDark }: Acco
           : <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={t.textSub} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
         }
       </button>
+
       {/* App identity */}
       <div style={{ textAlign: "center", marginBottom: 36 }}>
         <div style={{ width: 56, height: 56, borderRadius: 16, background: "linear-gradient(135deg, #4285f4 0%, #34a853 50%, #ea4335 100%)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 14px", boxShadow: "0 4px 16px rgba(66,133,244,0.3)" }}>
@@ -38,18 +41,33 @@ export function AccountPicker({ accounts, onSelect, isDark, onToggleDark }: Acco
         <div style={{ fontSize: 13, color: t.textSub, marginTop: 4 }}>选择要使用的账号</div>
       </div>
 
-      {/* Account list */}
-      <div style={{ width: 360, background: t.cardBg, borderRadius: 16, boxShadow: t.isDark ? "0 2px 24px rgba(0,0,0,0.4)" : "0 2px 24px rgba(0,0,0,0.09)", overflow: "hidden" }}>
-        {accounts.map((account, i) => (
-          <AccountRow key={account.id} account={account} showDivider={i < accounts.length - 1} onClick={() => onSelect(account)} />
-        ))}
-        {/* Add account */}
-        <div style={{ borderTop: `1px solid ${t.divider}`, padding: "13px 18px", display: "flex", alignItems: "center", gap: 12, cursor: "not-allowed", opacity: 0.4 }}>
-          <div style={{ width: 36, height: 36, borderRadius: "50%", border: `1.5px dashed ${t.textMuted}`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={t.textSub} strokeWidth="2" strokeLinecap="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>
+      {/* Content area */}
+      <div style={{ width: 360, background: t.cardBg, borderRadius: 16, boxShadow: t.isDark ? "0 2px 24px rgba(0,0,0,0.4)" : "0 2px 24px rgba(0,0,0,0.09)", overflow: "hidden", minHeight: 64 }}>
+        {loading ? (
+          /* Loading state */
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: 32 }}>
+            <SpinnerIcon color={t.textMuted} />
           </div>
-          <span style={{ fontSize: 14, color: t.text }}>添加账号</span>
-        </div>
+        ) : accounts.length === 0 ? (
+          /* No accounts */
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", padding: "28px 24px" }}>
+            <div style={{ fontSize: 13, color: t.textSub, textAlign: "center", lineHeight: 1.6 }}>
+              未找到本地账号数据。<br />
+              应用已自动尝试从本地浏览器 Cookies 导入账号。<br />
+              请确认已在 Chrome 登录 Gemini 后重新打开应用。
+            </div>
+          </div>
+        ) : (
+          /* Account list */
+          accounts.map((account, i) => (
+            <AccountRow
+              key={account.id}
+              account={account}
+              showDivider={i < accounts.length - 1}
+              onClick={() => onSelect(account)}
+            />
+          ))
+        )}
       </div>
     </div>
   );
@@ -75,9 +93,21 @@ function AccountRow({ account, showDivider, onClick }: { account: Account; showD
       </div>
       <div style={{ textAlign: "right", flexShrink: 0 }}>
         <div style={{ fontSize: 12, color: t.textMuted }}>{account.conversationCount} 条对话</div>
-        <div style={{ fontSize: 11, color: t.textMuted, marginTop: 1 }}>{account.lastSync}</div>
+        <div style={{ fontSize: 11, color: t.textMuted, marginTop: 1 }}>{account.lastSyncAt ? account.lastSyncAt.slice(0, 10) : "未同步"}</div>
       </div>
       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke={t.textMuted} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="9 18 15 12 9 6" /></svg>
     </div>
+  );
+}
+
+function SpinnerIcon({ color }: { color: string }) {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"
+      style={{ animation: "spin 0.9s linear infinite", flexShrink: 0 }}>
+      <style>{`@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}`}</style>
+      <polyline points="23 4 23 10 17 10" />
+      <polyline points="1 20 1 14 7 14" />
+      <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+    </svg>
   );
 }

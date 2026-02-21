@@ -2,6 +2,10 @@ import React from "react";
 import { Conversation } from "../data/mockData";
 import { useTheme } from "../theme";
 
+function formatDate(iso: string): string {
+  return iso.slice(0, 10);
+}
+
 interface TopBarProps {
   selectedConversation: Conversation | null;
   sidebarCollapsed: boolean;
@@ -51,7 +55,7 @@ export function TopBar({
         <div style={{ position: "absolute", left: "50%", transform: "translateX(-50%)", textAlign: "center", pointerEvents: "none", whiteSpace: "nowrap" }}>
           <div style={{ fontSize: 13, fontWeight: 600, color: t.text }}>{selectedConversation.title}</div>
           <div style={{ fontSize: 11, color: t.textSub, marginTop: 1 }}>
-            {selectedConversation.messages.length} 条消息 · {selectedConversation.updatedAt}
+            {selectedConversation.messages.length} 条消息 · {formatDate(selectedConversation.updatedAt)}
           </div>
         </div>
       )}
@@ -84,7 +88,7 @@ export function TopBar({
   );
 }
 
-function iconBtn(hoverBg: string): React.CSSProperties {
+function iconBtn(_hoverBg?: string): React.CSSProperties {
   return {
     width: 28,
     height: 28,
