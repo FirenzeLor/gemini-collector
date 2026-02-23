@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Virtuoso } from "react-virtuoso";
 import { ConversationSummary, Account } from "../data/mockData";
 import { useTheme } from "../theme";
@@ -51,6 +51,12 @@ export function Sidebar({
   const [showSwitcher, setShowSwitcher] = useState(false);
   const syncingSet = new Set(syncingConversationIds);
   const otherAccounts = accounts.filter((a) => a.id !== currentAccount.id);
+
+  useEffect(() => {
+    if (disableAccountSwitch && showSwitcher) {
+      setShowSwitcher(false);
+    }
+  }, [disableAccountSwitch, showSwitcher]);
 
   function handleSyncConv(id: string) {
     if (disableConversationSync || syncingSet.has(id)) return;
@@ -136,7 +142,10 @@ export function Sidebar({
       </div>
 
       <div
-        onMouseEnter={() => setShowSwitcher(true)}
+        onMouseEnter={() => {
+          if (disableAccountSwitch) return;
+          setShowSwitcher(true);
+        }}
         onMouseLeave={() => setShowSwitcher(false)}
         style={{ padding: "0 6px 6px", minWidth: 260, position: "relative" }}
       >
@@ -272,6 +281,18 @@ function ConversationItem({ conversation, selected, onClick, syncing, onSync }: 
   onSync: () => void;
 }) {
   const t = useTheme();
+  const [copied, setCopied] = useState(false);
+
+  function handleCopyConversationId() {
+    void navigator.clipboard.writeText(conversation.id)
+      .then(() => {
+        setCopied(true);
+        window.setTimeout(() => setCopied(false), 850);
+      })
+      .catch((e) => {
+        console.error("复制对话 ID 失败:", e);
+      });
+  }
 
   return (
     <div
@@ -280,6 +301,14 @@ function ConversationItem({ conversation, selected, onClick, syncing, onSync }: 
       onMouseEnter={(e) => { if (!selected) (e.currentTarget as HTMLElement).style.background = t.hover; }}
       onMouseLeave={(e) => { if (!selected) (e.currentTarget as HTMLElement).style.background = "transparent"; }}
     >
+      {conversation.hasFailedData && (
+        <span
+          title="该会话存在失败数据（通常是媒体下载失败）"
+          style={{ fontSize: 12, lineHeight: 1, flexShrink: 0 }}
+        >
+          ⚠️
+        </span>
+      )}
       <div style={{ flex: 1, overflow: "hidden", minWidth: 0 }}>
         <div style={{ fontSize: 13, fontWeight: selected ? 600 : 400, color: selected ? t.selectedText : t.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginBottom: 2 }}>
           {conversation.title}
@@ -290,15 +319,26 @@ function ConversationItem({ conversation, selected, onClick, syncing, onSync }: 
           <span>{conversation.messageCount} 条</span>
         </div>
       </div>
-      <button
-        onClick={(e) => { e.stopPropagation(); onSync(); }}
-        title="同步此对话"
-        style={{ width: 26, height: 26, borderRadius: 7, border: "none", background: "transparent", cursor: syncing ? "default" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, transition: "background 0.15s" }}
-        onMouseEnter={(e) => { e.stopPropagation(); if (!syncing) (e.currentTarget as HTMLElement).style.background = t.btnHoverBg; }}
-        onMouseLeave={(e) => { e.stopPropagation(); (e.currentTarget as HTMLElement).style.background = "transparent"; }}
-      >
-        <SyncIcon spinning={syncing} color={syncing ? "#0071e3" : t.textMuted} />
-      </button>
+      <div style={{ display: "flex", alignItems: "center", gap: 1, marginLeft: 3, marginRight: -2 }}>
+        <button
+          onClick={(e) => { e.stopPropagation(); handleCopyConversationId(); }}
+          title={copied ? "已复制" : "复制对话 ID"}
+          style={{ width: 24, height: 24, borderRadius: 7, border: "none", background: "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, transition: "background 0.15s" }}
+          onMouseEnter={(e) => { e.stopPropagation(); (e.currentTarget as HTMLElement).style.background = t.btnHoverBg; }}
+          onMouseLeave={(e) => { e.stopPropagation(); (e.currentTarget as HTMLElement).style.background = "transparent"; }}
+        >
+          {copied ? <CheckIcon color="#16a34a" /> : <CopyIcon color={t.textMuted} />}
+        </button>
+        <button
+          onClick={(e) => { e.stopPropagation(); onSync(); }}
+          title="同步此对话"
+          style={{ width: 24, height: 24, borderRadius: 7, border: "none", background: "transparent", cursor: syncing ? "default" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, transition: "background 0.15s" }}
+          onMouseEnter={(e) => { e.stopPropagation(); if (!syncing) (e.currentTarget as HTMLElement).style.background = t.btnHoverBg; }}
+          onMouseLeave={(e) => { e.stopPropagation(); (e.currentTarget as HTMLElement).style.background = "transparent"; }}
+        >
+          <SyncIcon spinning={syncing} color={syncing ? "#0071e3" : t.textMuted} />
+        </button>
+      </div>
     </div>
   );
 }
@@ -327,6 +367,23 @@ function TrashIcon({ color }: { color: string }) {
       <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
       <line x1="10" y1="11" x2="10" y2="17" />
       <line x1="14" y1="11" x2="14" y2="17" />
+    </svg>
+  );
+}
+
+function CopyIcon({ color }: { color: string }) {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+    </svg>
+  );
+}
+
+function CheckIcon({ color }: { color: string }) {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round">
+      <polyline points="20 6 9 17 4 12" />
     </svg>
   );
 }

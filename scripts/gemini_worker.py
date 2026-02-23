@@ -214,7 +214,10 @@ class GeminiWorker:
             exporter = self._get_exporter(account_id, force_refresh=True)
             return fn(exporter)
 
-    def _load_conversation_ids(self, account_id: str) -> list[str]:
+    def _log(self, phase: str, message: str) -> None:
+        print(f"[worker:{phase}] {message}", file=sys.stderr, flush=True)
+
+    def _load_conversation_items(self, account_id: str) -> list[dict[str, Any]]:
         conv_index = self.output_dir / "accounts" / account_id / "conversations.json"
         if not conv_index.exists():
             return []
@@ -223,16 +226,129 @@ class GeminiWorker:
         except Exception:
             return []
         items = data.get("items", []) if isinstance(data, dict) else []
-        if not isinstance(items, list):
-            return []
+        return [row for row in items if isinstance(row, dict)]
+
+    def _load_conversation_ids(self, account_id: str) -> list[str]:
         out: list[str] = []
-        for row in items:
-            if not isinstance(row, dict):
-                continue
+        for row in self._load_conversation_items(account_id):
             cid = row.get("id")
             if isinstance(cid, str) and cid.strip():
                 out.append(cid.strip())
         return out
+
+    @staticmethod
+    def _jsonl_has_failed_marker(jsonl_path: Path) -> bool:
+        if not jsonl_path.exists():
+            return False
+        try:
+            return '"downloadFailed": true' in jsonl_path.read_text(encoding="utf-8")
+        except Exception:
+            return False
+
+    @staticmethod
+    def _jsonl_has_message_rows(jsonl_path: Path) -> bool:
+        if not jsonl_path.exists():
+            return False
+        try:
+            with jsonl_path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    if '"type": "message"' in line:
+                        return True
+        except Exception:
+            return False
+        return False
+
+    def _collect_failed_conversation_ids(self, account_id: str) -> list[str]:
+        account_dir = self.output_dir / "accounts" / account_id
+        conv_dir = account_dir / "conversations"
+        ids: set[str] = set()
+
+        sync_state_file = account_dir / "sync_state.json"
+        if sync_state_file.exists():
+            try:
+                sync_state = json.loads(sync_state_file.read_text(encoding="utf-8"))
+            except Exception:
+                sync_state = {}
+            full_sync = sync_state.get("fullSync") if isinstance(sync_state, dict) else None
+            failed = full_sync.get("conversationsFailed") if isinstance(full_sync, dict) else []
+            if isinstance(failed, list):
+                for cid in failed:
+                    if isinstance(cid, str) and cid.strip():
+                        ids.add(cid.strip())
+
+        if conv_dir.exists():
+            for jsonl_path in conv_dir.glob("*.jsonl"):
+                if self._jsonl_has_failed_marker(jsonl_path):
+                    ids.add(jsonl_path.stem)
+
+        return sorted(ids)
+
+    def _collect_empty_conversation_ids(self, account_id: str) -> list[str]:
+        account_dir = self.output_dir / "accounts" / account_id
+        conv_dir = account_dir / "conversations"
+        out: list[str] = []
+
+        for row in self._load_conversation_items(account_id):
+            cid = row.get("id")
+            if not isinstance(cid, str) or not cid.strip():
+                continue
+            cid = cid.strip()
+            jsonl_path = conv_dir / f"{cid}.jsonl"
+            synced_at = row.get("syncedAt")
+            message_count = row.get("messageCount")
+            index_empty = synced_at is None or message_count == 0
+            local_empty = not self._jsonl_has_message_rows(jsonl_path)
+            if index_empty or local_empty:
+                out.append(cid)
+
+        return out
+
+    def _sync_conversation_batch(
+        self,
+        job: Dict[str, Any],
+        account_id: str,
+        conv_ids: list[str],
+        phase: str,
+    ) -> Dict[str, Any]:
+        total = len(conv_ids)
+        if total == 0:
+            self._emit_job_state(job, "running", phase=phase, progress={"current": 0, "total": 0})
+            return {"succeeded": [], "failed": []}
+
+        succeeded: list[str] = []
+        failed: list[str] = []
+
+        for idx, cid in enumerate(conv_ids, start=1):
+            sub_job = {
+                "jobId": f"{job['jobId']}:conv:{phase}:{cid}",
+                "type": "sync_conversation",
+                "accountId": account_id,
+                "conversationId": cid,
+            }
+            progress = {"current": idx - 1, "total": total}
+            self._emit_job_state(sub_job, "running", phase=phase, progress=progress)
+            try:
+                self._execute_sync_conversation(sub_job)
+                self._emit_job_state(sub_job, "done", phase=phase, progress={"current": idx, "total": total})
+                succeeded.append(cid)
+            except Exception as exc:
+                self._emit_job_state(
+                    sub_job,
+                    "failed",
+                    phase=phase,
+                    progress={"current": idx, "total": total},
+                    error=self._to_error(exc),
+                )
+                failed.append(cid)
+
+            self._emit_job_state(
+                job,
+                "running",
+                phase=phase,
+                progress={"current": idx, "total": total},
+            )
+
+        return {"succeeded": succeeded, "failed": failed}
 
     def _execute_sync_list(self, job: Dict[str, Any]) -> Dict[str, Any]:
         account_id = job["accountId"]
@@ -271,46 +387,50 @@ class GeminiWorker:
 
     def _execute_sync_full(self, job: Dict[str, Any]) -> Dict[str, Any]:
         account_id = job["accountId"]
+        success_ids: set[str] = set()
+        failed_ids: set[str] = set()
 
-        self._emit_job_state(job, "running", phase="list")
+        self._log("sync_full", f"开始全量同步: account={account_id}")
+
+        retry_failed_ids = self._collect_failed_conversation_ids(account_id)
+        self._log("retry_failed", f"失败记录重试: {len(retry_failed_ids)}")
+        retry_result = self._sync_conversation_batch(job, account_id, retry_failed_ids, "retry_failed")
+        success_ids.update(retry_result["succeeded"])
+        failed_ids.update(retry_result["failed"])
+        failed_ids.difference_update(retry_result["succeeded"])
+
+        empty_ids = [cid for cid in self._collect_empty_conversation_ids(account_id) if cid not in success_ids]
+        self._log("sync_empty", f"空会话补齐: {len(empty_ids)}")
+        empty_result = self._sync_conversation_batch(job, account_id, empty_ids, "sync_empty")
+        success_ids.update(empty_result["succeeded"])
+        failed_ids.update(empty_result["failed"])
+        failed_ids.difference_update(empty_result["succeeded"])
+
+        before_ids = self._load_conversation_ids(account_id)
+        self._emit_job_state(job, "running", phase="refresh_list")
+        self._log("refresh_list", "拉取最新列表并识别新增会话")
         self._execute_sync_list(job)
+        after_ids = self._load_conversation_ids(account_id)
+        before_set = set(before_ids)
+        new_ids = [cid for cid in after_ids if cid not in before_set and cid not in success_ids]
 
-        conv_ids = self._load_conversation_ids(account_id)
-        total = len(conv_ids)
-        failed = 0
+        self._log("sync_new", f"新增会话同步: {len(new_ids)}")
+        new_result = self._sync_conversation_batch(job, account_id, new_ids, "sync_new")
+        success_ids.update(new_result["succeeded"])
+        failed_ids.update(new_result["failed"])
+        failed_ids.difference_update(new_result["succeeded"])
 
-        for idx, cid in enumerate(conv_ids, start=1):
-            sub_job = {
-                "jobId": f"{job['jobId']}:conv:{cid}",
-                "type": "sync_conversation",
-                "accountId": account_id,
-                "conversationId": cid,
-            }
-            progress = {"current": idx - 1, "total": total}
-            self._emit_job_state(sub_job, "running", phase="conversation", progress=progress)
-            try:
-                self._execute_sync_conversation(sub_job)
-                progress = {"current": idx, "total": total}
-                self._emit_job_state(sub_job, "done", phase="conversation", progress=progress)
-            except Exception as exc:
-                failed += 1
-                progress = {"current": idx, "total": total}
-                self._emit_job_state(
-                    sub_job,
-                    "failed",
-                    phase="conversation",
-                    progress=progress,
-                    error=self._to_error(exc),
-                )
+        remaining_old_ids = [cid for cid in after_ids if cid not in success_ids]
+        self._log("sync_old", f"剩余老会话检查更新: {len(remaining_old_ids)}")
+        old_result = self._sync_conversation_batch(job, account_id, remaining_old_ids, "sync_old")
+        success_ids.update(old_result["succeeded"])
+        failed_ids.update(old_result["failed"])
+        failed_ids.difference_update(old_result["succeeded"])
 
-            self._emit_job_state(
-                job,
-                "running",
-                phase="conversation",
-                progress={"current": idx, "total": total},
-            )
-
-        return {"total": total, "failed": failed}
+        total = len(after_ids)
+        self._emit_job_state(job, "running", phase="sync_old", progress={"current": total, "total": total})
+        self._log("sync_full", f"全量同步结束: total={total}, failed={len(failed_ids)}")
+        return {"total": total, "failed": len(failed_ids), "progress": {"current": total, "total": total}}
 
     def _execute_job(self, job: Dict[str, Any]) -> Dict[str, Any]:
         job_type = job["type"]
