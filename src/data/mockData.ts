@@ -38,6 +38,8 @@ export interface ConversationSummary {
   messageCount: number;
   hasMedia: boolean;
   hasFailedData?: boolean;
+  imageCount?: number;
+  videoCount?: number;
   updatedAt: string;        // ISO 8601
   syncedAt: string | null;
   remoteHash: string | null;

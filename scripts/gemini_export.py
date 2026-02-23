@@ -1890,6 +1890,12 @@ class GeminiExporter:
         msg_count = existing.get("messageCount", 0)
         if not isinstance(msg_count, int):
             msg_count = 0
+        image_count = existing.get("imageCount", 0)
+        if not isinstance(image_count, int) or image_count < 0:
+            image_count = 0
+        video_count = existing.get("videoCount", 0)
+        if not isinstance(video_count, int) or video_count < 0:
+            video_count = 0
 
         return {
             "id": bare_id,
@@ -1898,6 +1904,8 @@ class GeminiExporter:
             "messageCount": msg_count,
             "hasMedia": bool(existing.get("hasMedia", False)),
             "hasFailedData": bool(existing.get("hasFailedData", False)),
+            "imageCount": image_count,
+            "videoCount": video_count,
             "updatedAt": updated_at,
             "syncedAt": existing.get("syncedAt"),
             "remoteHash": remote_hash,
@@ -2046,6 +2054,29 @@ class GeminiExporter:
                 if row.get("type") == "message":
                     count += 1
         return count
+
+    @staticmethod
+    def _count_media_types_from_rows(rows):
+        image_count = 0
+        video_count = 0
+        for row in rows:
+            if not isinstance(row, dict) or row.get("type") != "message":
+                continue
+            attachments = row.get("attachments")
+            if not isinstance(attachments, list):
+                continue
+            for att in attachments:
+                if not isinstance(att, dict):
+                    continue
+                mime_type = att.get("mimeType")
+                if not isinstance(mime_type, str):
+                    continue
+                mime_lower = mime_type.lower()
+                if mime_lower.startswith("image/"):
+                    image_count += 1
+                elif mime_lower.startswith("video/"):
+                    video_count += 1
+        return image_count, video_count
 
     @staticmethod
     def _rows_has_failed_data(rows):
@@ -2479,6 +2510,8 @@ class GeminiExporter:
                     "messageCount": 0,
                     "hasMedia": False,
                     "hasFailedData": False,
+                    "imageCount": 0,
+                    "videoCount": 0,
                     "updatedAt": chat_info.get("latest_update_iso"),
                     "syncedAt": None,
                     "remoteHash": None,
@@ -2486,6 +2519,12 @@ class GeminiExporter:
             progress_summary["id"] = bare_id
             progress_summary["title"] = progress_summary.get("title") or title
             progress_summary["messageCount"] = progress_count
+            progress_summary["imageCount"] = _safe_int(progress_summary.get("imageCount"), 0)
+            if progress_summary["imageCount"] < 0:
+                progress_summary["imageCount"] = 0
+            progress_summary["videoCount"] = _safe_int(progress_summary.get("videoCount"), 0)
+            if progress_summary["videoCount"] < 0:
+                progress_summary["videoCount"] = 0
             progress_summary["hasFailedData"] = bool(progress_summary.get("hasFailedData", False))
             progress_summary["syncedAt"] = now_iso_local
             if not progress_summary.get("updatedAt") and chat_info.get("latest_update_iso"):
@@ -2643,6 +2682,7 @@ class GeminiExporter:
                 ]
                 has_media = any(r.get("attachments") for r in all_msg_rows)
                 has_failed_data = self._rows_has_failed_data(all_msg_rows)
+                image_count, video_count = self._count_media_types_from_rows(all_msg_rows)
                 last_text = ""
                 for r in reversed(all_msg_rows):
                     if r.get("text"):
@@ -2656,6 +2696,8 @@ class GeminiExporter:
                     "messageCount": len(all_msg_rows),
                     "hasMedia": has_media,
                     "hasFailedData": has_failed_data,
+                    "imageCount": image_count,
+                    "videoCount": video_count,
                     "updatedAt": meta_row.get("updatedAt"),
                     "syncedAt": meta_row.get("syncedAt"),
                     "remoteHash": meta_row.get("remoteHash"),
@@ -2671,12 +2713,22 @@ class GeminiExporter:
                         "messageCount": 0,
                         "hasMedia": False,
                         "hasFailedData": False,
+                        "imageCount": 0,
+                        "videoCount": 0,
                         "updatedAt": chat_info.get("latest_update_iso"),
                         "syncedAt": now_iso,
                         "remoteHash": None,
                     }
                 summary["id"] = bare_id
                 summary["title"] = summary.get("title") or title
+                image_count = summary.get("imageCount")
+                if not isinstance(image_count, int) or image_count < 0:
+                    image_count = 0
+                summary["imageCount"] = image_count
+                video_count = summary.get("videoCount")
+                if not isinstance(video_count, int) or video_count < 0:
+                    video_count = 0
+                summary["videoCount"] = video_count
                 if chat_info.get("latest_update_iso") and not summary.get("updatedAt"):
                     summary["updatedAt"] = chat_info.get("latest_update_iso")
                 if chat_info.get("latest_update_ts") is not None:
@@ -2727,6 +2779,7 @@ class GeminiExporter:
             ]
             has_media = any(r.get("attachments") for r in msg_rows)
             has_failed_data = self._rows_has_failed_data(msg_rows)
+            image_count, video_count = self._count_media_types_from_rows(msg_rows)
             last_text = ""
             for r in reversed(msg_rows):
                 if r.get("text"):
@@ -2740,6 +2793,8 @@ class GeminiExporter:
                 "messageCount": len(msg_rows),
                 "hasMedia": has_media,
                 "hasFailedData": has_failed_data,
+                "imageCount": image_count,
+                "videoCount": video_count,
                 "updatedAt": meta_row.get("updatedAt") or chat_info.get("latest_update_iso"),
                 "syncedAt": meta_row.get("syncedAt"),
                 "remoteHash": meta_row.get("remoteHash"),
@@ -2915,6 +2970,7 @@ class GeminiExporter:
                 ]
                 has_media = any(r.get("attachments") for r in msg_rows)
                 has_failed_data = self._rows_has_failed_data(msg_rows)
+                image_count, video_count = self._count_media_types_from_rows(msg_rows)
                 last_text = ""
                 for r in reversed(msg_rows):
                     if r.get("text"):
@@ -2928,6 +2984,8 @@ class GeminiExporter:
                     "messageCount": len(msg_rows),
                     "hasMedia": has_media,
                     "hasFailedData": has_failed_data,
+                    "imageCount": image_count,
+                    "videoCount": video_count,
                     "updatedAt": meta_row.get("updatedAt"),
                     "syncedAt": meta_row.get("syncedAt"),
                     "remoteHash": meta_row.get("remoteHash"),
@@ -2946,6 +3004,8 @@ class GeminiExporter:
                     "messageCount": 0,
                     "hasMedia": False,
                     "hasFailedData": False,
+                    "imageCount": 0,
+                    "videoCount": 0,
                     "updatedAt": chat.get("latest_update_iso"),
                     "syncedAt": None,
                     "remoteHash": None,
@@ -3156,6 +3216,7 @@ class GeminiExporter:
             ]
             has_media = any(r.get("attachments") for r in all_msg_rows)
             has_failed_data = self._rows_has_failed_data(all_msg_rows)
+            image_count, video_count = self._count_media_types_from_rows(all_msg_rows)
             last_text = ""
             for r in reversed(all_msg_rows):
                 if r.get("text"):
@@ -3169,6 +3230,8 @@ class GeminiExporter:
                 "messageCount": len(all_msg_rows),
                 "hasMedia": has_media,
                 "hasFailedData": has_failed_data,
+                "imageCount": image_count,
+                "videoCount": video_count,
                 "updatedAt": meta_row.get("updatedAt"),
                 "syncedAt": meta_row.get("syncedAt"),
                 "remoteHash": meta_row.get("remoteHash"),
@@ -3189,6 +3252,8 @@ class GeminiExporter:
                     "messageCount": 0,
                     "hasMedia": False,
                     "hasFailedData": False,
+                    "imageCount": 0,
+                    "videoCount": 0,
                     "updatedAt": chat.get("latest_update_iso"),
                     "syncedAt": None,
                     "remoteHash": None,

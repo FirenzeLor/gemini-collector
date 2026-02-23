@@ -4,8 +4,12 @@ import remarkGfm from "remark-gfm";
 import { Virtuoso } from "react-virtuoso";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
+import { oneLight, vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { Attachment, Conversation, ConvMessage } from "../data/mockData";
 import { useTheme } from "../theme";
+
+const loadedImageUrlCache = new Set<string>();
 
 function getKind(mimeType: string): "image" | "video" | "file" {
   if (mimeType.startsWith("image/")) return "image";
@@ -90,6 +94,82 @@ function fixMarkdown(content: string): string {
     .replace(/iemoji:([^:\s)]{1,20})/g, "$1")
     .replace(/([^\x00-\x7F])(\*+)/g, "$1\u200B$2")
     .replace(/(\*+)([^\x00-\x7F])/g, "$1\u200B$2");
+}
+
+function markdownCodeLanguage(className?: string): string {
+  const matched = /language-([\w-]+)/.exec(className || "");
+  return matched?.[1] || "text";
+}
+
+function MarkdownCodeBlock({
+  code,
+  language,
+  isDark,
+}: {
+  code: string;
+  language: string;
+  isDark: boolean;
+}) {
+  const [copied, setCopied] = useState(false);
+
+  function handleCopy() {
+    void navigator.clipboard.writeText(code)
+      .then(() => {
+        setCopied(true);
+        window.setTimeout(() => setCopied(false), 900);
+      })
+      .catch((e) => {
+        console.error("复制代码失败:", e);
+      });
+  }
+
+  return (
+    <div style={{ position: "relative", margin: "0.6em 0" }}>
+      <button
+        onClick={handleCopy}
+        title={copied ? "已复制" : "复制代码"}
+        style={{
+          position: "absolute",
+          top: 8,
+          right: 8,
+          zIndex: 2,
+          border: "none",
+          borderRadius: 6,
+          padding: "2px 8px",
+          fontSize: 11,
+          background: copied
+            ? "rgba(22,163,74,0.9)"
+            : (isDark ? "rgba(15,23,42,0.7)" : "rgba(255,255,255,0.85)"),
+          color: copied ? "#fff" : (isDark ? "#dbeafe" : "#334155"),
+          borderColor: isDark ? "rgba(148,163,184,0.25)" : "rgba(148,163,184,0.45)",
+          borderStyle: "solid",
+          borderWidth: 1,
+          cursor: "pointer",
+        }}
+      >
+        {copied ? "已复制" : "复制"}
+      </button>
+      <SyntaxHighlighter
+        language={language}
+        style={isDark ? vscDarkPlus : oneLight}
+        customStyle={{
+          margin: 0,
+          borderRadius: 8,
+          padding: "12px 14px",
+          fontSize: 12.5,
+          lineHeight: 1.6,
+          background: isDark ? "#121826" : "#f8fafc",
+        }}
+        codeTagProps={{
+          style: {
+            fontFamily: "\"SF Mono\", \"Fira Code\", monospace",
+          },
+        }}
+      >
+        {code}
+      </SyntaxHighlighter>
+    </div>
+  );
 }
 
 // Format ISO 8601 timestamp to "HH:MM"
@@ -249,18 +329,12 @@ function AttachmentStrip({
             const url = buildUrl(att.mediaId, mediaDir, cacheKey);
             const kind = getKind(att.mimeType);
             return kind === "image" ? (
-              <div
+              <ImageThumbnail
                 key={i}
+                url={url}
+                alt={att.mediaId}
                 onClick={() => setLightboxIdx(i)}
-                style={{ width: 120, height: 120, borderRadius: 14, overflow: "hidden", cursor: "pointer", flexShrink: 0, background: "#222", boxShadow: "0 2px 8px rgba(0,0,0,0.25)" }}
-              >
-                <img
-                  src={url}
-                  alt={att.mediaId}
-                  style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
-                  draggable={false}
-                />
-              </div>
+              />
             ) : (
               <div
                 key={i}
@@ -314,6 +388,98 @@ function AttachmentStrip({
         />
       )}
     </>
+  );
+}
+
+function ImageThumbnail({
+  url,
+  alt,
+  onClick,
+}: {
+  url: string;
+  alt: string;
+  onClick: () => void;
+}) {
+  const t = useTheme();
+  const imgRef = React.useRef<HTMLImageElement | null>(null);
+  const [loading, setLoading] = useState(() => !!url && !loadedImageUrlCache.has(url));
+
+  React.useEffect(() => {
+    if (!url || loadedImageUrlCache.has(url)) {
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
+  }, [url]);
+
+  React.useEffect(() => {
+    const img = imgRef.current;
+    if (!img || !url) return;
+    if (img.complete && img.naturalWidth > 0) {
+      loadedImageUrlCache.add(url);
+      setLoading(false);
+    }
+  }, [url]);
+
+  return (
+    <div
+      onClick={onClick}
+      style={{
+        width: 120,
+        height: 120,
+        borderRadius: 14,
+        overflow: "hidden",
+        cursor: "pointer",
+        flexShrink: 0,
+        background: t.isDark ? "#1a1a1c" : "#d9d9dc",
+        boxShadow: "0 2px 8px rgba(0,0,0,0.25)",
+        position: "relative",
+      }}
+    >
+      <img
+        ref={imgRef}
+        src={url}
+        alt={alt}
+        onLoad={() => {
+          if (url) loadedImageUrlCache.add(url);
+          setLoading(false);
+        }}
+        onError={() => setLoading(false)}
+        style={{
+          width: "100%",
+          height: "100%",
+          objectFit: "cover",
+          display: "block",
+          opacity: loading ? 0.62 : 1,
+          transition: "opacity 0.22s ease-out",
+        }}
+        draggable={false}
+      />
+      {loading && (
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            pointerEvents: "none",
+            background: t.isDark ? "rgba(0,0,0,0.15)" : "rgba(255,255,255,0.2)",
+          }}
+        >
+          <div
+            style={{
+              position: "absolute",
+              inset: 0,
+              backgroundImage: t.isDark
+                ? "repeating-linear-gradient(135deg, rgba(255,255,255,0.03) 0 16px, rgba(255,255,255,0.12) 16px 32px, rgba(255,255,255,0.03) 32px 48px)"
+                : "repeating-linear-gradient(135deg, rgba(255,255,255,0.10) 0 16px, rgba(255,255,255,0.30) 16px 32px, rgba(255,255,255,0.10) 32px 48px)",
+              backgroundSize: "260px 260px",
+              animation: "mediaLoadingDiagonalSweep 3.2s linear infinite",
+              opacity: t.isDark ? 0.55 : 0.5,
+              willChange: "background-position",
+            }}
+          />
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -480,6 +646,26 @@ function MessageBubble({
                         {children}
                       </a>
                     ),
+                    pre: ({ children }) => <>{children}</>,
+                    code: ({ className, children, ...props }) => {
+                      const content = String(children ?? "");
+                      const isBlock =
+                        (className || "").includes("language-") || content.includes("\n");
+                      if (!isBlock) {
+                        return (
+                          <code className={className} {...props}>
+                            {children}
+                          </code>
+                        );
+                      }
+                      return (
+                        <MarkdownCodeBlock
+                          code={content.replace(/\n$/, "")}
+                          language={markdownCodeLanguage(className)}
+                          isDark={t.isDark}
+                        />
+                      );
+                    },
                   }}
                 >
                   {fixMarkdown(message.text)}

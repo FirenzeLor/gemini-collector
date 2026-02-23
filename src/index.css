@@ -29,6 +29,15 @@
   background: rgba(0,0,0,0.25);
 }
 
+@keyframes mediaLoadingDiagonalSweep {
+  0% {
+    background-position: -180px -180px;
+  }
+  100% {
+    background-position: 180px 180px;
+  }
+}
+
 /* Prose markdown styles */
 .prose-ai {
   font-size: 14px;
