@@ -1,9 +1,18 @@
-use tauri::Manager;
-use std::path::{Path, PathBuf};
+mod worker_host;
 
-const PYTHON3: &str = "/usr/local/bin/python3";
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use tauri::Manager;
+use worker_host::EnqueueJobRequest;
+
+const PYTHON3_CANDIDATES: [&str; 3] = [
+    "/usr/local/bin/python3",    // Intel Homebrew
+    "/opt/homebrew/bin/python3", // Apple Silicon Homebrew
+    "/usr/bin/python3",          // macOS system python3
+];
 // Dev-time script path derived from Cargo.toml location at compile time
 const SCRIPT_PATH_DEV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/gemini_export.py");
+const WORKER_SCRIPT_PATH_DEV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/gemini_worker.py");
 
 fn find_script(app: &tauri::AppHandle) -> PathBuf {
     let dev = PathBuf::from(SCRIPT_PATH_DEV);
@@ -17,12 +26,38 @@ fn find_script(app: &tauri::AppHandle) -> PathBuf {
         .join("gemini_export.py")
 }
 
-fn pick_python_bin() -> String {
-    if Path::new(PYTHON3).exists() {
-        PYTHON3.to_string()
-    } else {
-        "python3".to_string()
+fn find_worker_script(app: &tauri::AppHandle) -> PathBuf {
+    let dev = PathBuf::from(WORKER_SCRIPT_PATH_DEV);
+    if dev.exists() {
+        return dev;
     }
+    app.path()
+        .resource_dir()
+        .unwrap_or_default()
+        .join("gemini_worker.py")
+}
+
+static PYTHON_BIN: OnceLock<String> = OnceLock::new();
+
+fn init_python_bin() {
+    PYTHON_BIN.get_or_init(|| {
+        if let Ok(custom) = std::env::var("GEMINI_COLLECTOR_PYTHON") {
+            let trimmed = custom.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+        for candidate in PYTHON3_CANDIDATES {
+            if Path::new(candidate).exists() {
+                return candidate.to_string();
+            }
+        }
+        "python3".to_string()
+    });
+}
+
+fn python_bin() -> &'static str {
+    PYTHON_BIN.get().expect("init_python_bin not called")
 }
 
 fn value_to_non_empty_string(v: Option<&serde_json::Value>) -> Option<String> {
@@ -92,6 +127,133 @@ fn is_list_sync_pending(data_dir: &Path, data_dir_rel: &str) -> bool {
         .and_then(|v| v.as_str());
 
     matches!(phase, Some(p) if p != "done")
+}
+
+fn normalize_conversation_id(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(stripped) = trimmed.strip_prefix("c_") {
+        stripped.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+#[tauri::command]
+fn clear_account_data(
+    app: tauri::AppHandle,
+    account_id: Option<String>,
+    #[allow(non_snake_case)] accountId: Option<String>,
+) -> Result<String, String> {
+    let account_id = account_id
+        .or(accountId)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "缺少 account_id/accountId 参数".to_string())?;
+
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let account_dir = data_dir.join("accounts").join(&account_id);
+    let conversations_dir = account_dir.join("conversations");
+    let media_dir = account_dir.join("media");
+    let conversations_file = account_dir.join("conversations.json");
+    let sync_state_file = account_dir.join("sync_state.json");
+    let media_manifest_file = account_dir.join("media_manifest.json");
+    let meta_file = account_dir.join("meta.json");
+
+    if conversations_dir.exists() {
+        std::fs::remove_dir_all(&conversations_dir).map_err(|e| e.to_string())?;
+    }
+    if media_dir.exists() {
+        std::fs::remove_dir_all(&media_dir).map_err(|e| e.to_string())?;
+    }
+    if conversations_file.exists() {
+        std::fs::remove_file(&conversations_file).map_err(|e| e.to_string())?;
+    }
+    if sync_state_file.exists() {
+        std::fs::remove_file(&sync_state_file).map_err(|e| e.to_string())?;
+    }
+    if media_manifest_file.exists() {
+        std::fs::remove_file(&media_manifest_file).map_err(|e| e.to_string())?;
+    }
+
+    std::fs::create_dir_all(&conversations_dir).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&media_dir).map_err(|e| e.to_string())?;
+
+    // Keep account mapping while resetting local sync counters in meta.
+    let registry_entry = read_account_registry_entry(&data_dir, &account_id).ok();
+    let email_from_registry = registry_entry
+        .as_ref()
+        .and_then(|v| value_to_non_empty_string(v.get("email")));
+    let authuser_from_registry = registry_entry
+        .as_ref()
+        .and_then(|v| value_to_non_empty_string(v.get("authuser")));
+
+    let mut meta_val = if meta_file.exists() {
+        let raw = std::fs::read_to_string(&meta_file).map_err(|e| e.to_string())?;
+        serde_json::from_str::<serde_json::Value>(&raw).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+    if !meta_val.is_object() {
+        meta_val = serde_json::json!({});
+    }
+    let obj = meta_val
+        .as_object_mut()
+        .ok_or_else(|| "meta.json 格式错误".to_string())?;
+
+    let email = obj
+        .get("email")
+        .and_then(|v| value_to_non_empty_string(Some(v)))
+        .or(email_from_registry)
+        .unwrap_or_default();
+    let name = obj
+        .get("name")
+        .and_then(|v| value_to_non_empty_string(Some(v)))
+        .unwrap_or_else(|| {
+            if email.is_empty() {
+                account_id.clone()
+            } else {
+                email.split('@').next().unwrap_or(&account_id).to_string()
+            }
+        });
+    let avatar_text = obj
+        .get("avatarText")
+        .and_then(|v| value_to_non_empty_string(Some(v)))
+        .unwrap_or_else(|| {
+            name.chars()
+                .next()
+                .map(|c| c.to_uppercase().to_string())
+                .unwrap_or_else(|| "?".to_string())
+        });
+    let avatar_color = obj
+        .get("avatarColor")
+        .and_then(|v| value_to_non_empty_string(Some(v)))
+        .unwrap_or_else(|| "#667eea".to_string());
+    let authuser = obj
+        .get("authuser")
+        .and_then(|v| value_to_non_empty_string(Some(v)))
+        .or(authuser_from_registry);
+
+    obj.insert("version".to_string(), serde_json::json!(1));
+    obj.insert("id".to_string(), serde_json::json!(account_id));
+    obj.insert("name".to_string(), serde_json::json!(name));
+    obj.insert("email".to_string(), serde_json::json!(email));
+    obj.insert("avatarText".to_string(), serde_json::json!(avatar_text));
+    obj.insert("avatarColor".to_string(), serde_json::json!(avatar_color));
+    obj.insert("conversationCount".to_string(), serde_json::json!(0));
+    obj.insert("remoteConversationCount".to_string(), serde_json::Value::Null);
+    obj.insert("lastSyncAt".to_string(), serde_json::Value::Null);
+    obj.insert("lastSyncResult".to_string(), serde_json::Value::Null);
+    obj.insert(
+        "authuser".to_string(),
+        authuser
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null),
+    );
+
+    let serialized = serde_json::to_string_pretty(&meta_val).map_err(|e| e.to_string())?;
+    std::fs::write(&meta_file, serialized).map_err(|e| e.to_string())?;
+
+    Ok("{\"status\":\"ok\"}".to_string())
 }
 
 /// Read accounts.json + each account's meta.json from app data dir.
@@ -181,7 +343,7 @@ async fn run_accounts_import(app: tauri::AppHandle) -> Result<String, String> {
         return Err(format!("脚本未找到: {}", script.display()));
     }
 
-    let python = pick_python_bin();
+    let python = python_bin().to_string();
     let data_dir_str = data_dir.to_str().unwrap_or("").to_string();
     let script_str = script.to_str().unwrap_or("").to_string();
     let script_dir = script
@@ -209,62 +371,9 @@ async fn run_accounts_import(app: tauri::AppHandle) -> Result<String, String> {
     }
 }
 
-/// Run `python3 gemini_export.py --sync-list-only --user <authuser> --output <appDataDir>`.
 #[tauri::command]
-async fn run_list_sync(app: tauri::AppHandle, account_id: String) -> Result<String, String> {
-    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let script = find_script(&app);
-
-    if !script.exists() {
-        return Err(format!("脚本未找到: {}", script.display()));
-    }
-
-    let entry = read_account_registry_entry(&data_dir, &account_id)?;
-    let user_spec = value_to_non_empty_string(entry.get("authuser"))
-        .filter(|s| s.chars().all(|c| c.is_ascii_digit()))
-        .ok_or_else(|| format!("账号 {} 缺少有效 authuser，请先重新导入账号映射", account_id))?;
-    let account_email = value_to_non_empty_string(entry.get("email"));
-
-    let python = pick_python_bin();
-    let data_dir_str = data_dir.to_str().unwrap_or("").to_string();
-    let script_str = script.to_str().unwrap_or("").to_string();
-    let account_id_for_script = account_id.clone();
-    let script_dir = script
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .to_path_buf();
-
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        let mut cmd = std::process::Command::new(&python);
-        cmd.current_dir(&script_dir)
-            .arg(&script_str)
-            .arg("--sync-list-only")
-            .arg("--user")
-            .arg(&user_spec)
-            .arg("--account-id")
-            .arg(&account_id_for_script);
-        if let Some(email) = account_email {
-            cmd.arg("--account-email").arg(email);
-        }
-        cmd.arg("--output").arg(&data_dir_str).output()
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())?;
-
-    if result.status.success() {
-        Ok(String::from_utf8_lossy(&result.stdout).to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&result.stderr).to_string();
-        let stdout = String::from_utf8_lossy(&result.stdout).to_string();
-        if stderr.trim().is_empty() {
-            Err(stdout)
-        } else if stdout.trim().is_empty() {
-            Err(stderr)
-        } else {
-            Err(format!("{}\n{}", stderr, stdout))
-        }
-    }
+fn enqueue_job(req: EnqueueJobRequest) -> Result<String, String> {
+    worker_host::enqueue_job(req)
 }
 
 /// Read `accounts/{id}/conversations.json` and return the `items` array as JSON string.
@@ -291,16 +400,182 @@ fn load_conversation_summaries(app: tauri::AppHandle, account_id: String) -> Res
     serde_json::to_string(&items).map_err(|e| e.to_string())
 }
 
+/// Return absolute media directory path for an account: `accounts/{id}/media`.
+#[tauri::command]
+fn get_account_media_dir(app: tauri::AppHandle, account_id: String) -> Result<String, String> {
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let media_dir = data_dir
+        .join("accounts")
+        .join(account_id)
+        .join("media");
+    Ok(media_dir.to_string_lossy().to_string())
+}
+
+/// Read one conversation JSONL detail file and return a Conversation object JSON or `null`.
+#[tauri::command]
+fn load_conversation_detail(
+    app: tauri::AppHandle,
+    account_id: String,
+    conversation_id: String,
+) -> Result<String, String> {
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let bare_id = normalize_conversation_id(&conversation_id);
+    if bare_id.is_empty() {
+        return Ok("null".to_string());
+    }
+
+    let jsonl_file = data_dir
+        .join("accounts")
+        .join(&account_id)
+        .join("conversations")
+        .join(format!("{}.jsonl", bare_id));
+
+    if !jsonl_file.exists() {
+        return Ok("null".to_string());
+    }
+
+    let raw = std::fs::read_to_string(&jsonl_file).map_err(|e| e.to_string())?;
+    let mut meta: Option<serde_json::Value> = None;
+    let mut messages: Vec<serde_json::Value> = Vec::new();
+    let mut parse_error_count: usize = 0;
+    let mut parse_error_lines: Vec<usize> = Vec::new();
+
+    for (idx, line) in raw.lines().enumerate() {
+        let s = line.trim();
+        if s.is_empty() {
+            continue;
+        }
+        let row: serde_json::Value = match serde_json::from_str(s) {
+            Ok(v) => v,
+            Err(_) => {
+                parse_error_count += 1;
+                if parse_error_lines.len() < 5 {
+                    parse_error_lines.push(idx + 1);
+                }
+                continue;
+            }
+        };
+        match row.get("type").and_then(|v| v.as_str()) {
+            Some("meta") => {
+                if meta.is_none() {
+                    meta = Some(row);
+                }
+            }
+            Some("message") => messages.push(row),
+            _ => {}
+        }
+    }
+
+    let parse_warning = if parse_error_count > 0 {
+        let sample_line_str = if parse_error_lines.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "（示例行: {}）",
+                parse_error_lines
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<String>>()
+                    .join(", ")
+            )
+        };
+        let warning = format!(
+            "本地会话数据有 {} 行解析失败{}，已跳过。建议点击该会话右侧同步按钮修复。",
+            parse_error_count, sample_line_str
+        );
+        eprintln!(
+            "[load_conversation_detail] account={} conversation={} parse_errors={} lines={:?}",
+            account_id, bare_id, parse_error_count, parse_error_lines
+        );
+        Some(warning)
+    } else {
+        None
+    };
+
+    let meta_val = meta.unwrap_or_else(|| serde_json::json!({}));
+    let title = meta_val
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let created_at = meta_val
+        .get("createdAt")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let updated_at = meta_val
+        .get("updatedAt")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let synced_at = meta_val
+        .get("syncedAt")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| updated_at.clone());
+    let remote_hash = meta_val.get("remoteHash").cloned().unwrap_or(serde_json::Value::Null);
+    let account_id_meta = meta_val
+        .get("accountId")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&account_id)
+        .to_string();
+
+    let conversation = serde_json::json!({
+        "id": bare_id,
+        "accountId": account_id_meta,
+        "title": title,
+        "createdAt": created_at,
+        "updatedAt": updated_at,
+        "syncedAt": synced_at,
+        "remoteHash": remote_hash,
+        "parseWarning": parse_warning,
+        "messages": messages,
+    });
+
+    serde_json::to_string(&conversation).map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    init_python_bin();
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| -> Result<(), Box<dyn std::error::Error>> {
+            let app_handle = app.handle().clone();
+            let output_dir = app_handle.path().app_data_dir()?;
+            let worker_script = find_worker_script(&app_handle);
+            if !worker_script.exists() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("worker 脚本未找到: {}", worker_script.display()),
+                )
+                .into());
+            }
+
+            worker_host::init_worker_host(
+                app_handle,
+                python_bin().to_string(),
+                worker_script,
+                output_dir,
+            )
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             load_accounts,
             run_accounts_import,
-            run_list_sync,
-            load_conversation_summaries
+            enqueue_job,
+            clear_account_data,
+            load_conversation_summaries,
+            get_account_media_dir,
+            load_conversation_detail
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|_app, event| {
+        if let tauri::RunEvent::ExitRequested { .. } = event {
+            worker_host::shutdown_worker_host();
+        }
+    });
 }
