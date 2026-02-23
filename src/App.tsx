@@ -637,6 +637,9 @@ function App() {
 
   const anySyncTaskRunning =
     listSyncing || fullSyncing || syncingConversationIds.length > 0;
+  const selectedSummary = selectedId
+    ? conversationSummaries.find((c) => c.id === selectedId) ?? null
+    : null;
 
   if (screen === "account-picker" || !currentAccount) {
     return (
@@ -678,6 +681,7 @@ function App() {
         <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
           <TopBar
             selectedConversation={selectedConversation}
+            selectedSummary={selectedSummary}
             sidebarCollapsed={sidebarCollapsed}
             onToggleSidebar={() => setSidebarCollapsed((v) => !v)}
             isDark={isDark}
