@@ -18,6 +18,8 @@ import time
 import datetime
 import codecs
 import uuid
+import shutil
+import subprocess
 from pathlib import Path
 from urllib.parse import urlencode, quote, urlparse, parse_qsl, urlunparse, urljoin
 
@@ -56,6 +58,26 @@ PROTECTED_MEDIA_HOSTS = {
     "lh3.googleusercontent.com",
     "contribution.usercontent.google.com",
 }
+
+GENERATION_PLACEHOLDER_TOKEN = "image_generation_content/"
+
+
+def sanitize_generation_placeholder_text(text, has_attachments):
+    """
+    在已提取到附件时移除旧占位 URL 文本，避免污染 assistant 正文。
+    """
+    if not has_attachments or not isinstance(text, str) or GENERATION_PLACEHOLDER_TOKEN not in text:
+        return text
+
+    kept = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(("https://", "http://")) and GENERATION_PLACEHOLDER_TOKEN in stripped:
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
 
 
 def _normalize_cookie_domain(domain):
@@ -522,6 +544,7 @@ class GeminiExporter:
         }
 
         url = f"{GEMINI_BASE}/_/BardChatUi/data/batchexecute"
+        req_start = time.perf_counter()
         resp = self.client.post(
             url,
             params=params,
@@ -531,6 +554,11 @@ class GeminiExporter:
                 "x-goog-ext-73010989-jspb": "[0]",
                 "x-goog-ext-525001261-jspb": "[1,null,null,null,null,null,null,null,[4]]",
             },
+        )
+        req_elapsed_ms = (time.perf_counter() - req_start) * 1000.0
+        print(
+            f"  [timing] batchexecute rpc={rpcid} status={resp.status_code} "
+            f"elapsed={req_elapsed_ms:.1f}ms source={source_path or '/app'}"
         )
 
         if resp.status_code != 200:
@@ -562,6 +590,7 @@ class GeminiExporter:
         else:
             payload = json.dumps([BATCH_SIZE, cursor])
 
+        step_start = time.perf_counter()
         result = self._batchexecute("MaZiqc", payload, source_path="/app")
 
         if not result or not isinstance(result, list):
@@ -583,6 +612,11 @@ class GeminiExporter:
                     "latest_update_iso": self._to_iso_utc(latest_update_ts),
                 })
 
+        step_elapsed_ms = (time.perf_counter() - step_start) * 1000.0
+        print(
+            f"  [timing] list-page cursor={'init' if cursor is None else 'next'} "
+            f"items={len(items)} has_next={bool(next_token)} elapsed={step_elapsed_ms:.1f}ms"
+        )
         return items, next_token
 
     def get_all_chats(self):
@@ -615,34 +649,51 @@ class GeminiExporter:
     # ------------------------------------------------------------------
     # 获取对话详情
     # ------------------------------------------------------------------
+    def get_chat_detail_page(self, conv_id, cursor=None):
+        """
+        拉取单页会话详情。
+
+        cursor 为 None 时拉第一页；否则按分页 token 拉后续页。
+        返回: (turns, next_cursor)
+        """
+        source_path = f"/app/{conv_id.replace('c_', '')}"
+        payload = json.dumps(
+            [conv_id, DETAIL_PAGE_SIZE, cursor, 1, [1], [4], None, 1]
+        )
+        step_start = time.perf_counter()
+        result = self._batchexecute("hNvQHb", payload, source_path=source_path)
+
+        if not result or not isinstance(result, list):
+            return [], None
+
+        turns = result[0] if len(result) > 0 and isinstance(result[0], list) else []
+        next_cursor = result[1] if len(result) > 1 and isinstance(result[1], str) and result[1] else None
+        step_elapsed_ms = (time.perf_counter() - step_start) * 1000.0
+        print(
+            f"  [timing] detail-page conv={conv_id.replace('c_', '')} "
+            f"cursor={'init' if cursor is None else 'next'} turns={len(turns)} "
+            f"has_next={bool(next_cursor)} elapsed={step_elapsed_ms:.1f}ms"
+        )
+        return turns, next_cursor
+
     def get_chat_detail(self, conv_id):
         """获取单个对话的完整内容（含分页）"""
         all_turns = []
         page = 0
-
-        # 第一页
-        payload = json.dumps([conv_id, DETAIL_PAGE_SIZE, None, 1, [1], [4], None, 1])
-        source_path = f"/app/{conv_id.replace('c_', '')}"
-
-        result = self._batchexecute("hNvQHb", payload, source_path=source_path)
+        cursor = None
 
         while True:
             page += 1
-
-            if not result or not result[0]:
+            turns, next_cursor = self.get_chat_detail_page(conv_id, cursor)
+            if not turns and not next_cursor:
                 break
 
-            turns = result[0]
             all_turns.extend(turns)
-
-            # 检查分页 token
-            next_token = result[1] if len(result) > 1 and isinstance(result[1], str) else None
-            if not next_token:
+            if not next_cursor:
                 break
 
+            cursor = next_cursor
             time.sleep(REQUEST_DELAY)
-            payload = json.dumps([conv_id, DETAIL_PAGE_SIZE, next_token, 1, [1], [4], None, 1])
-            result = self._batchexecute("hNvQHb", payload, source_path=source_path)
 
         return all_turns
 
@@ -674,6 +725,20 @@ class GeminiExporter:
             payload = json.dumps([BATCH_SIZE, next_token])
             result = self._batchexecute("MaZiqc", payload, source_path="/app")
 
+    def get_chat_summary_by_id(self, chat_id):
+        """按 chat_id 查询会话列表条目（id/title/latest_update）。"""
+        target = self.normalize_chat_id(chat_id)
+        cursor = None
+        while True:
+            items, next_cursor = self.get_chats_page(cursor)
+            for item in items:
+                if item.get("id") == target:
+                    return item
+            if not next_cursor:
+                return None
+            cursor = next_cursor
+            time.sleep(REQUEST_DELAY)
+
     def is_chat_updated(self, chat_id, last_update_ts):
         """比较会话最新更新时间，返回是否有更新"""
         try:
@@ -697,6 +762,128 @@ class GeminiExporter:
     # ------------------------------------------------------------------
     # 解析对话轮次
     # ------------------------------------------------------------------
+    @staticmethod
+    def _looks_like_http_url(value):
+        return isinstance(value, str) and (
+            value.startswith("https://") or value.startswith("http://")
+        )
+
+    @staticmethod
+    def _is_media_descriptor(item):
+        """
+        判断一个 list 是否像 Gemini 媒体描述项（图片/视频）。
+        """
+        if not isinstance(item, list) or len(item) < 2:
+            return False
+
+        type_val = item[1]
+        if type_val not in (1, 2):
+            return False
+
+        has_url = False
+        if len(item) > 3 and GeminiExporter._looks_like_http_url(item[3]):
+            has_url = True
+        if not has_url and len(item) > 7 and isinstance(item[7], list):
+            has_url = any(GeminiExporter._looks_like_http_url(u) for u in item[7])
+        if not has_url:
+            return False
+
+        has_name = len(item) > 2 and isinstance(item[2], str) and "." in item[2]
+        has_mime = len(item) > 11 and isinstance(item[11], str) and "/" in item[11]
+        return has_name or has_mime
+
+    @staticmethod
+    def _collect_media_descriptors(node, out):
+        if isinstance(node, list):
+            if GeminiExporter._is_media_descriptor(node):
+                out.append(node)
+                return
+            for child in node:
+                GeminiExporter._collect_media_descriptors(child, out)
+
+    @staticmethod
+    def _media_descriptor_size_hint(item):
+        if (
+            isinstance(item, list)
+            and len(item) > 15
+            and isinstance(item[15], list)
+            and len(item[15]) > 2
+            and isinstance(item[15][2], int)
+        ):
+            return item[15][2]
+        return 0
+
+    @staticmethod
+    def _pick_preferred_media_descriptor(items):
+        valid = [it for it in items if GeminiExporter._is_media_descriptor(it)]
+        if not valid:
+            return None
+
+        def _score(item):
+            size_hint = GeminiExporter._media_descriptor_size_hint(item)
+            mime = item[11] if len(item) > 11 and isinstance(item[11], str) else ""
+            is_png = 1 if mime == "image/png" else 0
+            return (size_hint, is_png)
+
+        return max(valid, key=_score)
+
+    @staticmethod
+    def _collect_primary_media_descriptors(node, out):
+        """
+        处理 image_generation 的双格式结构（常见于同一图同时给 png/jpeg）。
+        命中同层 3/6 槽位时只保留一份主资源，避免重复渲染。
+        """
+        if not isinstance(node, list):
+            return
+
+        if GeminiExporter._is_media_descriptor(node):
+            out.append(node)
+            return
+
+        slot_candidates = []
+        for idx in (3, 6):
+            if len(node) > idx and isinstance(node[idx], list):
+                item = node[idx]
+                if GeminiExporter._is_media_descriptor(item):
+                    slot_candidates.append(item)
+        if slot_candidates:
+            preferred = GeminiExporter._pick_preferred_media_descriptor(slot_candidates)
+            if preferred is not None:
+                out.append(preferred)
+            return
+
+        for child in node:
+            GeminiExporter._collect_primary_media_descriptors(child, out)
+
+    @staticmethod
+    def _extract_ai_media_items(ai_data):
+        """
+        从 AI 候选结构中提取可下载的媒体描述项。
+        """
+        if not isinstance(ai_data, list):
+            return []
+
+        candidates = []
+        if len(ai_data) > 12 and ai_data[12] is not None:
+            GeminiExporter._collect_primary_media_descriptors(ai_data[12], candidates)
+        if not candidates:
+            GeminiExporter._collect_media_descriptors(ai_data, candidates)
+
+        deduped = []
+        seen = set()
+        for item in candidates:
+            parsed = GeminiExporter._parse_media_item(item, "assistant")
+            url = parsed.get("url")
+            if not url or "image_generation_content/" in url:
+                continue
+            key = (url, parsed.get("filename"), parsed.get("mime"))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+
+        return deduped
+
     @staticmethod
     def parse_turn(turn):
         """解析单个对话轮次，返回结构化数据"""
@@ -758,6 +945,18 @@ class GeminiExporter:
                 if ai_data is None and candidates:
                     ai_data = candidates[0]
 
+            user_media_keys = {
+                (
+                    f.get("url") or "",
+                    f.get("filename") or "",
+                    f.get("mime") or "",
+                    f.get("type") or "",
+                )
+                for f in result["user"].get("files", [])
+                if isinstance(f, dict)
+            }
+
+            ai_media_items = []
             if isinstance(ai_data, list):
 
                 # AI 文本: ai_data[1][0]
@@ -774,18 +973,31 @@ class GeminiExporter:
                             result["assistant"]["thinking"] = thinking[0][0]
                     elif isinstance(thinking[0], str):
                         result["assistant"]["thinking"] = thinking[0]
+                # 优先从 AI 候选结构中提取生成媒体（含 image_generation_content 实际图）
+                ai_media_items = GeminiExporter._extract_ai_media_items(ai_data)
 
-            # AI 生成/关联的媒体 (content[0][4][0][4])
-            if (len(msg) > 4 and msg[4] is not None
-                    and isinstance(msg[4], list) and len(msg[4]) > 0
-                    and isinstance(msg[4][0], list) and len(msg[4][0]) > 4
-                    and msg[4][0][4] is not None):
-                ai_media = msg[4][0][4]
-                for f in ai_media:
-                    if isinstance(f, list):
-                        result["assistant"]["files"].append(
-                            GeminiExporter._parse_media_item(f, "assistant")
-                        )
+            seen_ai = set()
+            for f in ai_media_items:
+                parsed = GeminiExporter._parse_media_item(f, "assistant")
+                url = parsed.get("url")
+                key = (
+                    url or "",
+                    parsed.get("filename") or "",
+                    parsed.get("mime") or "",
+                    parsed.get("type") or "",
+                )
+                if key in user_media_keys:
+                    continue
+                if key in seen_ai:
+                    continue
+                seen_ai.add(key)
+                result["assistant"]["files"].append(parsed)
+
+            asst_text = result["assistant"].get("text")
+            result["assistant"]["text"] = sanitize_generation_placeholder_text(
+                asst_text,
+                has_attachments=bool(result["assistant"]["files"]),
+            )
 
         except (IndexError, TypeError):
             pass
@@ -910,6 +1122,90 @@ class GeminiExporter:
 
         return parsed_turns
 
+    @staticmethod
+    def _video_preview_name(media_id):
+        stem = Path(media_id).stem
+        return f"{stem}_preview.jpg"
+
+    def _generate_video_preview(self, video_path, preview_path):
+        """
+        从视频首帧生成固定尺寸预览图（匹配前端预览卡片 160x110）。
+        """
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if not ffmpeg_bin:
+            return False
+
+        preview_path.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            ffmpeg_bin,
+            "-y",
+            "-i",
+            str(video_path),
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=160:110:force_original_aspect_ratio=increase,crop=160:110",
+            "-q:v",
+            "4",
+            str(preview_path),
+        ]
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            return proc.returncode == 0 and preview_path.exists() and preview_path.stat().st_size > 0
+        except Exception:
+            return False
+
+    def _ensure_video_previews_from_turns(self, parsed_turns, media_dir):
+        """
+        遍历 turn 中的视频附件，确保存在对应首帧预览图。
+        """
+        media_dir = Path(media_dir)
+        seen = set()
+        stats = {"preview_generated": 0, "preview_failed": 0}
+
+        for parsed in parsed_turns or []:
+            if not isinstance(parsed, dict):
+                continue
+            for role in ("user", "assistant"):
+                role_obj = parsed.get(role)
+                if not isinstance(role_obj, dict):
+                    continue
+                for f in role_obj.get("files", []) or []:
+                    if not isinstance(f, dict) or f.get("type") != "video":
+                        continue
+                    media_id = f.get("media_id")
+                    if not media_id:
+                        continue
+
+                    preview_id = f.get("preview_media_id") or self._video_preview_name(media_id)
+                    f["preview_media_id"] = preview_id
+
+                    key = (media_id, preview_id)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+
+                    video_path = media_dir / media_id
+                    preview_path = media_dir / preview_id
+
+                    if preview_path.exists() and preview_path.stat().st_size > 0:
+                        continue
+                    if not video_path.exists():
+                        stats["preview_failed"] += 1
+                        continue
+
+                    if self._generate_video_preview(video_path, preview_path):
+                        stats["preview_generated"] += 1
+                    else:
+                        stats["preview_failed"] += 1
+
+        return stats
+
     # ------------------------------------------------------------------
     # 批量下载媒体文件（无 CDP）
     # ------------------------------------------------------------------
@@ -918,7 +1214,7 @@ class GeminiExporter:
         批量下载媒体文件（按用户上下文顺序下载）
         media_list: [{"url": ..., "filepath": Path}, ...]
         """
-        self._download_media_batch_no_cdp(media_list, stats)
+        return self._download_media_batch_no_cdp(media_list, stats)
 
     def _build_media_cookie_header(self):
         return "; ".join(
@@ -942,22 +1238,10 @@ class GeminiExporter:
         ))
 
     def _download_one_media_no_cdp(self, url, cookie_header, referer):
-        try:
-            import curl_cffi.requests as curl_requests
-        except ImportError:
-            os.system(f"{sys.executable} -m pip install curl_cffi")
-            import curl_cffi.requests as curl_requests
-
         base_headers = {
             "accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
             "accept-language": "en-US,en;q=0.9",
             "referer": referer,
-            "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144", "Google Chrome";v="144"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"macOS"',
-            "sec-fetch-dest": "image",
-            "sec-fetch-mode": "no-cors",
-            "sec-fetch-site": "cross-site",
             "user-agent": (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -966,22 +1250,38 @@ class GeminiExporter:
         }
 
         current_url = url
-        for _ in range(8):
+        for hop in range(8):
             headers = dict(base_headers)
             host = (urlparse(current_url).hostname or "").lower()
             if host in PROTECTED_MEDIA_HOSTS:
                 headers["cookie"] = cookie_header
 
-            resp = curl_requests.get(
-                current_url,
-                headers=headers,
-                allow_redirects=False,
-                timeout=45,
+            req_start = time.perf_counter()
+            try:
+                resp = self.client.get(
+                    current_url,
+                    headers=headers,
+                    follow_redirects=False,
+                    timeout=45.0,
+                )
+            except Exception as e:
+                req_elapsed_ms = (time.perf_counter() - req_start) * 1000.0
+                print(
+                    f"  [timing] media-get hop={hop + 1} status=exception "
+                    f"elapsed={req_elapsed_ms:.1f}ms url={current_url}"
+                )
+                print(f"  [media-fail] httpx 下载异常: {e} | url={current_url}")
+                return None
+            req_elapsed_ms = (time.perf_counter() - req_start) * 1000.0
+            print(
+                f"  [timing] media-get hop={hop + 1} status={resp.status_code} "
+                f"elapsed={req_elapsed_ms:.1f}ms url={current_url}"
             )
 
             if resp.status_code in (301, 302, 303, 307, 308):
                 location = resp.headers.get("location")
                 if not location:
+                    print(f"  [media-fail] 重定向缺少 location | url={current_url}")
                     return None
                 current_url = urljoin(current_url, location)
                 continue
@@ -989,37 +1289,48 @@ class GeminiExporter:
             if resp.status_code == 200:
                 return resp.content
 
+            print(f"  [media-fail] 非200状态码={resp.status_code} | url={current_url}")
             return None
 
+        print(f"  [media-fail] 重定向次数超限 | url={url}")
         return None
 
     def _download_media_batch_no_cdp(self, media_list, stats):
+        failed_items = []
         if not media_list:
-            return
+            return failed_items
 
-        # 对齐账号上下文（与 --user 一致）
         authuser = self._authuser_params().get("authuser")
-        try:
-            self.client.get(f"{GEMINI_BASE}/app", params=self._authuser_params())
-        except Exception:
-            pass
 
         cookie_header = self._build_media_cookie_header()
         referer = f"{GEMINI_BASE}/u/{authuser}/app" if authuser is not None else f"{GEMINI_BASE}/app"
 
         for item in media_list:
+            item_start = time.perf_counter()
             filepath = item["filepath"]
             url = item["url"]
+            media_id = item.get("media_id") or filepath.name
 
             if filepath.exists():
                 stats["media_downloaded"] += 1
+                item_elapsed_ms = (time.perf_counter() - item_start) * 1000.0
+                print(
+                    f"  [timing] media-download media_id={media_id} status=skip_exists "
+                    f"elapsed={item_elapsed_ms:.1f}ms"
+                )
                 continue
 
-            candidates = [url, self._append_authuser(url, authuser)] if authuser is not None else [url]
+            # 多账号登录下媒体权限与 authuser 强相关；直接使用带 authuser 的 URL，
+            # 避免先请求裸链接产生一次确定性的 403/失败开销。
+            candidates = [self._append_authuser(url, authuser)] if authuser is not None else [url]
 
             content = None
             for candidate_url in candidates:
-                content = self._download_one_media_no_cdp(candidate_url, cookie_header, referer)
+                try:
+                    content = self._download_one_media_no_cdp(candidate_url, cookie_header, referer)
+                except Exception as e:
+                    print(f"  [media-fail] 媒体下载异常: {e} | url={candidate_url}")
+                    content = None
                 if content:
                     break
 
@@ -1027,8 +1338,26 @@ class GeminiExporter:
                 filepath.parent.mkdir(parents=True, exist_ok=True)
                 filepath.write_bytes(content)
                 stats["media_downloaded"] += 1
+                item_elapsed_ms = (time.perf_counter() - item_start) * 1000.0
+                print(
+                    f"  [timing] media-download media_id={media_id} status=ok "
+                    f"elapsed={item_elapsed_ms:.1f}ms"
+                )
             else:
+                print(f"  [media-fail] 媒体下载失败，已跳过: {filepath.name} | url={url}")
                 stats["media_failed"] += 1
+                item_elapsed_ms = (time.perf_counter() - item_start) * 1000.0
+                print(
+                    f"  [timing] media-download media_id={media_id} status=failed "
+                    f"elapsed={item_elapsed_ms:.1f}ms"
+                )
+                failed_items.append({
+                    "media_id": media_id,
+                    "url": url,
+                    "error": "download_failed",
+                })
+
+        return failed_items
 
     @staticmethod
     def _read_jsonl_rows(jsonl_file):
@@ -1047,10 +1376,204 @@ class GeminiExporter:
         return rows
 
     @staticmethod
+    def _dedupe_raw_turns_by_id(raw_turns):
+        if not isinstance(raw_turns, list) or not raw_turns:
+            return raw_turns, 0
+
+        deduped = []
+        seen = set()
+        removed = 0
+        for turn in raw_turns:
+            tid = GeminiExporter._turn_id_from_raw(turn)
+            if isinstance(tid, str) and tid:
+                if tid in seen:
+                    removed += 1
+                    continue
+                seen.add(tid)
+            deduped.append(turn)
+        return deduped, removed
+
+    @staticmethod
+    def _dedupe_message_rows_by_id(message_rows):
+        if not isinstance(message_rows, list) or not message_rows:
+            return message_rows, 0
+
+        deduped = []
+        seen = set()
+        removed = 0
+        for row in message_rows:
+            if not isinstance(row, dict):
+                deduped.append(row)
+                continue
+            row_id = row.get("id")
+            if not isinstance(row_id, str) or not row_id:
+                deduped.append(row)
+                continue
+            if row_id in seen:
+                removed += 1
+                continue
+            seen.add(row_id)
+            deduped.append(row)
+        return deduped, removed
+
+    @staticmethod
     def _write_jsonl_rows(jsonl_file, rows):
         with open(jsonl_file, "w", encoding="utf-8") as fh:
             for row in rows:
                 fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    @staticmethod
+    def _is_media_file_ready(media_dir, media_id):
+        if not isinstance(media_id, str) or not media_id:
+            return False
+        try:
+            p = Path(media_dir) / media_id
+            return p.exists() and p.stat().st_size > 0
+        except OSError:
+            return False
+
+    @staticmethod
+    def _build_media_id_to_url_map(account_dir):
+        url_to_name = GeminiExporter._load_media_manifest_new(account_dir)
+        media_to_url = {}
+        if not isinstance(url_to_name, dict):
+            return media_to_url
+        for url, media_name in url_to_name.items():
+            if not isinstance(url, str) or not isinstance(media_name, str):
+                continue
+            if media_name not in media_to_url:
+                media_to_url[media_name] = url
+        return media_to_url
+
+    @classmethod
+    def _scan_failed_media_from_rows(cls, rows, media_dir, media_id_to_url):
+        pending = []
+        recovered = set()
+        seen_pending = set()
+
+        for row in rows:
+            if not isinstance(row, dict) or row.get("type") != "message":
+                continue
+            attachments = row.get("attachments")
+            if not isinstance(attachments, list):
+                continue
+
+            for att in attachments:
+                if not isinstance(att, dict):
+                    continue
+                media_id = att.get("mediaId")
+                if not isinstance(media_id, str) or not media_id:
+                    continue
+
+                file_ready = cls._is_media_file_ready(media_dir, media_id)
+                marked_failed = bool(att.get("downloadFailed"))
+
+                if file_ready:
+                    if marked_failed:
+                        recovered.add(media_id)
+                    continue
+
+                if media_id in seen_pending:
+                    continue
+                seen_pending.add(media_id)
+
+                pending.append({
+                    "media_id": media_id,
+                    "url": media_id_to_url.get(media_id),
+                    "error": att.get("downloadError") if isinstance(att.get("downloadError"), str) else "download_failed",
+                })
+
+        return pending, recovered
+
+    @classmethod
+    def _update_jsonl_media_failure_flags(cls, jsonl_file, failed_error_map, recovered_ids):
+        rows = cls._read_jsonl_rows(jsonl_file)
+        if not rows:
+            return {"marked": 0, "cleared": 0}
+
+        marked = 0
+        cleared = 0
+        changed = False
+        recovered_ids = set(recovered_ids or set())
+        failed_error_map = dict(failed_error_map or {})
+
+        for row in rows:
+            if not isinstance(row, dict) or row.get("type") != "message":
+                continue
+            attachments = row.get("attachments")
+            if not isinstance(attachments, list):
+                continue
+
+            for att in attachments:
+                if not isinstance(att, dict):
+                    continue
+                media_id = att.get("mediaId")
+                if not isinstance(media_id, str) or not media_id:
+                    continue
+
+                if media_id in recovered_ids:
+                    had_failed = "downloadFailed" in att
+                    had_error = "downloadError" in att
+                    if had_failed:
+                        att.pop("downloadFailed", None)
+                    if had_error:
+                        att.pop("downloadError", None)
+                    if had_failed or had_error:
+                        changed = True
+                        cleared += 1
+                    continue
+
+                if media_id in failed_error_map:
+                    error_text = failed_error_map.get(media_id) or "download_failed"
+                    if att.get("downloadFailed") is not True or att.get("downloadError") != error_text:
+                        att["downloadFailed"] = True
+                        att["downloadError"] = error_text
+                        changed = True
+                    marked += 1
+
+        if changed:
+            cls._write_jsonl_rows(jsonl_file, rows)
+        return {"marked": marked, "cleared": cleared}
+
+    def _retry_failed_media_for_conversation(self, jsonl_file, account_dir, media_dir, stats):
+        if not Path(jsonl_file).exists():
+            return {"attempted": 0, "recovered": 0, "failed": 0, "missingUrl": 0}
+
+        rows = self._read_jsonl_rows(jsonl_file)
+        if not rows:
+            return {"attempted": 0, "recovered": 0, "failed": 0, "missingUrl": 0}
+
+        media_id_to_url = self._build_media_id_to_url_map(account_dir)
+        pending, recovered_existing = self._scan_failed_media_from_rows(rows, media_dir, media_id_to_url)
+        if not pending and not recovered_existing:
+            return {"attempted": 0, "recovered": 0, "failed": 0, "missingUrl": 0}
+
+        downloadable = [p for p in pending if isinstance(p.get("url"), str) and p["url"]]
+        missing_url = [p for p in pending if not p.get("url")]
+
+        retry_batch = [
+            {"url": item["url"], "filepath": Path(media_dir) / item["media_id"], "media_id": item["media_id"]}
+            for item in downloadable
+        ]
+        failed_items = self.download_media_batch(retry_batch, media_dir, stats) if retry_batch else []
+
+        failed_map = {item["media_id"]: (item.get("error") or "download_failed") for item in failed_items}
+        for item in missing_url:
+            failed_map[item["media_id"]] = "missing_manifest_url"
+
+        attempted_ids = {item["media_id"] for item in downloadable}
+        recovered_ids = set(recovered_existing) | (attempted_ids - set(failed_map.keys()))
+
+        flag_stats = self._update_jsonl_media_failure_flags(jsonl_file, failed_map, recovered_ids)
+
+        return {
+            "attempted": len(attempted_ids),
+            "recovered": len(recovered_ids),
+            "failed": len(failed_map),
+            "missingUrl": len(missing_url),
+            "flagMarked": flag_stats.get("marked", 0),
+            "flagCleared": flag_stats.get("cleared", 0),
+        }
 
     @staticmethod
     def _turn_id_from_raw(raw_turn):
@@ -1387,10 +1910,16 @@ class GeminiExporter:
             ts = GeminiExporter._to_iso_utc(turn.get("timestamp")) or now_iso
 
             user = turn.get("user", {})
-            user_attachments = [
-                {"mediaId": f["media_id"], "mimeType": f.get("mime") or ""}
-                for f in user.get("files", []) if f.get("media_id")
-            ]
+            user_attachments = []
+            for f in user.get("files", []):
+                media_id = f.get("media_id")
+                if not media_id:
+                    continue
+                item = {"mediaId": media_id, "mimeType": f.get("mime") or ""}
+                preview_id = f.get("preview_media_id")
+                if preview_id:
+                    item["previewMediaId"] = preview_id
+                user_attachments.append(item)
             rows.append({
                 "type": "message",
                 "id": f"{turn_id}_u",
@@ -1401,10 +1930,16 @@ class GeminiExporter:
             })
 
             asst = turn.get("assistant", {})
-            asst_attachments = [
-                {"mediaId": f["media_id"], "mimeType": f.get("mime") or ""}
-                for f in asst.get("files", []) if f.get("media_id")
-            ]
+            asst_attachments = []
+            for f in asst.get("files", []):
+                media_id = f.get("media_id")
+                if not media_id:
+                    continue
+                item = {"mediaId": media_id, "mimeType": f.get("mime") or ""}
+                preview_id = f.get("preview_media_id")
+                if preview_id:
+                    item["previewMediaId"] = preview_id
+                asst_attachments.append(item)
             model_row = {
                 "type": "message",
                 "id": f"{turn_id}_m",
@@ -1442,6 +1977,25 @@ class GeminiExporter:
                 except json.JSONDecodeError:
                     continue
         return ids
+
+    @staticmethod
+    def _count_message_rows_new(jsonl_file):
+        """统计新格式 JSONL 中 message 行数量。"""
+        count = 0
+        if not Path(jsonl_file).exists():
+            return 0
+        with open(jsonl_file, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("type") == "message":
+                    count += 1
+        return count
 
     @staticmethod
     def _remote_hash_from_jsonl(jsonl_file):
@@ -1491,9 +2045,11 @@ class GeminiExporter:
                         media_id = fname
 
                     f["media_id"] = media_id
+                    if f.get("type") == "video":
+                        f["preview_media_id"] = self._video_preview_name(media_id)
                     target = global_media_dir / fname
                     if not target.exists() and not any(item["filepath"] == target for item in batch_list):
-                        batch_list.append({"url": url, "filepath": target})
+                        batch_list.append({"url": url, "filepath": target, "media_id": media_id})
 
         return batch_list
 
@@ -1540,11 +2096,10 @@ class GeminiExporter:
         - 复用 MaZiqc 列表接口
         - 每页完成后写入 conversations.json + sync_state.json
         - 支持从 sync_state.fullSync.listingCursor 断点续传
+        - 调用前需先完成 init_auth（由上层统一初始化）
         """
         base_dir = Path(output_dir) if output_dir else OUTPUT_DIR
         base_dir.mkdir(parents=True, exist_ok=True)
-
-        self.init_auth()
 
         account_info = self._resolve_account_info()
         account_id = account_info["id"]
@@ -1590,6 +2145,13 @@ class GeminiExporter:
             listing_total = len(summaries) if phase == "done" else None
             listing_fetched = len(summaries)
             completed_at = now_iso if phase == "done" else None
+            current_state = self._load_sync_state(account_dir)
+            pending_conversations = (
+                current_state.get("pendingConversations")
+                if isinstance(current_state, dict) else []
+            )
+            if not isinstance(pending_conversations, list):
+                pending_conversations = []
 
             self._write_conversations_index(account_dir, account_id, now_iso, summaries)
             self._write_sync_state(account_dir, {
@@ -1609,7 +2171,7 @@ class GeminiExporter:
                     "completedAt": completed_at,
                     "errorMessage": error,
                 },
-                "pendingConversations": [],
+                "pendingConversations": pending_conversations,
             })
 
             # 列表同步阶段先按已落盘的列表数量展示会话数；详情抓取后可再由全量/增量流程覆盖。
@@ -1663,6 +2225,494 @@ class GeminiExporter:
             persist_state("listing", cursor, str(e))
             raise
 
+    def sync_single_conversation(self, conversation_id, output_dir=None):
+        """
+        同步单个会话详情（含媒体），并更新该账号本地索引。
+
+        复用现有 hNvQHb / 媒体下载 / JSONL 输出逻辑，不引入新协议。
+        调用前需先完成 init_auth（由上层统一初始化）。
+        """
+        base_dir = Path(output_dir) if output_dir else OUTPUT_DIR
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        account_info = self._resolve_account_info()
+        account_id = account_info["id"]
+        account_dir = base_dir / "accounts" / account_id
+        conv_dir = account_dir / "conversations"
+        media_dir = account_dir / "media"
+        account_dir.mkdir(parents=True, exist_ok=True)
+        conv_dir.mkdir(parents=True, exist_ok=True)
+        media_dir.mkdir(parents=True, exist_ok=True)
+
+        conv_id = self.normalize_chat_id(conversation_id)
+        bare_id = conv_id.replace("c_", "")
+        jsonl_file = conv_dir / f"{bare_id}.jsonl"
+        tmp_turns_file = conv_dir / f".tmp_{bare_id}.turns.json"
+        local_jsonl_exists = jsonl_file.exists()
+        detail_mode = "incremental" if local_jsonl_exists else "full"
+        pre_sync_media_stats = {
+            "media_downloaded": 0,
+            "media_failed": 0,
+        }
+
+        print(f"[*] 账号: {account_info['email'] or account_id}")
+        print(f"[*] 同步单会话: {conv_id}")
+
+        retry_stats = self._retry_failed_media_for_conversation(
+            jsonl_file=jsonl_file,
+            account_dir=account_dir,
+            media_dir=media_dir,
+            stats=pre_sync_media_stats,
+        )
+        if retry_stats["attempted"] > 0 or retry_stats["missingUrl"] > 0:
+            print(
+                "  [media-retry] 历史失败媒体重试:"
+                f" attempted={retry_stats['attempted']},"
+                f" recovered={retry_stats['recovered']},"
+                f" failed={retry_stats['failed']},"
+                f" missing_url={retry_stats['missingUrl']}"
+            )
+
+        _, existing_index = self._load_conversations_index(account_dir)
+        existing_summary = existing_index.get(bare_id, {}) if isinstance(existing_index, dict) else {}
+        chat_info = self.get_chat_summary_by_id(conv_id) or {
+            "id": conv_id,
+            "title": existing_summary.get("title", ""),
+            "latest_update_ts": None,
+            "latest_update_iso": existing_summary.get("updatedAt"),
+        }
+        title = chat_info.get("title") or existing_summary.get("title") or bare_id
+        chat_info["title"] = title
+
+        def _safe_int(value, default=0):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        def _updated_sort_num(iso_str):
+            if not isinstance(iso_str, str) or not iso_str:
+                return 0.0
+            try:
+                return datetime.datetime.fromisoformat(iso_str).timestamp()
+            except Exception:
+                return 0.0
+
+        def _load_cached_turns():
+            if not tmp_turns_file.exists():
+                return []
+            try:
+                data = json.loads(tmp_turns_file.read_text(encoding="utf-8"))
+            except Exception:
+                return []
+            return data if isinstance(data, list) else []
+
+        def _load_sync_state_for_conversation():
+            state = self._load_sync_state(account_dir)
+            if not isinstance(state, dict):
+                state = {}
+            pending = state.get("pendingConversations")
+            if not isinstance(pending, list):
+                pending = []
+            state["pendingConversations"] = pending
+            if "fullSync" not in state:
+                state["fullSync"] = None
+            state["version"] = _safe_int(state.get("version"), 1) or 1
+            state["accountId"] = account_id
+            return state
+
+        def _persist_conversation_state(
+            state,
+            phase,
+            detail_cursor,
+            detail_mode_value,
+            fetched_pages,
+            fetched_turns,
+            started_at,
+            error_message=None,
+        ):
+            now_iso_local = datetime.datetime.now(datetime.UTC).isoformat()
+            pending = state.get("pendingConversations", [])
+            if not isinstance(pending, list):
+                pending = []
+
+            updated_pending = []
+            for item in pending:
+                if isinstance(item, dict) and item.get("id") == bare_id:
+                    continue
+                updated_pending.append(item)
+
+            if phase != "done":
+                relative_tmp_path = str(
+                    Path("accounts") / account_id / "conversations" / tmp_turns_file.name
+                )
+                updated_pending.append({
+                    "id": bare_id,
+                    "phase": phase,
+                    "detailMode": detail_mode_value,
+                    "startedAt": started_at,
+                    "updatedAt": now_iso_local,
+                    "detailCursor": detail_cursor,
+                    "detailFetchedPages": fetched_pages,
+                    "detailFetchedTurns": fetched_turns,
+                    "tempFile": relative_tmp_path,
+                    "completedAt": None,
+                    "errorMessage": error_message,
+                })
+
+            state["updatedAt"] = now_iso_local
+            state["pendingConversations"] = updated_pending
+            self._write_sync_state(account_dir, state)
+
+        sync_state = _load_sync_state_for_conversation()
+        pending_entry = next(
+            (
+                p for p in sync_state.get("pendingConversations", [])
+                if isinstance(p, dict) and p.get("id") == bare_id and p.get("phase") != "done"
+            ),
+            None,
+        )
+
+        started_at = datetime.datetime.now(datetime.UTC).isoformat()
+        cursor = None
+        fetched_pages = 0
+        raw_turns = []
+        existing_turn_ids = self._build_existing_turn_id_set_new(jsonl_file) if local_jsonl_exists else set()
+
+        if pending_entry:
+            started_at = pending_entry.get("startedAt") or started_at
+            mode_candidate = pending_entry.get("detailMode")
+            if mode_candidate in {"full", "incremental"}:
+                detail_mode = mode_candidate
+            cursor_candidate = pending_entry.get("detailCursor")
+            if isinstance(cursor_candidate, str) and cursor_candidate:
+                cursor = cursor_candidate
+            fetched_pages = _safe_int(pending_entry.get("detailFetchedPages"), 0)
+            raw_turns = _load_cached_turns()
+            print("[*] 检测到未完成单会话同步，继续断点拉取...")
+        else:
+            if detail_mode == "incremental":
+                print("[*] 本地已存在会话详情，执行增量同步...")
+            else:
+                print("[*] 本地无会话详情，执行全量拉取...")
+
+        base_message_count = 0
+        if detail_mode == "incremental" and local_jsonl_exists:
+            base_message_count = self._count_message_rows_new(jsonl_file)
+
+        progress_index = dict(existing_index)
+
+        def _persist_progress_summary(parsed_turn_count):
+            now_iso_local = datetime.datetime.now(datetime.UTC).isoformat()
+            incremental_base = base_message_count if detail_mode == "incremental" and local_jsonl_exists else 0
+            progress_count = max(0, incremental_base + parsed_turn_count * 2)
+
+            progress_summary = dict(existing_summary) if isinstance(existing_summary, dict) else {}
+            if not progress_summary:
+                progress_summary = {
+                    "id": bare_id,
+                    "title": title,
+                    "lastMessage": "",
+                    "messageCount": 0,
+                    "hasMedia": False,
+                    "updatedAt": chat_info.get("latest_update_iso"),
+                    "syncedAt": None,
+                    "remoteHash": None,
+                }
+            progress_summary["id"] = bare_id
+            progress_summary["title"] = progress_summary.get("title") or title
+            progress_summary["messageCount"] = progress_count
+            progress_summary["syncedAt"] = now_iso_local
+            if not progress_summary.get("updatedAt") and chat_info.get("latest_update_iso"):
+                progress_summary["updatedAt"] = chat_info.get("latest_update_iso")
+            if not progress_summary.get("remoteHash") and chat_info.get("latest_update_ts") is not None:
+                progress_summary["remoteHash"] = str(chat_info.get("latest_update_ts"))
+
+            progress_index[bare_id] = progress_summary
+            progress_summaries = list(progress_index.values())
+            progress_summaries.sort(key=lambda s: _updated_sort_num(s.get("updatedAt")), reverse=True)
+            self._write_conversations_index(account_dir, account_id, now_iso_local, progress_summaries)
+
+        try:
+            while True:
+                fetched_pages += 1
+                turns, next_cursor = self.get_chat_detail_page(conv_id, cursor)
+                if not turns and not next_cursor:
+                    break
+
+                hit_existing = False
+                page_turns = []
+                if detail_mode == "incremental":
+                    for turn in turns:
+                        tid = self._turn_id_from_raw(turn)
+                        if tid and tid in existing_turn_ids:
+                            hit_existing = True
+                            break
+                        page_turns.append(turn)
+                else:
+                    page_turns = turns
+
+                raw_turns.extend(page_turns)
+                cursor = next_cursor
+
+                tmp_turns_file.write_text(
+                    json.dumps(raw_turns, ensure_ascii=False), encoding="utf-8"
+                )
+                _persist_conversation_state(
+                    sync_state,
+                    phase="downloading",
+                    detail_cursor=cursor,
+                    detail_mode_value=detail_mode,
+                    fetched_pages=fetched_pages,
+                    fetched_turns=len(raw_turns),
+                    started_at=started_at,
+                    error_message=None,
+                )
+                _persist_progress_summary(len(raw_turns))
+                print(f"  第 {fetched_pages} 页: {len(page_turns)} 轮 (累计 {len(raw_turns)})")
+
+                if hit_existing or not next_cursor:
+                    break
+                time.sleep(REQUEST_DELAY)
+        except Exception as e:
+            try:
+                tmp_turns_file.write_text(
+                    json.dumps(raw_turns, ensure_ascii=False), encoding="utf-8"
+                )
+                _persist_conversation_state(
+                    sync_state,
+                    phase="downloading",
+                    detail_cursor=cursor,
+                    detail_mode_value=detail_mode,
+                    fetched_pages=fetched_pages,
+                    fetched_turns=len(raw_turns),
+                    started_at=started_at,
+                    error_message=str(e),
+                )
+            except Exception:
+                pass
+            raise
+
+        raw_turns, removed_turns = self._dedupe_raw_turns_by_id(raw_turns)
+        if removed_turns > 0:
+            print(f"  [dedupe] 当前会话分页结果去重: {removed_turns} 个重复 turn")
+
+        global_seen_urls = self._load_media_manifest_new(account_dir)
+        global_used_names = set(global_seen_urls.values())
+        for f in media_dir.iterdir():
+            if f.is_file():
+                global_used_names.add(f.name)
+
+        media_stats = {
+            "media_downloaded": pre_sync_media_stats["media_downloaded"],
+            "media_failed": pre_sync_media_stats["media_failed"],
+            "preview_generated": 0,
+            "preview_failed": 0,
+        }
+        merged = dict(existing_index)
+
+        if detail_mode == "incremental" and local_jsonl_exists:
+            if raw_turns:
+                parsed_new_turns = [self.parse_turn(turn) for turn in raw_turns]
+                parsed_new_turns = self.normalize_turn_media_first_seen(parsed_new_turns)
+
+                batch_list = self._assign_media_ids_and_collect_downloads(
+                    parsed_new_turns, media_dir, global_seen_urls, global_used_names,
+                )
+                new_rows_full = self._turns_to_jsonl_rows(parsed_new_turns, conv_id, account_id, title, chat_info)
+                new_meta = new_rows_full[0]
+                new_msg_rows = new_rows_full[1:]
+
+                existing_msg_rows = []
+                if jsonl_file.exists():
+                    with open(jsonl_file, "r", encoding="utf-8") as fh:
+                        for i, line in enumerate(fh):
+                            if i == 0:
+                                continue
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                existing_msg_rows.append(json.loads(line))
+                            except json.JSONDecodeError:
+                                continue
+
+                merged_msg_rows, removed_msg_rows = self._dedupe_message_rows_by_id(
+                    new_msg_rows + existing_msg_rows
+                )
+                if removed_msg_rows > 0:
+                    print(f"  [dedupe] 合并写盘去重: {removed_msg_rows} 行")
+                all_rows = [new_meta] + merged_msg_rows
+                self._write_jsonl_rows(jsonl_file, all_rows)
+
+                failed_items = []
+                if batch_list:
+                    print(f"  媒体文件: {len(batch_list)} 个（去重后）")
+                    failed_items = self.download_media_batch(batch_list, media_dir, media_stats)
+                    self._save_media_manifest_new(account_dir, global_seen_urls)
+                preview_stats = self._ensure_video_previews_from_turns(parsed_new_turns, media_dir)
+                media_stats["preview_generated"] += preview_stats["preview_generated"]
+                media_stats["preview_failed"] += preview_stats["preview_failed"]
+
+                batch_media_ids = {item.get("media_id") or item["filepath"].name for item in batch_list}
+                failed_map = {item["media_id"]: (item.get("error") or "download_failed") for item in failed_items}
+                recovered_ids = batch_media_ids - set(failed_map.keys())
+                flag_stats = self._update_jsonl_media_failure_flags(jsonl_file, failed_map, recovered_ids)
+                if flag_stats["marked"] > 0 or flag_stats["cleared"] > 0:
+                    print(
+                        "  [media-flag] 已更新附件下载标记:"
+                        f" marked={flag_stats['marked']},"
+                        f" cleared={flag_stats['cleared']}"
+                    )
+
+                rows_after = self._read_jsonl_rows(jsonl_file)
+                meta_row = (
+                    next(
+                        (r for r in rows_after if isinstance(r, dict) and r.get("type") == "meta"),
+                        None,
+                    )
+                    or new_meta
+                )
+                all_msg_rows = [
+                    r for r in rows_after if isinstance(r, dict) and r.get("type") == "message"
+                ]
+                has_media = any(r.get("attachments") for r in all_msg_rows)
+                last_text = ""
+                for r in reversed(all_msg_rows):
+                    if r.get("text"):
+                        last_text = r["text"][:80]
+                        break
+
+                summary = {
+                    "id": bare_id,
+                    "title": title,
+                    "lastMessage": last_text,
+                    "messageCount": len(all_msg_rows),
+                    "hasMedia": has_media,
+                    "updatedAt": meta_row.get("updatedAt"),
+                    "syncedAt": meta_row.get("syncedAt"),
+                    "remoteHash": meta_row.get("remoteHash"),
+                }
+            else:
+                now_iso = datetime.datetime.now(datetime.UTC).isoformat()
+                summary = dict(existing_summary) if isinstance(existing_summary, dict) else {}
+                if not summary:
+                    summary = {
+                        "id": bare_id,
+                        "title": title,
+                        "lastMessage": "",
+                        "messageCount": 0,
+                        "hasMedia": False,
+                        "updatedAt": chat_info.get("latest_update_iso"),
+                        "syncedAt": now_iso,
+                        "remoteHash": None,
+                    }
+                summary["id"] = bare_id
+                summary["title"] = summary.get("title") or title
+                if chat_info.get("latest_update_iso") and not summary.get("updatedAt"):
+                    summary["updatedAt"] = chat_info.get("latest_update_iso")
+                if chat_info.get("latest_update_ts") is not None:
+                    summary["remoteHash"] = str(chat_info.get("latest_update_ts"))
+                summary["syncedAt"] = now_iso
+        else:
+            print(f"  轮次: {len(raw_turns)}")
+            parsed_turns = [self.parse_turn(turn) for turn in raw_turns]
+            parsed_turns = self.normalize_turn_media_first_seen(parsed_turns)
+
+            batch_list = self._assign_media_ids_and_collect_downloads(
+                parsed_turns, media_dir, global_seen_urls, global_used_names,
+            )
+            rows = self._turns_to_jsonl_rows(parsed_turns, conv_id, account_id, title, chat_info)
+            self._write_jsonl_rows(jsonl_file, rows)
+
+            failed_items = []
+            if batch_list:
+                print(f"  媒体文件: {len(batch_list)} 个（去重后）")
+                failed_items = self.download_media_batch(batch_list, media_dir, media_stats)
+                self._save_media_manifest_new(account_dir, global_seen_urls)
+            preview_stats = self._ensure_video_previews_from_turns(parsed_turns, media_dir)
+            media_stats["preview_generated"] += preview_stats["preview_generated"]
+            media_stats["preview_failed"] += preview_stats["preview_failed"]
+
+            batch_media_ids = {item.get("media_id") or item["filepath"].name for item in batch_list}
+            failed_map = {item["media_id"]: (item.get("error") or "download_failed") for item in failed_items}
+            recovered_ids = batch_media_ids - set(failed_map.keys())
+            flag_stats = self._update_jsonl_media_failure_flags(jsonl_file, failed_map, recovered_ids)
+            if flag_stats["marked"] > 0 or flag_stats["cleared"] > 0:
+                print(
+                    "  [media-flag] 已更新附件下载标记:"
+                    f" marked={flag_stats['marked']},"
+                    f" cleared={flag_stats['cleared']}"
+                )
+
+            rows_after = self._read_jsonl_rows(jsonl_file)
+            meta_row = (
+                next(
+                    (r for r in rows_after if isinstance(r, dict) and r.get("type") == "meta"),
+                    None,
+                )
+                or (rows[0] if rows else {})
+            )
+            msg_rows = [
+                r for r in rows_after if isinstance(r, dict) and r.get("type") == "message"
+            ]
+            has_media = any(r.get("attachments") for r in msg_rows)
+            last_text = ""
+            for r in reversed(msg_rows):
+                if r.get("text"):
+                    last_text = r["text"][:80]
+                    break
+
+            summary = {
+                "id": bare_id,
+                "title": title,
+                "lastMessage": last_text,
+                "messageCount": len(msg_rows),
+                "hasMedia": has_media,
+                "updatedAt": meta_row.get("updatedAt") or chat_info.get("latest_update_iso"),
+                "syncedAt": meta_row.get("syncedAt"),
+                "remoteHash": meta_row.get("remoteHash"),
+            }
+
+        merged[bare_id] = summary
+        summaries = list(merged.values())
+        summaries.sort(key=lambda s: _updated_sort_num(s.get("updatedAt")), reverse=True)
+
+        now_iso = datetime.datetime.now(datetime.UTC).isoformat()
+        account_info["conversationCount"] = len(summaries)
+        account_info["remoteConversationCount"] = max(
+            len(summaries),
+            account_info.get("remoteConversationCount") or 0,
+        )
+        account_info["lastSyncAt"] = now_iso
+        account_info["lastSyncResult"] = "success"
+
+        self._write_accounts_json(base_dir, account_info)
+        self._write_account_meta(account_dir, account_info)
+        self._write_conversations_index(account_dir, account_id, now_iso, summaries)
+        _persist_conversation_state(
+            sync_state,
+            phase="done",
+            detail_cursor=None,
+            detail_mode_value=detail_mode,
+            fetched_pages=fetched_pages,
+            fetched_turns=len(raw_turns),
+            started_at=started_at,
+            error_message=None,
+        )
+
+        if tmp_turns_file.exists():
+            try:
+                tmp_turns_file.unlink()
+            except OSError:
+                pass
+
+        print(f"  媒体下载: {media_stats['media_downloaded']}")
+        print(f"  媒体失败: {media_stats['media_failed']}")
+        print(f"  视频预览生成: {media_stats['preview_generated']}")
+        print(f"  视频预览失败: {media_stats['preview_failed']}")
+        print("[*] 单会话同步完成")
+
     def export_all(self, output_dir=None, chat_ids=None):
         """
         导出所有（或指定的）聊天数据
@@ -1676,15 +2726,13 @@ class GeminiExporter:
               sync_state.json
               conversations/{bare_id}.jsonl   — 首行 meta，其余每行一条 message
               media/{media_id}.{ext}
+        调用前需先完成 init_auth（由上层统一初始化）。
         """
         now_iso = datetime.datetime.now(datetime.UTC).isoformat()
         base_dir = Path(output_dir) if output_dir else OUTPUT_DIR
         base_dir.mkdir(parents=True, exist_ok=True)
 
-        # 1. 初始化认证
-        self.init_auth()
-
-        # 2. 解析账号信息
+        # 1. 解析账号信息
         account_info = self._resolve_account_info()
         account_id = account_info["id"]
         account_dir = base_dir / "accounts" / account_id
@@ -1718,7 +2766,14 @@ class GeminiExporter:
 
         # 4. 逐个导出对话详情
         total = len(chats)
-        stats = {"success": 0, "failed": 0, "media_downloaded": 0, "media_failed": 0}
+        stats = {
+            "success": 0,
+            "failed": 0,
+            "media_downloaded": 0,
+            "media_failed": 0,
+            "preview_generated": 0,
+            "preview_failed": 0,
+        }
 
         global_seen_urls = self._load_media_manifest_new(account_dir)
         global_used_names = set(global_seen_urls.values())
@@ -1737,7 +2792,10 @@ class GeminiExporter:
 
             try:
                 raw_turns = self.get_chat_detail(conv_id)
+                raw_turns, removed_turns = self._dedupe_raw_turns_by_id(raw_turns)
                 print(f"  轮次: {len(raw_turns)}")
+                if removed_turns > 0:
+                    print(f"  [dedupe] 分页结果去重: {removed_turns} 个重复 turn")
 
                 parsed_turns = [self.parse_turn(turn) for turn in raw_turns]
                 parsed_turns = self.normalize_turn_media_first_seen(parsed_turns)
@@ -1752,14 +2810,38 @@ class GeminiExporter:
                 self._write_jsonl_rows(jsonl_file, rows)
 
                 # 下载媒体
+                failed_items = []
                 if batch_list:
                     print(f"  媒体文件: {len(batch_list)} 个（去重后）")
-                    self.download_media_batch(batch_list, media_dir, stats)
+                    failed_items = self.download_media_batch(batch_list, media_dir, stats)
                     self._save_media_manifest_new(account_dir, global_seen_urls)
+                preview_stats = self._ensure_video_previews_from_turns(parsed_turns, media_dir)
+                stats["preview_generated"] += preview_stats["preview_generated"]
+                stats["preview_failed"] += preview_stats["preview_failed"]
+
+                batch_media_ids = {item.get("media_id") or item["filepath"].name for item in batch_list}
+                failed_map = {item["media_id"]: (item.get("error") or "download_failed") for item in failed_items}
+                recovered_ids = batch_media_ids - set(failed_map.keys())
+                flag_stats = self._update_jsonl_media_failure_flags(jsonl_file, failed_map, recovered_ids)
+                if flag_stats["marked"] > 0 or flag_stats["cleared"] > 0:
+                    print(
+                        "  [media-flag] 已更新附件下载标记:"
+                        f" marked={flag_stats['marked']},"
+                        f" cleared={flag_stats['cleared']}"
+                    )
 
                 # 构建 summary
-                meta_row = rows[0]
-                msg_rows = [r for r in rows if r.get("type") == "message"]
+                rows_after = self._read_jsonl_rows(jsonl_file)
+                meta_row = (
+                    next(
+                        (r for r in rows_after if isinstance(r, dict) and r.get("type") == "meta"),
+                        None,
+                    )
+                    or rows[0]
+                )
+                msg_rows = [
+                    r for r in rows_after if isinstance(r, dict) and r.get("type") == "message"
+                ]
                 has_media = any(r.get("attachments") for r in msg_rows)
                 last_text = ""
                 for r in reversed(msg_rows):
@@ -1838,6 +2920,8 @@ class GeminiExporter:
         print(f"  失败: {stats['failed']}/{total}")
         print(f"  媒体下载: {stats['media_downloaded']}")
         print(f"  媒体失败: {stats['media_failed']}")
+        print(f"  视频预览生成: {stats['preview_generated']}")
+        print(f"  视频预览失败: {stats['preview_failed']}")
         print(f"  输出目录: {account_dir.absolute()}")
 
     def export_incremental(self, output_dir=None):
@@ -1846,12 +2930,11 @@ class GeminiExporter:
         - 按聊天列表新到旧扫描
         - 命中第一个未更新会话后停止继续下探
         - 对更新会话仅抓取新增 turn（遇到本地已存在 turn_id 即停止）
+        调用前需先完成 init_auth（由上层统一初始化）。
         """
         now_iso = datetime.datetime.now(datetime.UTC).isoformat()
         base_dir = Path(output_dir) if output_dir else OUTPUT_DIR
         base_dir.mkdir(parents=True, exist_ok=True)
-
-        self.init_auth()
 
         # 解析账号信息
         account_info = self._resolve_account_info()
@@ -1879,7 +2962,14 @@ class GeminiExporter:
             if f.is_file():
                 global_used_names.add(f.name)
 
-        stats = {"updated": 0, "checked": 0, "media_downloaded": 0, "media_failed": 0}
+        stats = {
+            "updated": 0,
+            "checked": 0,
+            "media_downloaded": 0,
+            "media_failed": 0,
+            "preview_generated": 0,
+            "preview_failed": 0,
+        }
         stop_chat = None
 
         # 读取现有 conversations.json 构建索引
@@ -1916,11 +3006,14 @@ class GeminiExporter:
             print(f"\n[*] 增量检查: {title} ({conv_id})")
             existing_ids = self._build_existing_turn_id_set_new(jsonl_file)
             raw_new_turns = self.get_chat_detail_incremental(conv_id, existing_ids)
+            raw_new_turns, removed_turns = self._dedupe_raw_turns_by_id(raw_new_turns)
 
             if not raw_new_turns:
                 print("  无新增 turn")
                 time.sleep(REQUEST_DELAY)
                 continue
+            if removed_turns > 0:
+                print(f"  [dedupe] 增量抓取结果去重: {removed_turns} 个重复 turn")
 
             parsed_new_turns = [self.parse_turn(turn) for turn in raw_new_turns]
             batch_list = self._assign_media_ids_and_collect_downloads(
@@ -1948,15 +3041,45 @@ class GeminiExporter:
             new_msg_rows = new_rows_full[1:]
 
             # 合并：新消息（正序）在前，旧消息跟随
-            all_rows = [new_meta] + new_msg_rows + existing_msg_rows
+            merged_msg_rows, removed_msg_rows = self._dedupe_message_rows_by_id(
+                new_msg_rows + existing_msg_rows
+            )
+            if removed_msg_rows > 0:
+                print(f"  [dedupe] 增量合并写盘去重: {removed_msg_rows} 行")
+            all_rows = [new_meta] + merged_msg_rows
             self._write_jsonl_rows(jsonl_file, all_rows)
 
+            failed_items = []
             if batch_list:
-                self.download_media_batch(batch_list, media_dir, stats)
+                failed_items = self.download_media_batch(batch_list, media_dir, stats)
                 self._save_media_manifest_new(account_dir, global_seen_urls)
+            preview_stats = self._ensure_video_previews_from_turns(parsed_new_turns, media_dir)
+            stats["preview_generated"] += preview_stats["preview_generated"]
+            stats["preview_failed"] += preview_stats["preview_failed"]
+
+            batch_media_ids = {item.get("media_id") or item["filepath"].name for item in batch_list}
+            failed_map = {item["media_id"]: (item.get("error") or "download_failed") for item in failed_items}
+            recovered_ids = batch_media_ids - set(failed_map.keys())
+            flag_stats = self._update_jsonl_media_failure_flags(jsonl_file, failed_map, recovered_ids)
+            if flag_stats["marked"] > 0 or flag_stats["cleared"] > 0:
+                print(
+                    "  [media-flag] 已更新附件下载标记:"
+                    f" marked={flag_stats['marked']},"
+                    f" cleared={flag_stats['cleared']}"
+                )
 
             # 更新 conv_index
-            all_msg_rows = new_msg_rows + existing_msg_rows
+            rows_after = self._read_jsonl_rows(jsonl_file)
+            meta_row = (
+                next(
+                    (r for r in rows_after if isinstance(r, dict) and r.get("type") == "meta"),
+                    None,
+                )
+                or new_meta
+            )
+            all_msg_rows = [
+                r for r in rows_after if isinstance(r, dict) and r.get("type") == "message"
+            ]
             has_media = any(r.get("attachments") for r in all_msg_rows)
             last_text = ""
             for r in reversed(all_msg_rows):
@@ -1970,9 +3093,9 @@ class GeminiExporter:
                 "lastMessage": last_text,
                 "messageCount": len(all_msg_rows),
                 "hasMedia": has_media,
-                "updatedAt": new_meta.get("updatedAt"),
-                "syncedAt": new_meta.get("syncedAt"),
-                "remoteHash": new_meta.get("remoteHash"),
+                "updatedAt": meta_row.get("updatedAt"),
+                "syncedAt": meta_row.get("syncedAt"),
+                "remoteHash": meta_row.get("remoteHash"),
             }
 
             print(f"  新增 turn: {len(parsed_new_turns)}")
@@ -2028,160 +3151,9 @@ class GeminiExporter:
         print(f"  停止位置: {stop_chat}")
         print(f"  媒体下载: {stats['media_downloaded']}")
         print(f"  媒体失败: {stats['media_failed']}")
+        print(f"  视频预览生成: {stats['preview_generated']}")
+        print(f"  视频预览失败: {stats['preview_failed']}")
         print(f"  输出目录: {account_dir.absolute()}")
-
-
-# ============================================================================
-# 迁移工具
-# ============================================================================
-def migrate_old_to_new(old_dir, new_base_dir, account_id, email="", name=""):
-    """
-    将旧格式目录（{bare_id}.jsonl + chat_list*.json + media/）迁移到新格式。
-
-    old_dir      : 旧格式数据目录
-    new_base_dir : 新格式根目录（accounts.json 在此级别）
-    account_id   : 账号 ID（如 sanitized email）
-    """
-    old_dir = Path(old_dir)
-    new_base_dir = Path(new_base_dir)
-    now_iso = datetime.datetime.now(datetime.UTC).isoformat()
-
-    account_dir = new_base_dir / "accounts" / account_id
-    conv_dir = account_dir / "conversations"
-    media_dir = account_dir / "media"
-
-    account_dir.mkdir(parents=True, exist_ok=True)
-    conv_dir.mkdir(parents=True, exist_ok=True)
-    media_dir.mkdir(parents=True, exist_ok=True)
-
-    # 读取聊天列表
-    chats = []
-    for fname in ["chat_list_union.json", "chat_list.json", "chat_list_latest.json"]:
-        candidate = old_dir / fname
-        if candidate.exists():
-            try:
-                raw = json.loads(candidate.read_text(encoding="utf-8"))
-                if isinstance(raw, list):
-                    chats = raw
-                elif isinstance(raw, dict) and "conversations" in raw:
-                    chats = raw["conversations"]
-                if chats:
-                    print(f"[migrate] 聊天列表: {fname} ({len(chats)} 个)")
-                    break
-            except Exception:
-                pass
-
-    chat_info_map = {}
-    for chat in chats:
-        cid = chat.get("id", "")
-        bare_id = cid.replace("c_", "")
-        chat_info_map[bare_id] = chat
-
-    # 迁移媒体文件（创建软链接）
-    old_media_dir = old_dir / "media"
-    if old_media_dir.exists():
-        for f in old_media_dir.iterdir():
-            if f.is_file():
-                target = media_dir / f.name
-                if not target.exists():
-                    try:
-                        target.symlink_to(f.resolve())
-                    except Exception:
-                        pass  # fallback: skip if symlink fails
-        print(f"[migrate] 媒体文件软链接完成: {media_dir}")
-
-    # 迁移媒体清单
-    old_manifest = old_dir / "media_manifest.json"
-    if old_manifest.exists():
-        try:
-            manifest_data = json.loads(old_manifest.read_text(encoding="utf-8"))
-            GeminiExporter._save_media_manifest_new(account_dir, manifest_data.get("url_to_name", {}))
-        except Exception:
-            pass
-
-    # 迁移每个对话 JSONL
-    jsonl_files = sorted(old_dir.glob("*.jsonl"))
-    print(f"[migrate] 发现 {len(jsonl_files)} 个 JSONL 文件")
-
-    conv_summaries = []
-
-    for jsonl_file in jsonl_files:
-        bare_id = jsonl_file.stem
-        chat = chat_info_map.get(bare_id, {
-            "id": f"c_{bare_id}",
-            "title": bare_id,
-            "latest_update_ts": None,
-            "latest_update_iso": None,
-        })
-        conv_id = chat.get("id", f"c_{bare_id}")
-        title = chat.get("title", bare_id)
-
-        old_turns = GeminiExporter._read_jsonl_rows(jsonl_file)
-        rows = GeminiExporter._turns_to_jsonl_rows(old_turns, conv_id, account_id, title, chat)
-
-        new_jsonl = conv_dir / f"{bare_id}.jsonl"
-        GeminiExporter._write_jsonl_rows(new_jsonl, rows)
-
-        meta_row = rows[0]
-        msg_rows = [r for r in rows if r.get("type") == "message"]
-        has_media = any(r.get("attachments") for r in msg_rows)
-        last_text = ""
-        for r in reversed(msg_rows):
-            if r.get("text"):
-                last_text = r["text"][:80]
-                break
-
-        conv_summaries.append({
-            "id": bare_id,
-            "title": title,
-            "lastMessage": last_text,
-            "messageCount": len(msg_rows),
-            "hasMedia": has_media,
-            "updatedAt": meta_row.get("updatedAt"),
-            "syncedAt": meta_row.get("syncedAt"),
-            "remoteHash": meta_row.get("remoteHash"),
-        })
-
-    # 写入账号结构文件
-    avatar_text = (email.split("@")[0][0].upper() if email else account_id[0].upper())
-    account_info = {
-        "id": account_id,
-        "email": email,
-        "name": name or (email.split("@")[0] if email else account_id),
-        "avatarText": avatar_text,
-        "avatarColor": "#667eea",
-        "conversationCount": len(conv_summaries),
-        "remoteConversationCount": len(chats) or None,
-        "lastSyncAt": now_iso,
-        "lastSyncResult": "success",
-        "authuser": None,
-    }
-    GeminiExporter._write_accounts_json(new_base_dir, account_info)
-    GeminiExporter._write_account_meta(account_dir, account_info)
-    GeminiExporter._write_conversations_index(account_dir, account_id, now_iso, conv_summaries)
-    GeminiExporter._write_sync_state(account_dir, {
-        "version": 1,
-        "accountId": account_id,
-        "updatedAt": now_iso,
-        "concurrency": 3,
-        "fullSync": {
-            "phase": "done",
-            "startedAt": now_iso,
-            "listingCursor": None,
-            "listingTotal": len(chats),
-            "listingFetched": len(chats),
-            "conversationsToFetch": [],
-            "conversationsFetched": len(conv_summaries),
-            "conversationsFailed": [],
-            "completedAt": now_iso,
-            "errorMessage": None,
-        },
-        "pendingConversations": [],
-    })
-
-    print(f"[migrate] 完成: {len(conv_summaries)} 个对话已迁移")
-    print(f"[migrate] 新格式目录: {account_dir.absolute()}")
-    return account_dir
 
 
 # ============================================================================
@@ -2202,6 +3174,8 @@ def main():
     parser.add_argument("--last-update-ts", type=int, help="上次记录的对话更新时间（秒级时间戳）")
     parser.add_argument("--incremental", action="store_true", help="增量更新导出（命中首个未更新会话后停止）")
     parser.add_argument("--sync-list-only", action="store_true", help="仅同步会话列表（支持分页断点续传）")
+    parser.add_argument("--sync-conversation", action="store_true", help="仅同步单个会话详情")
+    parser.add_argument("--conversation-id", help="会话 ID（支持 bare id 或 c_xxx）")
     parser.add_argument("--accounts-only", action="store_true", help="仅导入账号信息并写入本地，不拉取对话")
     args = parser.parse_args()
 
@@ -2239,23 +3213,17 @@ def main():
         print(json.dumps(rows, ensure_ascii=False, indent=2))
         return
 
-    # 3. 鉴权校验
-    auth_ready = False
-    try:
-        exporter.init_auth()
-        auth_ready = True
-    except Exception as e:
-        print(f"[!] cookies 鉴权失败: {e}")
-        print("    请确认浏览器已登录 Gemini，或使用 --cookies-file 提供可用 cookie")
-        sys.exit(1)
-
-    # 4. 导出 / 仅列表测试
+    # 3. 导出 / 仅列表测试
     if args.check_chat_id:
         if args.last_update_ts is None:
             print("[!] 使用 --check-chat-id 时必须提供 --last-update-ts")
             sys.exit(1)
-        if not auth_ready:
+        try:
             exporter.init_auth()
+        except Exception as e:
+            print(f"[!] cookies 鉴权失败: {e}")
+            print("    请确认浏览器已登录 Gemini，或使用 --cookies-file 提供可用 cookie")
+            sys.exit(1)
         check_result = exporter.is_chat_updated(
             exporter.normalize_chat_id(args.check_chat_id),
             args.last_update_ts,
@@ -2264,8 +3232,12 @@ def main():
         return
 
     if args.list_only:
-        if not auth_ready:
+        try:
             exporter.init_auth()
+        except Exception as e:
+            print(f"[!] cookies 鉴权失败: {e}")
+            print("    请确认浏览器已登录 Gemini，或使用 --cookies-file 提供可用 cookie")
+            sys.exit(1)
         chats = exporter.get_all_chats()
         print(f"[*] 聊天列表获取完成: {len(chats)} 个")
         return
@@ -2379,12 +3351,26 @@ def main():
         print(json.dumps(result, ensure_ascii=False))
         return
 
+    try:
+        exporter.init_auth()
+    except Exception as e:
+        print(f"[!] cookies 鉴权失败: {e}")
+        print("    请确认浏览器已登录 Gemini，或使用 --cookies-file 提供可用 cookie")
+        sys.exit(1)
+
     if args.incremental:
         exporter.export_incremental(output_dir=args.output)
         return
 
     if args.sync_list_only:
         exporter.export_list_only(output_dir=args.output)
+        return
+
+    if args.sync_conversation:
+        if not args.conversation_id:
+            print("[!] 使用 --sync-conversation 时必须提供 --conversation-id")
+            sys.exit(1)
+        exporter.sync_single_conversation(args.conversation_id, output_dir=args.output)
         return
 
     exporter.export_all(output_dir=args.output, chat_ids=args.chat_ids)

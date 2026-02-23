@@ -50,11 +50,41 @@ export function TopBar({
         <SidebarIcon collapsed={sidebarCollapsed} color={t.textSub} />
       </button>
 
-      {/* Title - centered in right panel */}
+      {/* Title - centered and width-constrained to avoid overlapping controls */}
       {selectedConversation && (
-        <div style={{ position: "absolute", left: "50%", transform: "translateX(-50%)", textAlign: "center", pointerEvents: "none", whiteSpace: "nowrap" }}>
-          <div style={{ fontSize: 13, fontWeight: 600, color: t.text }}>{selectedConversation.title}</div>
-          <div style={{ fontSize: 11, color: t.textSub, marginTop: 1 }}>
+        <div
+          style={{
+            position: "absolute",
+            left: sidebarCollapsed ? 152 : 84,
+            right: 96,
+            top: "50%",
+            transform: "translateY(-50%)",
+            textAlign: "center",
+            pointerEvents: "none",
+          }}
+        >
+          <div
+            style={{
+              fontSize: 13,
+              fontWeight: 600,
+              color: t.text,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {selectedConversation.title}
+          </div>
+          <div
+            style={{
+              fontSize: 11,
+              color: t.textSub,
+              marginTop: 1,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
             {selectedConversation.messages.length} 条消息 · {formatDate(selectedConversation.updatedAt)}
           </div>
         </div>

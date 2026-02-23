@@ -3,6 +3,9 @@
 export interface Attachment {
   mediaId: string;   // filename with extension in media/ dir
   mimeType: string;
+  previewMediaId?: string; // optional preview image for video
+  downloadFailed?: boolean;
+  downloadError?: string;
 }
 
 export interface ConvMessage {
@@ -24,6 +27,7 @@ export interface Conversation {
   updatedAt: string;   // ISO 8601
   syncedAt: string;    // ISO 8601
   remoteHash: string | null;
+  parseWarning?: string;
   messages: ConvMessage[];
 }
 
