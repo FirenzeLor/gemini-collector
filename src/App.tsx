@@ -635,6 +635,9 @@ function App() {
     }
   }
 
+  const anySyncTaskRunning =
+    listSyncing || fullSyncing || syncingConversationIds.length > 0;
+
   if (screen === "account-picker" || !currentAccount) {
     return (
       <ThemeContext.Provider value={theme}>
@@ -667,7 +670,7 @@ function App() {
           currentAccount={currentAccount}
           accounts={accounts}
           onSwitchAccount={handleSwitchAccount}
-          disableAccountSwitch={listSyncing || fullSyncing || clearingAccountData}
+          disableAccountSwitch={anySyncTaskRunning || clearingAccountData}
           disableConversationSync={listSyncing || fullSyncing || clearingAccountData}
           onSyncConversation={handleSyncConversation}
           syncingConversationIds={syncingConversationIds}
@@ -679,6 +682,7 @@ function App() {
             onToggleSidebar={() => setSidebarCollapsed((v) => !v)}
             isDark={isDark}
             onToggleDark={() => setIsDark((v) => !v)}
+            disableLogout={anySyncTaskRunning}
             onLogout={() => {
               setCurrentAccount(null);
               setConversationSummaries([]);

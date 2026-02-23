@@ -138,6 +138,14 @@ fn normalize_conversation_id(raw: &str) -> String {
     }
 }
 
+fn conversation_has_failed_data(jsonl_file: &Path) -> bool {
+    let raw = match std::fs::read_to_string(jsonl_file) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    raw.contains("\"downloadFailed\": true") || raw.contains("\"downloadFailed\":true")
+}
+
 #[tauri::command]
 fn clear_account_data(
     app: tauri::AppHandle,
@@ -380,6 +388,7 @@ fn enqueue_job(req: EnqueueJobRequest) -> Result<String, String> {
 #[tauri::command]
 fn load_conversation_summaries(app: tauri::AppHandle, account_id: String) -> Result<String, String> {
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let account_dir = data_dir.join("accounts").join(&account_id);
     let conv_file = data_dir
         .join("accounts")
         .join(&account_id)
@@ -391,11 +400,33 @@ fn load_conversation_summaries(app: tauri::AppHandle, account_id: String) -> Res
 
     let raw = std::fs::read_to_string(&conv_file).map_err(|e| e.to_string())?;
     let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-    let items = parsed
+    let mut items = parsed
         .get("items")
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
+
+    let conversations_dir = account_dir.join("conversations");
+    for item in &mut items {
+        let Some(obj) = item.as_object_mut() else {
+            continue;
+        };
+        let cid = obj
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|v| v.trim())
+            .unwrap_or("");
+        if cid.is_empty() {
+            obj.insert("hasFailedData".to_string(), serde_json::Value::Bool(false));
+            continue;
+        }
+
+        let has_failed_data = conversation_has_failed_data(&conversations_dir.join(format!("{}.jsonl", cid)));
+        obj.insert(
+            "hasFailedData".to_string(),
+            serde_json::Value::Bool(has_failed_data),
+        );
+    }
 
     serde_json::to_string(&items).map_err(|e| e.to_string())
 }

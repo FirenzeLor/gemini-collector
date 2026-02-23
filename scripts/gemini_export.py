@@ -60,13 +60,58 @@ PROTECTED_MEDIA_HOSTS = {
 }
 
 GENERATION_PLACEHOLDER_TOKEN = "image_generation_content/"
+YOUTUBE_PLACEHOLDER_TOKEN = "youtube_content/"
+
+
+def timing_log(action: str, start_perf: float, **fields) -> None:
+    elapsed_ms = (time.perf_counter() - start_perf) * 1000.0
+    detail = " ".join(f"{k}={v}" for k, v in fields.items())
+    if detail:
+        print(f"  [timing] {action} {detail} elapsed={elapsed_ms:.1f}ms")
+    else:
+        print(f"  [timing] {action} elapsed={elapsed_ms:.1f}ms")
+
+
+def _is_internal_placeholder_content_url(url_text):
+    if not isinstance(url_text, str):
+        return False
+    candidate = url_text.strip().rstrip("。.,;，；）)]}\"'")
+    if not candidate.startswith(("https://", "http://")):
+        return False
+
+    try:
+        parsed = urlparse(candidate)
+    except Exception:
+        return False
+
+    host = (parsed.hostname or "").lower()
+    if not (host == "googleusercontent.com" or host.endswith(".googleusercontent.com")):
+        return False
+
+    path = (parsed.path or "").lower()
+    return (
+        GENERATION_PLACEHOLDER_TOKEN in path
+        or YOUTUBE_PLACEHOLDER_TOKEN in path
+    )
+
+
+def _contains_internal_placeholder_content_url(text_line):
+    if not isinstance(text_line, str) or not text_line:
+        return False
+    urls = re.findall(r"https?://\S+", text_line)
+    for url_text in urls:
+        if _is_internal_placeholder_content_url(url_text):
+            return True
+    return False
 
 
 def sanitize_generation_placeholder_text(text, has_attachments):
     """
     在已提取到附件时移除旧占位 URL 文本，避免污染 assistant 正文。
     """
-    if not has_attachments or not isinstance(text, str) or GENERATION_PLACEHOLDER_TOKEN not in text:
+    if not isinstance(text, str):
+        return text
+    if GENERATION_PLACEHOLDER_TOKEN not in text and YOUTUBE_PLACEHOLDER_TOKEN not in text:
         return text
 
     kept = []
@@ -74,7 +119,13 @@ def sanitize_generation_placeholder_text(text, has_attachments):
         stripped = line.strip()
         if not stripped:
             continue
-        if stripped.startswith(("https://", "http://")) and GENERATION_PLACEHOLDER_TOKEN in stripped:
+        if _contains_internal_placeholder_content_url(stripped):
+            continue
+        if (
+            has_attachments
+            and stripped.startswith(("https://", "http://"))
+            and GENERATION_PLACEHOLDER_TOKEN in stripped
+        ):
             continue
         kept.append(line)
     return "\n".join(kept).strip()
@@ -555,10 +606,12 @@ class GeminiExporter:
                 "x-goog-ext-525001261-jspb": "[1,null,null,null,null,null,null,null,[4]]",
             },
         )
-        req_elapsed_ms = (time.perf_counter() - req_start) * 1000.0
-        print(
-            f"  [timing] batchexecute rpc={rpcid} status={resp.status_code} "
-            f"elapsed={req_elapsed_ms:.1f}ms source={source_path or '/app'}"
+        timing_log(
+            "_batchexecute",
+            req_start,
+            rpc=rpcid,
+            status=resp.status_code,
+            source=source_path or "/app",
         )
 
         if resp.status_code != 200:
@@ -612,10 +665,12 @@ class GeminiExporter:
                     "latest_update_iso": self._to_iso_utc(latest_update_ts),
                 })
 
-        step_elapsed_ms = (time.perf_counter() - step_start) * 1000.0
-        print(
-            f"  [timing] list-page cursor={'init' if cursor is None else 'next'} "
-            f"items={len(items)} has_next={bool(next_token)} elapsed={step_elapsed_ms:.1f}ms"
+        timing_log(
+            "get_chats_page",
+            step_start,
+            cursor="init" if cursor is None else "next",
+            items=len(items),
+            has_next=bool(next_token),
         )
         return items, next_token
 
@@ -668,11 +723,13 @@ class GeminiExporter:
 
         turns = result[0] if len(result) > 0 and isinstance(result[0], list) else []
         next_cursor = result[1] if len(result) > 1 and isinstance(result[1], str) and result[1] else None
-        step_elapsed_ms = (time.perf_counter() - step_start) * 1000.0
-        print(
-            f"  [timing] detail-page conv={conv_id.replace('c_', '')} "
-            f"cursor={'init' if cursor is None else 'next'} turns={len(turns)} "
-            f"has_next={bool(next_cursor)} elapsed={step_elapsed_ms:.1f}ms"
+        timing_log(
+            "get_chat_detail_page",
+            step_start,
+            conversation=conv_id.replace("c_", ""),
+            cursor="init" if cursor is None else "next",
+            turns=len(turns),
+            has_next=bool(next_cursor),
         )
         return turns, next_cursor
 
@@ -1265,17 +1322,21 @@ class GeminiExporter:
                     timeout=45.0,
                 )
             except Exception as e:
-                req_elapsed_ms = (time.perf_counter() - req_start) * 1000.0
-                print(
-                    f"  [timing] media-get hop={hop + 1} status=exception "
-                    f"elapsed={req_elapsed_ms:.1f}ms url={current_url}"
+                timing_log(
+                    "_download_one_media_no_cdp",
+                    req_start,
+                    hop=hop + 1,
+                    status="exception",
+                    url=current_url,
                 )
                 print(f"  [media-fail] httpx 下载异常: {e} | url={current_url}")
                 return None
-            req_elapsed_ms = (time.perf_counter() - req_start) * 1000.0
-            print(
-                f"  [timing] media-get hop={hop + 1} status={resp.status_code} "
-                f"elapsed={req_elapsed_ms:.1f}ms url={current_url}"
+            timing_log(
+                "_download_one_media_no_cdp",
+                req_start,
+                hop=hop + 1,
+                status=resp.status_code,
+                url=current_url,
             )
 
             if resp.status_code in (301, 302, 303, 307, 308):
@@ -1313,11 +1374,7 @@ class GeminiExporter:
 
             if filepath.exists():
                 stats["media_downloaded"] += 1
-                item_elapsed_ms = (time.perf_counter() - item_start) * 1000.0
-                print(
-                    f"  [timing] media-download media_id={media_id} status=skip_exists "
-                    f"elapsed={item_elapsed_ms:.1f}ms"
-                )
+                timing_log("_download_media_batch_no_cdp", item_start, media_id=media_id, status="skip_exists")
                 continue
 
             # 多账号登录下媒体权限与 authuser 强相关；直接使用带 authuser 的 URL，
@@ -1338,19 +1395,11 @@ class GeminiExporter:
                 filepath.parent.mkdir(parents=True, exist_ok=True)
                 filepath.write_bytes(content)
                 stats["media_downloaded"] += 1
-                item_elapsed_ms = (time.perf_counter() - item_start) * 1000.0
-                print(
-                    f"  [timing] media-download media_id={media_id} status=ok "
-                    f"elapsed={item_elapsed_ms:.1f}ms"
-                )
+                timing_log("_download_media_batch_no_cdp", item_start, media_id=media_id, status="ok")
             else:
                 print(f"  [media-fail] 媒体下载失败，已跳过: {filepath.name} | url={url}")
                 stats["media_failed"] += 1
-                item_elapsed_ms = (time.perf_counter() - item_start) * 1000.0
-                print(
-                    f"  [timing] media-download media_id={media_id} status=failed "
-                    f"elapsed={item_elapsed_ms:.1f}ms"
-                )
+                timing_log("_download_media_batch_no_cdp", item_start, media_id=media_id, status="failed")
                 failed_items.append({
                     "media_id": media_id,
                     "url": url,
@@ -1848,6 +1897,7 @@ class GeminiExporter:
             "lastMessage": existing.get("lastMessage", ""),
             "messageCount": msg_count,
             "hasMedia": bool(existing.get("hasMedia", False)),
+            "hasFailedData": bool(existing.get("hasFailedData", False)),
             "updatedAt": updated_at,
             "syncedAt": existing.get("syncedAt"),
             "remoteHash": remote_hash,
@@ -1996,6 +2046,19 @@ class GeminiExporter:
                 if row.get("type") == "message":
                     count += 1
         return count
+
+    @staticmethod
+    def _rows_has_failed_data(rows):
+        for row in rows:
+            if not isinstance(row, dict) or row.get("type") != "message":
+                continue
+            attachments = row.get("attachments")
+            if not isinstance(attachments, list):
+                continue
+            for att in attachments:
+                if isinstance(att, dict) and att.get("downloadFailed") is True:
+                    return True
+        return False
 
     @staticmethod
     def _remote_hash_from_jsonl(jsonl_file):
@@ -2415,6 +2478,7 @@ class GeminiExporter:
                     "lastMessage": "",
                     "messageCount": 0,
                     "hasMedia": False,
+                    "hasFailedData": False,
                     "updatedAt": chat_info.get("latest_update_iso"),
                     "syncedAt": None,
                     "remoteHash": None,
@@ -2422,6 +2486,7 @@ class GeminiExporter:
             progress_summary["id"] = bare_id
             progress_summary["title"] = progress_summary.get("title") or title
             progress_summary["messageCount"] = progress_count
+            progress_summary["hasFailedData"] = bool(progress_summary.get("hasFailedData", False))
             progress_summary["syncedAt"] = now_iso_local
             if not progress_summary.get("updatedAt") and chat_info.get("latest_update_iso"):
                 progress_summary["updatedAt"] = chat_info.get("latest_update_iso")
@@ -2577,6 +2642,7 @@ class GeminiExporter:
                     r for r in rows_after if isinstance(r, dict) and r.get("type") == "message"
                 ]
                 has_media = any(r.get("attachments") for r in all_msg_rows)
+                has_failed_data = self._rows_has_failed_data(all_msg_rows)
                 last_text = ""
                 for r in reversed(all_msg_rows):
                     if r.get("text"):
@@ -2589,6 +2655,7 @@ class GeminiExporter:
                     "lastMessage": last_text,
                     "messageCount": len(all_msg_rows),
                     "hasMedia": has_media,
+                    "hasFailedData": has_failed_data,
                     "updatedAt": meta_row.get("updatedAt"),
                     "syncedAt": meta_row.get("syncedAt"),
                     "remoteHash": meta_row.get("remoteHash"),
@@ -2603,6 +2670,7 @@ class GeminiExporter:
                         "lastMessage": "",
                         "messageCount": 0,
                         "hasMedia": False,
+                        "hasFailedData": False,
                         "updatedAt": chat_info.get("latest_update_iso"),
                         "syncedAt": now_iso,
                         "remoteHash": None,
@@ -2614,6 +2682,7 @@ class GeminiExporter:
                 if chat_info.get("latest_update_ts") is not None:
                     summary["remoteHash"] = str(chat_info.get("latest_update_ts"))
                 summary["syncedAt"] = now_iso
+                summary["hasFailedData"] = bool(summary.get("hasFailedData", False))
         else:
             print(f"  轮次: {len(raw_turns)}")
             parsed_turns = [self.parse_turn(turn) for turn in raw_turns]
@@ -2657,6 +2726,7 @@ class GeminiExporter:
                 r for r in rows_after if isinstance(r, dict) and r.get("type") == "message"
             ]
             has_media = any(r.get("attachments") for r in msg_rows)
+            has_failed_data = self._rows_has_failed_data(msg_rows)
             last_text = ""
             for r in reversed(msg_rows):
                 if r.get("text"):
@@ -2669,6 +2739,7 @@ class GeminiExporter:
                 "lastMessage": last_text,
                 "messageCount": len(msg_rows),
                 "hasMedia": has_media,
+                "hasFailedData": has_failed_data,
                 "updatedAt": meta_row.get("updatedAt") or chat_info.get("latest_update_iso"),
                 "syncedAt": meta_row.get("syncedAt"),
                 "remoteHash": meta_row.get("remoteHash"),
@@ -2843,6 +2914,7 @@ class GeminiExporter:
                     r for r in rows_after if isinstance(r, dict) and r.get("type") == "message"
                 ]
                 has_media = any(r.get("attachments") for r in msg_rows)
+                has_failed_data = self._rows_has_failed_data(msg_rows)
                 last_text = ""
                 for r in reversed(msg_rows):
                     if r.get("text"):
@@ -2855,6 +2927,7 @@ class GeminiExporter:
                     "lastMessage": last_text,
                     "messageCount": len(msg_rows),
                     "hasMedia": has_media,
+                    "hasFailedData": has_failed_data,
                     "updatedAt": meta_row.get("updatedAt"),
                     "syncedAt": meta_row.get("syncedAt"),
                     "remoteHash": meta_row.get("remoteHash"),
@@ -2872,6 +2945,7 @@ class GeminiExporter:
                     "lastMessage": "",
                     "messageCount": 0,
                     "hasMedia": False,
+                    "hasFailedData": False,
                     "updatedAt": chat.get("latest_update_iso"),
                     "syncedAt": None,
                     "remoteHash": None,
@@ -3081,6 +3155,7 @@ class GeminiExporter:
                 r for r in rows_after if isinstance(r, dict) and r.get("type") == "message"
             ]
             has_media = any(r.get("attachments") for r in all_msg_rows)
+            has_failed_data = self._rows_has_failed_data(all_msg_rows)
             last_text = ""
             for r in reversed(all_msg_rows):
                 if r.get("text"):
@@ -3093,6 +3168,7 @@ class GeminiExporter:
                 "lastMessage": last_text,
                 "messageCount": len(all_msg_rows),
                 "hasMedia": has_media,
+                "hasFailedData": has_failed_data,
                 "updatedAt": meta_row.get("updatedAt"),
                 "syncedAt": meta_row.get("syncedAt"),
                 "remoteHash": meta_row.get("remoteHash"),
@@ -3112,6 +3188,7 @@ class GeminiExporter:
                     "lastMessage": "",
                     "messageCount": 0,
                     "hasMedia": False,
+                    "hasFailedData": False,
                     "updatedAt": chat.get("latest_update_iso"),
                     "syncedAt": None,
                     "remoteHash": None,
