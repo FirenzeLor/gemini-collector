@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Virtuoso } from "react-virtuoso";
@@ -12,9 +12,73 @@ function getKind(mimeType: string): "image" | "video" | "file" {
   return "file";
 }
 
-function buildUrl(mediaId: string, mediaDir?: string): string {
-  if (!mediaDir) return "";
-  return convertFileSrc(`${mediaDir}/${mediaId}`);
+function buildUrl(mediaId: string, mediaDir?: string, cacheKey?: string): string {
+  if (!mediaDir || !mediaId) return "";
+  const base = convertFileSrc(`${mediaDir}/${mediaId}`);
+  if (!cacheKey) return base;
+  return `${base}?v=${encodeURIComponent(cacheKey)}`;
+}
+
+function dedupeLikelyFormatVariants(attachments: Attachment[]): Attachment[] {
+  // Gemini image_generation 在部分版本会返回同一图片的 png/jpeg 双格式；优先保留 png。
+  if (attachments.length !== 2) return attachments;
+
+  const imageAttachments = attachments.filter((a) => getKind(a.mimeType) === "image");
+  if (imageAttachments.length !== 2) return attachments;
+
+  const mimes = imageAttachments.map((a) => (a.mimeType || "").toLowerCase());
+  const hasPng = mimes.includes("image/png");
+  const hasJpeg = mimes.includes("image/jpeg") || mimes.includes("image/jpg");
+  if (!hasPng || !hasJpeg) return attachments;
+
+  const preferred = imageAttachments.find((a) => (a.mimeType || "").toLowerCase() === "image/png") ?? imageAttachments[0];
+  return [preferred];
+}
+
+function hammingDistance(a: number[], b: number[]): number {
+  if (a.length !== b.length) return Number.MAX_SAFE_INTEGER;
+  let diff = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) diff += 1;
+  }
+  return diff;
+}
+
+async function computeImageDHash(url: string, size = 8): Promise<number[] | null> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.decoding = "async";
+    img.onload = () => {
+      try {
+        const canvas = document.createElement("canvas");
+        canvas.width = size + 1;
+        canvas.height = size;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          resolve(null);
+          return;
+        }
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        const { data } = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const gray: number[] = [];
+        for (let i = 0; i < data.length; i += 4) {
+          gray.push((data[i] * 0.299) + (data[i + 1] * 0.587) + (data[i + 2] * 0.114));
+        }
+        const bits: number[] = [];
+        for (let y = 0; y < size; y += 1) {
+          const rowOffset = y * (size + 1);
+          for (let x = 0; x < size; x += 1) {
+            bits.push(gray[rowOffset + x] > gray[rowOffset + x + 1] ? 1 : 0);
+          }
+        }
+        resolve(bits);
+      } catch {
+        resolve(null);
+      }
+    };
+    img.onerror = () => resolve(null);
+    img.src = url;
+  });
 }
 
 // Fix CommonMark bold/italic parsing failure when ** is adjacent to CJK/Unicode chars.
@@ -48,10 +112,15 @@ function formatMsgDate(iso: string): string {
 interface ChatViewProps {
   conversation: Conversation | null;
   mediaDir?: string;  // path to accounts/{id}/media/
+  mediaVersion?: number;
 }
 
-export function ChatView({ conversation, mediaDir }: ChatViewProps) {
+export function ChatView({ conversation, mediaDir, mediaVersion = 0 }: ChatViewProps) {
   const t = useTheme();
+  const parseWarning =
+    conversation && typeof conversation.parseWarning === "string" && conversation.parseWarning.trim()
+      ? conversation.parseWarning.trim()
+      : "";
 
   if (!conversation) {
     return (
@@ -67,15 +136,36 @@ export function ChatView({ conversation, mediaDir }: ChatViewProps) {
 
   return (
     <div style={{ flex: 1, display: "flex", flexDirection: "column", background: t.appBg, overflow: "hidden" }}>
+      {parseWarning && (
+        <div
+          style={{
+            margin: "8px 14px 0",
+            padding: "8px 10px",
+            borderRadius: 8,
+            fontSize: 12,
+            color: t.isDark ? "#ffd28a" : "#9a5b00",
+            background: t.isDark ? "rgba(255,173,51,0.14)" : "rgba(255,173,51,0.15)",
+            border: t.isDark ? "1px solid rgba(255,173,51,0.35)" : "1px solid rgba(255,173,51,0.4)",
+          }}
+        >
+          {parseWarning}
+        </div>
+      )}
       {conversation.messages.length === 0 ? (
         <div style={{ textAlign: "center", color: t.textMuted, fontSize: 13, marginTop: 60 }}>暂无消息记录</div>
       ) : (
         <Virtuoso
-          key={conversation.id}
+          key={`${conversation.id}:${conversation.syncedAt}:${mediaVersion}`}
           data={conversation.messages}
           followOutput="smooth"
           initialTopMostItemIndex={conversation.messages.length - 1}
-          itemContent={(_, msg) => <MessageBubble message={msg} mediaDir={mediaDir} />}
+          itemContent={(_, msg) => (
+            <MessageBubble
+              message={msg}
+              mediaDir={mediaDir}
+              cacheKey={`${conversation.id}:${conversation.syncedAt}:${mediaVersion}`}
+            />
+          )}
           style={{ flex: 1 }}
         />
       )}
@@ -83,18 +173,79 @@ export function ChatView({ conversation, mediaDir }: ChatViewProps) {
   );
 }
 
-function AttachmentStrip({ attachments, mediaDir }: { attachments: Attachment[]; mediaDir?: string }) {
+function AttachmentStrip({
+  attachments,
+  mediaDir,
+  cacheKey,
+  alignRight,
+}: {
+  attachments: Attachment[];
+  mediaDir?: string;
+  cacheKey: string;
+  alignRight: boolean;
+}) {
   const [lightboxIdx, setLightboxIdx] = useState<number | null>(null);
-  const mediaAttachments = attachments.filter((a) => getKind(a.mimeType) !== "file");
-  const fileAttachments = attachments.filter((a) => getKind(a.mimeType) === "file");
+  const failedAttachments = attachments.filter((a) => a.downloadFailed);
+  const renderableAttachments = attachments.filter((a) => !a.downloadFailed);
+  const mediaAttachmentsBase = useMemo(
+    () => dedupeLikelyFormatVariants(renderableAttachments.filter((a) => getKind(a.mimeType) !== "file")),
+    [renderableAttachments],
+  );
+  const mediaKey = useMemo(
+    () => mediaAttachmentsBase.map((a) => `${a.mediaId}:${a.mimeType}`).join("|"),
+    [mediaAttachmentsBase],
+  );
+  const [collapseTwinImages, setCollapseTwinImages] = useState(false);
+  const mediaAttachments = collapseTwinImages ? [mediaAttachmentsBase[0]] : mediaAttachmentsBase;
+  const fileAttachments = renderableAttachments.filter((a) => getKind(a.mimeType) === "file");
+
+  React.useEffect(() => {
+    let cancelled = false;
+    setCollapseTwinImages(false);
+
+    const imageAttachments = mediaAttachmentsBase.filter((a) => getKind(a.mimeType) === "image");
+    if (imageAttachments.length !== 2 || mediaAttachmentsBase.length !== 2) return () => { cancelled = true; };
+
+    const leftUrl = buildUrl(imageAttachments[0].mediaId, mediaDir, cacheKey);
+    const rightUrl = buildUrl(imageAttachments[1].mediaId, mediaDir, cacheKey);
+    if (!leftUrl || !rightUrl) return () => { cancelled = true; };
+
+    (async () => {
+      const [leftHash, rightHash] = await Promise.all([
+        computeImageDHash(leftUrl),
+        computeImageDHash(rightUrl),
+      ]);
+      if (cancelled || !leftHash || !rightHash) return;
+      if (hammingDistance(leftHash, rightHash) <= 2) {
+        setCollapseTwinImages(true);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [mediaKey, mediaDir, cacheKey]);
 
   return (
     <>
+      {failedAttachments.length > 0 && (
+        <div
+          style={{
+            fontSize: 11,
+            color: "#d97706",
+            marginBottom: 6,
+            opacity: 0.9,
+            textAlign: alignRight ? "right" : "left",
+          }}
+        >
+          {failedAttachments.length} 个附件下载失败，点击同步可重试
+        </div>
+      )}
       {/* Media thumbnails */}
       {mediaAttachments.length > 0 && (
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, justifyContent: "flex-end", marginBottom: 6 }}>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, justifyContent: alignRight ? "flex-end" : "flex-start", marginBottom: 6 }}>
           {mediaAttachments.map((att, i) => {
-            const url = buildUrl(att.mediaId, mediaDir);
+            const url = buildUrl(att.mediaId, mediaDir, cacheKey);
             const kind = getKind(att.mimeType);
             return kind === "image" ? (
               <div
@@ -115,11 +266,9 @@ function AttachmentStrip({ attachments, mediaDir }: { attachments: Attachment[];
                 onClick={() => setLightboxIdx(i)}
                 style={{ width: 160, height: 110, borderRadius: 14, overflow: "hidden", cursor: "pointer", flexShrink: 0, background: "#111", boxShadow: "0 2px 8px rgba(0,0,0,0.3)", position: "relative" }}
               >
-                <video
-                  src={url}
-                  style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
-                  muted
-                  preload="metadata"
+                <VideoThumbnail
+                  videoUrl={url}
+                  previewUrl={att.previewMediaId ? buildUrl(att.previewMediaId, mediaDir, cacheKey) : ""}
                 />
                 <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.35)" }}>
                   <div style={{ width: 36, height: 36, borderRadius: "50%", border: "1.5px solid rgba(255,255,255,0.85)", display: "flex", alignItems: "center", justifyContent: "center" }}>
@@ -136,7 +285,7 @@ function AttachmentStrip({ attachments, mediaDir }: { attachments: Attachment[];
 
       {/* File attachments */}
       {fileAttachments.length > 0 && (
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, justifyContent: "flex-end", marginBottom: 6 }}>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, justifyContent: alignRight ? "flex-end" : "flex-start", marginBottom: 6 }}>
           {fileAttachments.map((att, i) => (
             <div
               key={i}
@@ -158,6 +307,7 @@ function AttachmentStrip({ attachments, mediaDir }: { attachments: Attachment[];
           attachments={mediaAttachments}
           index={lightboxIdx}
           mediaDir={mediaDir}
+          cacheKey={cacheKey}
           onClose={() => setLightboxIdx(null)}
           onChange={setLightboxIdx}
         />
@@ -166,21 +316,49 @@ function AttachmentStrip({ attachments, mediaDir }: { attachments: Attachment[];
   );
 }
 
+function VideoThumbnail({ videoUrl, previewUrl }: { videoUrl: string; previewUrl: string }) {
+  const [previewFailed, setPreviewFailed] = useState(false);
+  const canUsePreview = !!previewUrl && !previewFailed;
+
+  if (canUsePreview) {
+    return (
+      <img
+        src={previewUrl}
+        alt="video preview"
+        onError={() => setPreviewFailed(true)}
+        style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
+        draggable={false}
+      />
+    );
+  }
+
+  return (
+    <video
+      src={videoUrl}
+      style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
+      muted
+      preload="metadata"
+    />
+  );
+}
+
 function LightboxModal({
   attachments,
   index,
   mediaDir,
+  cacheKey,
   onClose,
   onChange,
 }: {
   attachments: Attachment[];
   index: number;
   mediaDir?: string;
+  cacheKey: string;
   onClose: () => void;
   onChange: (i: number) => void;
 }) {
   const att = attachments[index];
-  const url = buildUrl(att.mediaId, mediaDir);
+  const url = buildUrl(att.mediaId, mediaDir, cacheKey);
   const kind = getKind(att.mimeType);
 
   React.useEffect(() => {
@@ -243,40 +421,56 @@ function LightboxModal({
   );
 }
 
-function MessageBubble({ message, mediaDir }: { message: ConvMessage; mediaDir?: string }) {
+function MessageBubble({
+  message,
+  mediaDir,
+  cacheKey,
+}: {
+  message: ConvMessage;
+  mediaDir?: string;
+  cacheKey: string;
+}) {
   const t = useTheme();
   const isUser = message.role === "user";
+  const hasText = (message.text || "").trim().length > 0;
 
   return (
     <div style={{ display: "flex", justifyContent: isUser ? "flex-end" : "flex-start", padding: "4px 20px", gap: 8 }}>
-      <div style={{ maxWidth: isUser ? "62%" : "72%" }}>
-        {isUser && message.attachments.length > 0 && (
-          <AttachmentStrip attachments={message.attachments} mediaDir={mediaDir} />
+      <div style={{ maxWidth: isUser ? "62%" : "94%" }}>
+        {message.attachments.length > 0 && (
+          <AttachmentStrip
+            attachments={message.attachments}
+            mediaDir={mediaDir}
+            cacheKey={cacheKey}
+            alignRight={isUser}
+          />
         )}
-        <div style={{
-          padding: isUser ? "10px 14px" : "12px 16px",
-          borderRadius: isUser ? "18px 18px 6px 18px" : "18px 18px 18px 6px",
-          background: isUser ? "linear-gradient(135deg, #0071e3 0%, #0077ed 100%)" : t.aiBubbleBg,
-          color: isUser ? "#fff" : t.text,
-          fontSize: 14,
-          lineHeight: 1.55,
-          boxShadow: isUser ? "0 2px 8px rgba(0,113,227,0.22)" : t.isDark ? "0 1px 3px rgba(0,0,0,0.3)" : "0 1px 3px rgba(0,0,0,0.07)",
-          wordBreak: "break-word",
-        }}>
-          {isUser ? (
-            <span style={{ whiteSpace: "pre-wrap" }}>{message.text}</span>
-          ) : (
-            <div className={`prose-ai${t.isDark ? " prose-dark" : ""}`}>
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{fixMarkdown(message.text)}</ReactMarkdown>
-            </div>
-          )}
-        </div>
-        <div style={{ fontSize: 11, color: t.textMuted, marginTop: 3, textAlign: isUser ? "right" : "left", padding: "0 4px", display: "flex", gap: 4, justifyContent: isUser ? "flex-end" : "flex-start", alignItems: "center", flexWrap: "wrap" }}>
+        {hasText && (
+          <div style={{
+            padding: isUser ? "10px 14px" : "12px 16px",
+            borderRadius: isUser ? "18px 18px 6px 18px" : "18px 18px 18px 6px",
+            background: isUser ? "linear-gradient(135deg, #0071e3 0%, #0077ed 100%)" : t.aiBubbleBg,
+            color: isUser ? "#fff" : t.text,
+            fontSize: 14,
+            lineHeight: 1.55,
+            boxShadow: isUser ? "0 2px 8px rgba(0,113,227,0.22)" : t.isDark ? "0 1px 3px rgba(0,0,0,0.3)" : "0 1px 3px rgba(0,0,0,0.07)",
+            wordBreak: "break-word",
+          }}>
+            {isUser ? (
+              <span style={{ whiteSpace: "pre-wrap" }}>{message.text}</span>
+            ) : (
+              <div className={`prose-ai${t.isDark ? " prose-dark" : ""}`}>
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{fixMarkdown(message.text)}</ReactMarkdown>
+              </div>
+            )}
+          </div>
+        )}
+        <div style={{ fontSize: 11, color: t.textMuted, marginTop: hasText ? 3 : 1, textAlign: isUser ? "right" : "left", padding: "0 4px", display: "flex", gap: 4, justifyContent: isUser ? "flex-end" : "flex-start", alignItems: "center", flexWrap: "wrap" }}>
           <span>{formatMsgDate(message.timestamp)} {formatMsgTime(message.timestamp)}</span>
-          {!isUser && (message.model || null) && (
+          {!isUser && (
             <>
               <span style={{ opacity: 0.4 }}>·</span>
-              <span style={{ color: t.textSub }}>{message.model || "Gemini"}</span>
+              <span style={{ color: t.textSub }}>{message.model || "未知模型"}</span>
             </>
           )}
         </div>
