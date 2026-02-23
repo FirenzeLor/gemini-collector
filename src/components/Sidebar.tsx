@@ -235,7 +235,7 @@ export function Sidebar({
               (e.currentTarget as HTMLElement).style.background = "transparent";
             }}
           >
-            <span style={{ fontSize: 11, fontWeight: 600, lineHeight: 1, letterSpacing: 0.2 }}>List</span>
+            <span style={{ fontSize: 11, fontWeight: 700, lineHeight: 1, letterSpacing: 0.4 }}>List</span>
             <SyncIcon spinning={listSyncing} color={listSyncing ? "#0071e3" : t.textSub} small />
           </button>
           <button

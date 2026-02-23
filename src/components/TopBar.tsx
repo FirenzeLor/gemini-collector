@@ -1,13 +1,24 @@
 import React from "react";
-import { Conversation } from "../data/mockData";
+import { Conversation, ConversationSummary } from "../data/mockData";
 import { useTheme } from "../theme";
 
-function formatDate(iso: string): string {
-  return iso.slice(0, 10);
+function formatUpdatedAt(iso: string): string {
+  if (!iso) return "-";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
 }
 
 interface TopBarProps {
   selectedConversation: Conversation | null;
+  selectedSummary?: ConversationSummary | null;
   sidebarCollapsed: boolean;
   onToggleSidebar: () => void;
   isDark: boolean;
@@ -17,10 +28,21 @@ interface TopBarProps {
 }
 
 export function TopBar({
-  selectedConversation, sidebarCollapsed, onToggleSidebar,
+  selectedConversation,
+  selectedSummary = null,
+  sidebarCollapsed,
+  onToggleSidebar,
   isDark, onToggleDark, disableLogout = false, onLogout,
 }: TopBarProps) {
   const t = useTheme();
+  const imageCount = Math.max(0, selectedSummary?.imageCount ?? 0);
+  const videoCount = Math.max(0, selectedSummary?.videoCount ?? 0);
+  const createdAt = selectedConversation?.createdAt || selectedSummary?.updatedAt || "";
+  const subtitleParts: string[] = [];
+  if (imageCount > 0) subtitleParts.push(`图片 ${imageCount}`);
+  if (videoCount > 0) subtitleParts.push(`视频 ${videoCount}`);
+  subtitleParts.push(`创建于 ${formatUpdatedAt(createdAt)}`);
+  const subtitle = subtitleParts.join(" · ");
 
   return (
     <div
@@ -91,7 +113,7 @@ export function TopBar({
               whiteSpace: "nowrap",
             }}
           >
-            {selectedConversation.messages.length} 条消息 · {formatDate(selectedConversation.updatedAt)}
+            {subtitle}
           </div>
         </div>
       )}
