@@ -3,6 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Virtuoso } from "react-virtuoso";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { Attachment, Conversation, ConvMessage } from "../data/mockData";
 import { useTheme } from "../theme";
 
@@ -433,18 +434,19 @@ function MessageBubble({
   const t = useTheme();
   const isUser = message.role === "user";
   const hasText = (message.text || "").trim().length > 0;
+  const attachmentsBlock = message.attachments.length > 0 ? (
+    <AttachmentStrip
+      attachments={message.attachments}
+      mediaDir={mediaDir}
+      cacheKey={cacheKey}
+      alignRight={isUser}
+    />
+  ) : null;
 
   return (
     <div style={{ display: "flex", justifyContent: isUser ? "flex-end" : "flex-start", padding: "4px 20px", gap: 8 }}>
       <div style={{ maxWidth: isUser ? "62%" : "94%" }}>
-        {message.attachments.length > 0 && (
-          <AttachmentStrip
-            attachments={message.attachments}
-            mediaDir={mediaDir}
-            cacheKey={cacheKey}
-            alignRight={isUser}
-          />
-        )}
+        {isUser && attachmentsBlock}
         {hasText && (
           <div style={{
             padding: isUser ? "10px 14px" : "12px 16px",
@@ -460,11 +462,33 @@ function MessageBubble({
               <span style={{ whiteSpace: "pre-wrap" }}>{message.text}</span>
             ) : (
               <div className={`prose-ai${t.isDark ? " prose-dark" : ""}`}>
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>{fixMarkdown(message.text)}</ReactMarkdown>
+                <ReactMarkdown
+                  remarkPlugins={[remarkGfm]}
+                  components={{
+                    a: ({ href, children, ...props }) => (
+                      <a
+                        {...props}
+                        href={href}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          if (!href) return;
+                          void openUrl(href);
+                        }}
+                      >
+                        {children}
+                      </a>
+                    ),
+                  }}
+                >
+                  {fixMarkdown(message.text)}
+                </ReactMarkdown>
               </div>
             )}
           </div>
         )}
+        {!isUser && attachmentsBlock}
         <div style={{ fontSize: 11, color: t.textMuted, marginTop: hasText ? 3 : 1, textAlign: isUser ? "right" : "left", padding: "0 4px", display: "flex", gap: 4, justifyContent: isUser ? "flex-end" : "flex-start", alignItems: "center", flexWrap: "wrap" }}>
           <span>{formatMsgDate(message.timestamp)} {formatMsgTime(message.timestamp)}</span>
           {!isUser && (

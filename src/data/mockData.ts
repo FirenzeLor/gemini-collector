@@ -37,6 +37,7 @@ export interface ConversationSummary {
   lastMessage: string;      // plain text, max 80 chars
   messageCount: number;
   hasMedia: boolean;
+  hasFailedData?: boolean;
   updatedAt: string;        // ISO 8601
   syncedAt: string | null;
   remoteHash: string | null;

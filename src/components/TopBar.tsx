@@ -12,12 +12,13 @@ interface TopBarProps {
   onToggleSidebar: () => void;
   isDark: boolean;
   onToggleDark: () => void;
+  disableLogout?: boolean;
   onLogout: () => void;
 }
 
 export function TopBar({
   selectedConversation, sidebarCollapsed, onToggleSidebar,
-  isDark, onToggleDark, onLogout,
+  isDark, onToggleDark, disableLogout = false, onLogout,
 }: TopBarProps) {
   const t = useTheme();
 
@@ -61,6 +62,9 @@ export function TopBar({
             transform: "translateY(-50%)",
             textAlign: "center",
             pointerEvents: "none",
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
           }}
         >
           <div
@@ -68,6 +72,7 @@ export function TopBar({
               fontSize: 13,
               fontWeight: 600,
               color: t.text,
+              width: "60%",
               overflow: "hidden",
               textOverflow: "ellipsis",
               whiteSpace: "nowrap",
@@ -80,6 +85,7 @@ export function TopBar({
               fontSize: 11,
               color: t.textSub,
               marginTop: 1,
+              width: "60%",
               overflow: "hidden",
               textOverflow: "ellipsis",
               whiteSpace: "nowrap",
@@ -105,10 +111,16 @@ export function TopBar({
 
         {/* Logout */}
         <button
-          onClick={onLogout}
+          onClick={() => {
+            if (disableLogout) return;
+            onLogout();
+          }}
           title="退出账号"
-          style={iconBtn(t.btnHoverBg)}
-          onMouseEnter={(e) => ((e.currentTarget as HTMLElement).style.background = t.btnHoverBg)}
+          style={{ ...iconBtn(t.btnHoverBg), opacity: disableLogout ? 0.55 : 1, cursor: disableLogout ? "default" : "pointer" }}
+          onMouseEnter={(e) => {
+            if (disableLogout) return;
+            (e.currentTarget as HTMLElement).style.background = t.btnHoverBg;
+          }}
           onMouseLeave={(e) => ((e.currentTarget as HTMLElement).style.background = "transparent")}
         >
           <LogoutIcon color={t.textSub} />
