@@ -2,13 +2,18 @@
 # Stop the running gemini-mac-app dev instance (idempotent).
 
 APP_NAME="gemini-mac-app"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+APP_CARGO_MANIFEST="$SCRIPT_DIR/src-tauri/Cargo.toml"
+APP_DEBUG_PATH="$HOME/.cargo/targets/$(basename "$SCRIPT_DIR")/debug/$APP_NAME"
 
 collect_pids() {
   {
-    pgrep -f "target/debug/$APP_NAME" 2>/dev/null
+    pgrep -f "$APP_DEBUG_PATH" 2>/dev/null
+    pgrep -f "/target/debug/$APP_NAME" 2>/dev/null
+    pgrep -f "$APP_CARGO_MANIFEST" 2>/dev/null
     pgrep -f "tauri dev" 2>/dev/null
-    lsof -ti :1420 2>/dev/null
-  } | awk 'NF' | sort -u
+    lsof -ti tcp:1420 2>/dev/null
+  } | awk -v self="$$" 'NF && $1 != self' | sort -u
 }
 
 PIDS="$(collect_pids)"
