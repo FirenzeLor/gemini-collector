@@ -657,7 +657,26 @@ function App() {
 
   return (
     <ThemeContext.Provider value={theme}>
-      <div style={{ display: "flex", height: "100vh", width: "100vw", overflow: "hidden", background: theme.appBg }}>
+      <div
+        style={{
+          display: "flex",
+          height: "100vh",
+          width: "100vw",
+          overflow: "hidden",
+          background: theme.appBg,
+          position: "relative",
+        }}
+      >
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            pointerEvents: "none",
+            background: theme.isDark
+              ? "radial-gradient(940px 560px at 90% 8%, rgba(255,255,255,0.12), transparent 66%), radial-gradient(860px 540px at -6% 92%, rgba(255,255,255,0.08), transparent 62%), repeating-linear-gradient(128deg, rgba(255,255,255,0.03) 0 1px, transparent 1px 28px)"
+              : "radial-gradient(900px 520px at 89% 9%, rgba(126,181,255,0.3), transparent 67%), radial-gradient(860px 520px at -4% 91%, rgba(183,209,255,0.3), transparent 62%), linear-gradient(115deg, rgba(255,255,255,0.30) 0%, transparent 36%)",
+          }}
+        />
         <Sidebar
           conversations={conversationSummaries}
           selectedId={selectedId}
@@ -678,7 +697,20 @@ function App() {
           onSyncConversation={handleSyncConversation}
           syncingConversationIds={syncingConversationIds}
         />
-        <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+        <div
+          style={{
+            flex: 1,
+            minWidth: 0,
+            display: "flex",
+            flexDirection: "column",
+            overflow: "hidden",
+            background: theme.cardBg,
+            backdropFilter: "blur(36px) saturate(112%)",
+            WebkitBackdropFilter: "blur(36px) saturate(112%)",
+            position: "relative",
+            zIndex: 1,
+          }}
+        >
           <TopBar
             selectedConversation={selectedConversation}
             selectedSummary={selectedSummary}

@@ -72,10 +72,13 @@ export function Sidebar({
       transition: "width 0.25s cubic-bezier(0.4,0,0.2,1), min-width 0.25s cubic-bezier(0.4,0,0.2,1)",
       overflow: "hidden",
       background: t.sidebarBg,
-      borderRight: `1px solid ${t.border}`,
+      borderRight: `1px solid ${t.divider}`,
+      backdropFilter: "blur(34px) saturate(112%)",
+      WebkitBackdropFilter: "blur(34px) saturate(112%)",
       display: "flex",
       flexDirection: "column",
       flexShrink: 0,
+      position: "relative",
     }}>
       <div data-tauri-drag-region style={{ height: 52, minWidth: 260, flexShrink: 0 }} />
 
@@ -157,10 +160,12 @@ export function Sidebar({
             right: 6,
             marginBottom: 2,
             borderRadius: 10,
-            background: t.sidebarBg,
+            background: t.cardBg,
             border: `1px solid ${t.border}`,
+            backdropFilter: "blur(28px) saturate(115%)",
+            WebkitBackdropFilter: "blur(28px) saturate(115%)",
             overflow: "hidden",
-            boxShadow: t.isDark ? "0 -4px 16px rgba(0,0,0,0.4)" : "0 -4px 16px rgba(0,0,0,0.12)",
+            boxShadow: t.isDark ? "0 -8px 22px rgba(3,8,18,0.5)" : "0 -8px 22px rgba(80,104,146,0.18)",
           }}>
             {otherAccounts.map((account) => (
               <button
