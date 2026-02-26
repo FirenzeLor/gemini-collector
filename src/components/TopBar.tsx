@@ -56,6 +56,8 @@ export function TopBar({
         paddingRight: 12,
         position: "relative",
         background: t.topBarBg,
+        backdropFilter: "blur(30px) saturate(112%)",
+        WebkitBackdropFilter: "blur(30px) saturate(112%)",
       }}
     >
       {/* Toggle sidebar button */}

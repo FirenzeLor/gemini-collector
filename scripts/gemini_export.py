@@ -59,8 +59,7 @@ PROTECTED_MEDIA_HOSTS = {
     "contribution.usercontent.google.com",
 }
 
-GENERATION_PLACEHOLDER_TOKEN = "image_generation_content/"
-YOUTUBE_PLACEHOLDER_TOKEN = "youtube_content/"
+INTERNAL_PLACEHOLDER_PATH_RE = re.compile(r"(?:^|/)[a-z0-9_]+_content(?:/|$)")
 
 
 def timing_log(action: str, start_perf: float, **fields) -> None:
@@ -89,10 +88,7 @@ def _is_internal_placeholder_content_url(url_text):
         return False
 
     path = (parsed.path or "").lower()
-    return (
-        GENERATION_PLACEHOLDER_TOKEN in path
-        or YOUTUBE_PLACEHOLDER_TOKEN in path
-    )
+    return bool(INTERNAL_PLACEHOLDER_PATH_RE.search(path))
 
 
 def _contains_internal_placeholder_content_url(text_line):
@@ -111,7 +107,7 @@ def sanitize_generation_placeholder_text(text, has_attachments):
     """
     if not isinstance(text, str):
         return text
-    if GENERATION_PLACEHOLDER_TOKEN not in text and YOUTUBE_PLACEHOLDER_TOKEN not in text:
+    if "_content/" not in text or "googleusercontent.com" not in text:
         return text
 
     kept = []
@@ -120,12 +116,6 @@ def sanitize_generation_placeholder_text(text, has_attachments):
         if not stripped:
             continue
         if _contains_internal_placeholder_content_url(stripped):
-            continue
-        if (
-            has_attachments
-            and stripped.startswith(("https://", "http://"))
-            and GENERATION_PLACEHOLDER_TOKEN in stripped
-        ):
             continue
         kept.append(line)
     return "\n".join(kept).strip()
@@ -931,7 +921,7 @@ class GeminiExporter:
         for item in candidates:
             parsed = GeminiExporter._parse_media_item(item, "assistant")
             url = parsed.get("url")
-            if not url or "image_generation_content/" in url:
+            if not url or _is_internal_placeholder_content_url(url):
                 continue
             key = (url, parsed.get("filename"), parsed.get("mime"))
             if key in seen:
