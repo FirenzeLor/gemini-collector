@@ -205,7 +205,7 @@ export function ChatView({ conversation, mediaDir, mediaVersion = 0 }: ChatViewP
 
   if (!conversation) {
     return (
-      <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: t.appBg }}>
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: "transparent" }}>
         <div style={{ textAlign: "center", color: t.textMuted }}>
           <div style={{ fontSize: 44, marginBottom: 10 }}>💬</div>
           <div style={{ fontSize: 15, fontWeight: 600, color: t.text, marginBottom: 5 }}>选择一个对话</div>
@@ -216,7 +216,7 @@ export function ChatView({ conversation, mediaDir, mediaVersion = 0 }: ChatViewP
   }
 
   return (
-    <div style={{ flex: 1, display: "flex", flexDirection: "column", background: t.appBg, overflow: "hidden" }}>
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", background: "transparent", overflow: "hidden" }}>
       {parseWarning && (
         <div
           style={{

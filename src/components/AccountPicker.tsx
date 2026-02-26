@@ -22,7 +22,7 @@ export function AccountPicker({ accounts, loading, onSelect, isDark, onToggleDar
       <button
         onClick={onToggleDark}
         title={isDark ? "切换到亮色模式" : "切换到暗色模式"}
-        style={{ position: "absolute", top: 14, right: 14, width: 28, height: 28, borderRadius: 7, border: "none", background: "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", transition: "background 0.15s" }}
+        style={{ position: "absolute", top: 14, right: 14, width: 28, height: 28, borderRadius: 7, border: "none", background: t.topBarBg, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", transition: "background 0.15s", backdropFilter: "blur(24px) saturate(112%)", WebkitBackdropFilter: "blur(24px) saturate(112%)" }}
         onMouseEnter={(e) => ((e.currentTarget as HTMLElement).style.background = t.btnHoverBg)}
         onMouseLeave={(e) => ((e.currentTarget as HTMLElement).style.background = "transparent")}
       >
@@ -42,7 +42,7 @@ export function AccountPicker({ accounts, loading, onSelect, isDark, onToggleDar
       </div>
 
       {/* Content area */}
-      <div style={{ width: 360, background: t.cardBg, borderRadius: 16, boxShadow: t.isDark ? "0 2px 24px rgba(0,0,0,0.4)" : "0 2px 24px rgba(0,0,0,0.09)", overflow: "hidden", minHeight: 64 }}>
+      <div style={{ width: 360, background: t.cardBg, borderRadius: 16, boxShadow: t.isDark ? "0 16px 34px rgba(5,10,20,0.42)" : "0 16px 34px rgba(70,102,156,0.2)", backdropFilter: "blur(32px) saturate(115%)", WebkitBackdropFilter: "blur(32px) saturate(115%)", overflow: "hidden", minHeight: 64 }}>
         {loading ? (
           /* Loading state */
           <div style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: 32 }}>

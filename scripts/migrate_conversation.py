@@ -25,13 +25,50 @@
 import argparse
 import json
 import os
+import re
 import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 APP_DATA = Path.home() / "Library" / "Application Support" / "com.gemini-collector.app"
 ACCOUNTS_JSON = APP_DATA / "accounts.json"
+INTERNAL_PLACEHOLDER_PATH_RE = re.compile(r"(?:^|/)[a-z0-9_]+_content(?:/|$)")
+
+
+def _is_internal_placeholder_content_url(url_text: str) -> bool:
+    if not isinstance(url_text, str):
+        return False
+    candidate = url_text.strip().rstrip("。.,;，；）)]}\"'")
+    if not candidate.startswith(("https://", "http://")):
+        return False
+    try:
+        parsed = urlparse(candidate)
+    except Exception:
+        return False
+    host = (parsed.hostname or "").lower()
+    if not (host == "googleusercontent.com" or host.endswith(".googleusercontent.com")):
+        return False
+    path = (parsed.path or "").lower()
+    return bool(INTERNAL_PLACEHOLDER_PATH_RE.search(path))
+
+
+def sanitize_internal_placeholder_text(text: str | None) -> str:
+    if not isinstance(text, str):
+        return ""
+    if "_content/" not in text or "googleusercontent.com" not in text:
+        return text
+    kept = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        urls = re.findall(r"https?://\S+", stripped)
+        if any(_is_internal_placeholder_content_url(url) for url in urls):
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
 
 
 def load_accounts():
@@ -214,7 +251,7 @@ def convert_to_app_format(turns: list[dict], conv_id: str, account_id: str, meta
                 "type": "message",
                 "id": f"{turn_id}_m",
                 "role": "model",
-                "text": assistant.get("text", ""),
+                "text": sanitize_internal_placeholder_text(assistant.get("text", "")),
                 "attachments": [],
                 "timestamp": ts,
             }
