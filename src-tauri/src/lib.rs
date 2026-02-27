@@ -2,6 +2,7 @@ mod worker_host;
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use chrono::Local;
 use tauri::Manager;
 use worker_host::EnqueueJobRequest;
 
@@ -144,6 +145,300 @@ fn conversation_has_failed_data(jsonl_file: &Path) -> bool {
         Err(_) => return false,
     };
     raw.contains("\"downloadFailed\": true") || raw.contains("\"downloadFailed\":true")
+}
+
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AccountExportStats {
+    account_id: String,
+    conversation_count: u64,
+    conversation_file_count: u64,
+    media_file_count: u64,
+    total_file_count: u64,
+    total_bytes: u64,
+    estimated_zip_bytes: u64,
+}
+
+fn resolve_account_id_arg(
+    account_id: Option<String>,
+    account_id_camel: Option<String>,
+) -> Result<String, String> {
+    account_id
+        .or(account_id_camel)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "缺少 account_id/accountId 参数".to_string())
+}
+
+fn sanitize_file_component(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_control()
+            || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+        {
+            out.push('_');
+            continue;
+        }
+        if ch.is_whitespace() {
+            out.push('_');
+            continue;
+        }
+        out.push(ch);
+    }
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        "account".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn count_files_and_bytes_recursive(root: &Path) -> Result<(u64, u64), String> {
+    if !root.exists() {
+        return Ok((0, 0));
+    }
+
+    let mut files: u64 = 0;
+    let mut total_bytes: u64 = 0;
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let file_type = entry.file_type().map_err(|e| e.to_string())?;
+            if file_type.is_dir() {
+                stack.push(entry.path());
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            files += 1;
+            total_bytes += entry.metadata().map_err(|e| e.to_string())?.len();
+        }
+    }
+
+    Ok((files, total_bytes))
+}
+
+fn count_jsonl_files(conversations_dir: &Path) -> Result<u64, String> {
+    if !conversations_dir.exists() {
+        return Ok(0);
+    }
+    let mut count: u64 = 0;
+    for entry in std::fs::read_dir(conversations_dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        if !file_type.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn conversation_count_from_index(account_dir: &Path) -> Option<u64> {
+    let index_file = account_dir.join("conversations.json");
+    if !index_file.exists() {
+        return None;
+    }
+    let raw = std::fs::read_to_string(&index_file).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    if let Some(items) = parsed.get("items").and_then(|v| v.as_array()) {
+        return Some(items.len() as u64);
+    }
+    parsed.get("totalCount").and_then(|v| v.as_u64())
+}
+
+fn account_export_user_label(account_dir: &Path, account_id: &str) -> String {
+    let meta_file = account_dir.join("meta.json");
+    if meta_file.exists() {
+        if let Ok(raw) = std::fs::read_to_string(&meta_file) {
+            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(email) = value_to_non_empty_string(meta.get("email")) {
+                    let name = email.split('@').next().unwrap_or("").trim();
+                    if !name.is_empty() {
+                        return name.to_string();
+                    }
+                }
+                if let Some(name) = value_to_non_empty_string(meta.get("name")) {
+                    if !name.is_empty() {
+                        return name;
+                    }
+                }
+            }
+        }
+    }
+    account_id.to_string()
+}
+
+fn build_account_export_stats(account_dir: &Path, account_id: &str) -> Result<AccountExportStats, String> {
+    let conversations_dir = account_dir.join("conversations");
+    let media_dir = account_dir.join("media");
+
+    let conversation_file_count = count_jsonl_files(&conversations_dir)?;
+    let media_file_count = count_files_and_bytes_recursive(&media_dir)?.0;
+    let (total_file_count, total_bytes) = count_files_and_bytes_recursive(account_dir)?;
+    let conversation_count =
+        conversation_count_from_index(account_dir).unwrap_or(conversation_file_count);
+    let estimated_zip_bytes = if total_bytes == 0 {
+        0
+    } else {
+        ((total_bytes as f64) * 0.62).round() as u64
+    };
+
+    Ok(AccountExportStats {
+        account_id: account_id.to_string(),
+        conversation_count,
+        conversation_file_count,
+        media_file_count,
+        total_file_count,
+        total_bytes,
+        estimated_zip_bytes,
+    })
+}
+
+fn zip_account_dir(account_dir: &Path, zip_path: &Path) -> Result<(), String> {
+    let parent = account_dir
+        .parent()
+        .ok_or_else(|| "账号目录路径异常".to_string())?;
+    let folder_name = account_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| "账号目录名称异常".to_string())?;
+
+    let ditto_output = std::process::Command::new("ditto")
+        .current_dir(parent)
+        .arg("-c")
+        .arg("-k")
+        .arg("--sequesterRsrc")
+        .arg("--keepParent")
+        .arg(folder_name)
+        .arg(zip_path)
+        .output();
+
+    match ditto_output {
+        Ok(output) if output.status.success() => return Ok(()),
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let reason = if stderr.is_empty() {
+                format!("ditto 退出码 {:?}", output.status.code())
+            } else {
+                stderr
+            };
+            eprintln!("[export_account_zip] ditto 打包失败，尝试 zip 兜底: {}", reason);
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("[export_account_zip] 系统无 ditto，尝试 zip 兜底");
+        }
+        Err(err) => {
+            eprintln!("[export_account_zip] ditto 执行异常，尝试 zip 兜底: {}", err);
+        }
+    }
+
+    let zip_output = std::process::Command::new("zip")
+        .current_dir(parent)
+        .arg("-r")
+        .arg("-q")
+        .arg(zip_path)
+        .arg(folder_name)
+        .output()
+        .map_err(|e| format!("zip 执行失败: {}", e))?;
+
+    if zip_output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&zip_output.stderr).trim().to_string();
+        let reason = if stderr.is_empty() {
+            format!("zip 退出码 {:?}", zip_output.status.code())
+        } else {
+            stderr
+        };
+        Err(format!("zip 打包失败: {}", reason))
+    }
+}
+
+#[tauri::command]
+fn get_account_export_stats(
+    app: tauri::AppHandle,
+    account_id: Option<String>,
+    #[allow(non_snake_case)] accountId: Option<String>,
+) -> Result<String, String> {
+    let account_id = resolve_account_id_arg(account_id, accountId)?;
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let account_dir = data_dir.join("accounts").join(&account_id);
+    if !account_dir.exists() {
+        return Err(format!("账号目录不存在: {}", account_id));
+    }
+    let stats = build_account_export_stats(&account_dir, &account_id)?;
+    serde_json::to_string(&stats).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn export_account_zip(
+    app: tauri::AppHandle,
+    account_id: Option<String>,
+    #[allow(non_snake_case)] accountId: Option<String>,
+    output_dir: Option<String>,
+    #[allow(non_snake_case)] outputDir: Option<String>,
+) -> Result<String, String> {
+    let account_id = resolve_account_id_arg(account_id, accountId)?;
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let account_dir = data_dir.join("accounts").join(&account_id);
+    if !account_dir.exists() {
+        return Err(format!("账号目录不存在: {}", account_id));
+    }
+
+    let stats = build_account_export_stats(&account_dir, &account_id)?;
+    let user_label = account_export_user_label(&account_dir, &account_id);
+    let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
+    let file_name = format!(
+        "gemini-{}-{}.zip",
+        sanitize_file_component(&user_label),
+        timestamp
+    );
+
+    let preferred_export_dir = output_dir
+        .or(outputDir)
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+
+    let export_dir = preferred_export_dir
+        .unwrap_or_else(|| dirs::download_dir().unwrap_or_else(|| data_dir.join("exports")));
+    if !export_dir.exists() {
+        std::fs::create_dir_all(&export_dir).map_err(|e| e.to_string())?;
+    }
+    if !export_dir.is_dir() {
+        return Err(format!("导出目录不可用: {}", export_dir.display()));
+    }
+
+    let zip_path = export_dir.join(file_name);
+    if zip_path.exists() {
+        std::fs::remove_file(&zip_path).map_err(|e| e.to_string())?;
+    }
+
+    zip_account_dir(&account_dir, &zip_path)?;
+    let zip_size_bytes = std::fs::metadata(&zip_path)
+        .map_err(|e| e.to_string())?
+        .len();
+
+    let result = serde_json::json!({
+        "accountId": account_id,
+        "zipPath": zip_path.to_string_lossy().to_string(),
+        "fileName": zip_path.file_name().and_then(|s| s.to_str()).unwrap_or("export.zip"),
+        "zipSizeBytes": zip_size_bytes,
+        "conversationCount": stats.conversation_count,
+        "conversationFileCount": stats.conversation_file_count,
+        "mediaFileCount": stats.media_file_count,
+        "totalFileCount": stats.total_file_count,
+        "totalBytes": stats.total_bytes,
+        "estimatedZipBytes": stats.estimated_zip_bytes,
+    });
+    serde_json::to_string(&result).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -411,6 +706,18 @@ fn load_conversation_summaries(app: tauri::AppHandle, account_id: String) -> Res
         let Some(obj) = item.as_object_mut() else {
             continue;
         };
+        let status = obj
+            .get("status")
+            .and_then(|v| v.as_str())
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .unwrap_or("normal")
+            .to_string();
+        obj.insert(
+            "status".to_string(),
+            serde_json::Value::String(status),
+        );
+
         let cid = obj
             .get("id")
             .and_then(|v| v.as_str())
@@ -539,11 +846,6 @@ fn load_conversation_detail(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let synced_at = meta_val
-        .get("syncedAt")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| updated_at.clone());
     let remote_hash = meta_val.get("remoteHash").cloned().unwrap_or(serde_json::Value::Null);
     let account_id_meta = meta_val
         .get("accountId")
@@ -557,7 +859,6 @@ fn load_conversation_detail(
         "title": title,
         "createdAt": created_at,
         "updatedAt": updated_at,
-        "syncedAt": synced_at,
         "remoteHash": remote_hash,
         "parseWarning": parse_warning,
         "messages": messages,
@@ -570,6 +871,7 @@ fn load_conversation_detail(
 pub fn run() {
     init_python_bin();
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| -> Result<(), Box<dyn std::error::Error>> {
             let app_handle = app.handle().clone();
@@ -596,6 +898,8 @@ pub fn run() {
             load_accounts,
             run_accounts_import,
             enqueue_job,
+            get_account_export_stats,
+            export_account_zip,
             clear_account_data,
             load_conversation_summaries,
             get_account_media_dir,

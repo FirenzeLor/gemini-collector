@@ -1,5 +1,5 @@
 import React from "react";
-import { Account } from "../data/mockData";
+import { Account } from "../data/types";
 import { useTheme } from "../theme";
 
 interface AccountPickerProps {

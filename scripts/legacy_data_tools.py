@@ -354,7 +354,6 @@ def migrate_old_to_new(old_dir, new_base_dir, account_id, email="", name="", exp
                 "messageCount": len(msg_rows),
                 "hasMedia": has_media,
                 "updatedAt": meta_row.get("updatedAt"),
-                "syncedAt": meta_row.get("syncedAt"),
                 "remoteHash": meta_row.get("remoteHash"),
             }
         )

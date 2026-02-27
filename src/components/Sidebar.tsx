@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Virtuoso } from "react-virtuoso";
-import { ConversationSummary, Account } from "../data/mockData";
+import { ConversationSummary, Account } from "../data/types";
 import { useTheme } from "../theme";
 
 interface SidebarProps {
@@ -12,6 +12,9 @@ interface SidebarProps {
   fullSyncing: boolean;
   onSyncList: () => void;
   onSyncFull: () => void;
+  exportingAccountData?: boolean;
+  disableExportAccountData?: boolean;
+  onExportAccountData?: () => void;
   clearingAccountData: boolean;
   disableClearAccountData?: boolean;
   onClearAccountData: () => void;
@@ -42,6 +45,7 @@ function formatConvTime(iso: string): string {
 export function Sidebar({
   conversations, selectedId, onSelect, collapsed,
   listSyncing, fullSyncing, onSyncList, onSyncFull, clearingAccountData, onClearAccountData,
+  exportingAccountData = false, disableExportAccountData = false, onExportAccountData,
   disableClearAccountData = false,
   currentAccount, accounts, onSwitchAccount,
   disableAccountSwitch = false, disableConversationSync = false,
@@ -87,37 +91,70 @@ export function Sidebar({
           <span style={{ fontSize: 11, fontWeight: 600, color: t.textMuted, letterSpacing: 0.5, textTransform: "uppercase" }}>
             对话历史
           </span>
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              if (clearingAccountData || disableClearAccountData) return;
-              onClearAccountData();
-            }}
-            title="清空当前账号数据"
-            style={{
-              width: 22,
-              height: 22,
-              borderRadius: 6,
-              border: "none",
-              background: "transparent",
-              cursor: (clearingAccountData || disableClearAccountData) ? "default" : "pointer",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              flexShrink: 0,
-              opacity: (clearingAccountData || disableClearAccountData) ? 0.55 : 1,
-              transition: "background 0.12s",
-            }}
-            onMouseEnter={(e) => {
-              if (clearingAccountData || disableClearAccountData) return;
-              (e.currentTarget as HTMLElement).style.background = t.btnHoverBg;
-            }}
-            onMouseLeave={(e) => {
-              (e.currentTarget as HTMLElement).style.background = "transparent";
-            }}
-          >
-            <TrashIcon color={clearingAccountData ? "#d34b4b" : t.textMuted} />
-          </button>
+          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                if (exportingAccountData || disableExportAccountData) return;
+                onExportAccountData?.();
+              }}
+              title="导出当前账号数据"
+              style={{
+                width: 22,
+                height: 22,
+                borderRadius: 6,
+                border: "none",
+                background: "transparent",
+                cursor: (exportingAccountData || disableExportAccountData) ? "default" : "pointer",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                flexShrink: 0,
+                opacity: (exportingAccountData || disableExportAccountData) ? 0.62 : 1,
+                transition: "background 0.12s",
+              }}
+              onMouseEnter={(e) => {
+                if (exportingAccountData || disableExportAccountData) return;
+                (e.currentTarget as HTMLElement).style.background = t.btnHoverBg;
+              }}
+              onMouseLeave={(e) => {
+                (e.currentTarget as HTMLElement).style.background = "transparent";
+              }}
+            >
+              <ExportIcon spinning={exportingAccountData} color={exportingAccountData ? "#0071e3" : t.textMuted} />
+            </button>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                if (clearingAccountData || disableClearAccountData) return;
+                onClearAccountData();
+              }}
+              title="清空当前账号数据"
+              style={{
+                width: 22,
+                height: 22,
+                borderRadius: 6,
+                border: "none",
+                background: "transparent",
+                cursor: (clearingAccountData || disableClearAccountData) ? "default" : "pointer",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                flexShrink: 0,
+                opacity: (clearingAccountData || disableClearAccountData) ? 0.55 : 1,
+                transition: "background 0.12s",
+              }}
+              onMouseEnter={(e) => {
+                if (clearingAccountData || disableClearAccountData) return;
+                (e.currentTarget as HTMLElement).style.background = t.btnHoverBg;
+              }}
+              onMouseLeave={(e) => {
+                (e.currentTarget as HTMLElement).style.background = "transparent";
+              }}
+            >
+              <TrashIcon color={clearingAccountData ? "#d34b4b" : t.textMuted} />
+            </button>
+          </div>
         </div>
         {conversations.length === 0 ? (
           <div style={{ padding: "10px 14px", fontSize: 12, color: t.textMuted }}>
@@ -287,6 +324,9 @@ function ConversationItem({ conversation, selected, onClick, syncing, onSync }: 
 }) {
   const t = useTheme();
   const [copied, setCopied] = useState(false);
+  const isLost = conversation.status === "lost";
+  const lostTitleColor = t.isDark ? "#f87171" : "#d92d20";
+  const lostMetaColor = t.isDark ? "rgba(248,113,113,0.84)" : "#b42318";
 
   function handleCopyConversationId() {
     void navigator.clipboard.writeText(conversation.id)
@@ -315,12 +355,12 @@ function ConversationItem({ conversation, selected, onClick, syncing, onSync }: 
         </span>
       )}
       <div style={{ flex: 1, overflow: "hidden", minWidth: 0 }}>
-        <div style={{ fontSize: 13, fontWeight: selected ? 600 : 400, color: selected ? t.selectedText : t.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginBottom: 2 }}>
+        <div style={{ fontSize: 13, fontWeight: selected ? 600 : 400, color: isLost ? lostTitleColor : (selected ? t.selectedText : t.text), overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginBottom: 2 }}>
           {conversation.title}
         </div>
-        <div style={{ fontSize: 11, color: t.textMuted, display: "flex", alignItems: "center", gap: 4 }}>
+        <div style={{ fontSize: 11, color: isLost ? lostMetaColor : t.textMuted, display: "flex", alignItems: "center", gap: 4 }}>
           <span>{formatConvTime(conversation.updatedAt)}</span>
-          <span style={{ color: t.textMuted, opacity: 0.6 }}>·</span>
+          <span style={{ color: isLost ? lostMetaColor : t.textMuted, opacity: 0.6 }}>·</span>
           <span>{conversation.messageCount} 条</span>
         </div>
       </div>
@@ -361,6 +401,18 @@ function PendingDot() {
         flexShrink: 0,
       }}
     />
+  );
+}
+
+function ExportIcon({ spinning, color }: { spinning: boolean; color: string }) {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+      style={{ animation: spinning ? "spin 0.9s linear infinite" : "none" }}>
+      <style>{`@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}`}</style>
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+      <polyline points="7 10 12 15 17 10" />
+      <line x1="12" y1="15" x2="12" y2="3" />
+    </svg>
   );
 }
 

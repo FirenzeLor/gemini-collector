@@ -214,7 +214,6 @@ def convert_to_app_format(turns: list[dict], conv_id: str, account_id: str, meta
         "title": title,
         "createdAt": first_ts,
         "updatedAt": last_ts,
-        "syncedAt": now,
         "remoteHash": remote_hash,
     }
     lines.append(meta)
@@ -306,7 +305,6 @@ def update_conversations_json(conv_json_path: Path, conv_id: str, account_id: st
         "messageCount": msg_count,
         "hasMedia": has_media,
         "updatedAt": meta.get("updatedAt", now),
-        "syncedAt": now,
         "remoteHash": meta.get("remoteHash", ""),
         "imageCount": image_count,
         "videoCount": video_count,
