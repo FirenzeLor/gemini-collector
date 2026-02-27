@@ -1,5 +1,5 @@
 import React from "react";
-import { Conversation, ConversationSummary } from "../data/mockData";
+import { Conversation, ConversationSummary } from "../data/types";
 import { useTheme } from "../theme";
 
 function formatUpdatedAt(iso: string): string {

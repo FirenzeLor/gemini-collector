@@ -1,4 +1,4 @@
-// Interfaces match DATA_STRUCTURE.md exactly.
+// Type interfaces used by frontend state and Tauri payloads.
 
 export interface Attachment {
   mediaId: string;   // filename with extension in media/ dir
@@ -25,7 +25,6 @@ export interface Conversation {
   title: string;
   createdAt: string;   // ISO 8601
   updatedAt: string;   // ISO 8601
-  syncedAt: string;    // ISO 8601
   remoteHash: string | null;
   parseWarning?: string;
   messages: ConvMessage[];
@@ -40,8 +39,8 @@ export interface ConversationSummary {
   hasFailedData?: boolean;
   imageCount?: number;
   videoCount?: number;
+  status?: string;          // normal | lost | hidden | ...
   updatedAt: string;        // ISO 8601
-  syncedAt: string | null;
   remoteHash: string | null;
 }
 
@@ -58,7 +57,3 @@ export interface Account {
   authuser?: string | null;
   listSyncPending?: boolean;
 }
-
-export const mockConversations: Conversation[] = [];
-
-export const mockConversationSummaries: ConversationSummary[] = [];

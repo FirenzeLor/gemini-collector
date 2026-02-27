@@ -12,6 +12,7 @@ Gemini 全量聊天导出工具
 
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -44,7 +45,20 @@ GEMINI_BASE = "https://gemini.google.com"
 OUTPUT_DIR = Path("gemini_export_output")
 BATCH_SIZE = 20          # MaZiqc 每页数量
 DETAIL_PAGE_SIZE = 10    # hNvQHb 每页数量
-REQUEST_DELAY = 0.5      # 请求间隔(秒)
+# 随机请求间隔(秒): 总范围 300~600ms，区间内分布更集中
+REQUEST_DELAY = 0.30
+REQUEST_JITTER_MIN = 0.00
+REQUEST_JITTER_MAX = 0.30
+REQUEST_JITTER_MODE = 0.14
+REQUEST_BACKOFF_MAX_SECONDS = 120.0
+REQUEST_BACKOFF_LIMIT_FAILURES = 10
+REQUEST_REINIT_BACKOFF_SECONDS = 4.0
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+BROWSER_ACCEPT_LANGUAGE = "zh-CN,zh;q=0.9,en;q=0.8"
 
 GOOGLE_MEDIA_COOKIE_NAMES = [
     "AEC", "__Secure-BUCKET", "SID", "__Secure-1PSID", "__Secure-3PSID",
@@ -60,6 +74,11 @@ PROTECTED_MEDIA_HOSTS = {
 }
 
 INTERNAL_PLACEHOLDER_PATH_RE = re.compile(r"(?:^|/)[a-z0-9_]+_content(?:/|$)")
+
+
+class RequestBackoffLimitReachedError(RuntimeError):
+    """请求连续失败触发最终退避兜底时抛出。"""
+    pass
 
 
 def timing_log(action: str, start_perf: float, **fields) -> None:
@@ -286,11 +305,8 @@ def discover_email_authuser_mapping_via_listaccounts(cookies):
         "ts": "641",
     }
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": BROWSER_USER_AGENT,
+        "Accept-Language": BROWSER_ACCEPT_LANGUAGE,
         "Referer": f"{GEMINI_BASE}/app",
         "Origin": GEMINI_BASE,
     }
@@ -353,6 +369,10 @@ def discover_email_authuser_mapping(cookies):
 # 主导出类
 # ============================================================================
 class GeminiExporter:
+    CONVERSATION_STATUS_NORMAL = "normal"
+    CONVERSATION_STATUS_LOST = "lost"
+    CONVERSATION_STATUS_HIDDEN = "hidden"
+
     def __init__(self, cookies: dict, user=None, account_id=None, account_email=None):
         self.cookies = cookies
         self.user_spec = str(user).strip() if user is not None else None
@@ -363,22 +383,97 @@ class GeminiExporter:
         if self.account_email_override == "":
             self.account_email_override = None
         self.authuser = None
-        self.client = httpx.Client(
-            cookies=cookies,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/131.0.0.0 Safari/537.36"
-                ),
-            },
-            follow_redirects=True,
-            timeout=60.0,
-        )
+        self._client_refresh_in_progress = False
+        self._client_reinit_failure_mark = -1
+        self._client_reinit_attempted_for_scope = False
+        self.client = self._create_http_client()
         self.at = None   # CSRF token
         self.bl = None   # 服务器版本
         self.fsid = None # session ID
         self.reqid = 100000
+        self._request_started = False
+        self._request_consecutive_failures = 0
+        self._limit_probe_consumed = False
+        self._request_state_account_dir = None
+
+    @staticmethod
+    def _collect_runtime_google_cookies(client):
+        """
+        从现有 client 的 CookieJar 提取可复用的 Google 会话 cookie。
+        """
+        if client is None:
+            return {}
+        jar = getattr(getattr(client, "cookies", None), "jar", None)
+        if jar is None:
+            return {}
+        try:
+            return _select_preferred_google_cookies(list(jar))
+        except Exception:
+            return {}
+
+    def _create_http_client(self, cookies=None):
+        cookie_payload = self.cookies if cookies is None else cookies
+        return httpx.Client(
+            cookies=cookie_payload,
+            headers={
+                "User-Agent": BROWSER_USER_AGENT,
+                "Accept-Language": BROWSER_ACCEPT_LANGUAGE,
+            },
+            follow_redirects=True,
+            timeout=60.0,
+        )
+
+    def _reinit_http_client_and_auth(self, trigger_label, verbose=True):
+        if self._client_refresh_in_progress:
+            return False
+
+        snapshot_failures = self._request_consecutive_failures
+        snapshot_started = self._request_started
+        snapshot_limit_probe_consumed = self._limit_probe_consumed
+        old_client = self.client
+        runtime_cookie_overrides = self._collect_runtime_google_cookies(old_client)
+        candidate_cookies = dict(self.cookies or {})
+        if runtime_cookie_overrides:
+            candidate_cookies.update(runtime_cookie_overrides)
+
+        new_client = self._create_http_client(cookies=candidate_cookies)
+        self.client = new_client
+
+        self._client_refresh_in_progress = True
+        try:
+            if verbose:
+                print(
+                    "  [reinit] 命中4s退避档，重建HTTP client并重新初始化认证:"
+                    f" op={trigger_label}"
+                )
+            self.init_auth()
+            refreshed_cookie_overrides = self._collect_runtime_google_cookies(new_client)
+            if refreshed_cookie_overrides:
+                self.cookies.update(refreshed_cookie_overrides)
+            if old_client is not None:
+                try:
+                    old_client.close()
+                except Exception:
+                    pass
+            if verbose:
+                print("  [reinit] 认证刷新完成，继续当前请求")
+            return True
+        except Exception as e:
+            self.client = old_client
+            try:
+                new_client.close()
+            except Exception:
+                pass
+            if verbose:
+                print(f"  [reinit] 认证刷新失败，将继续尝试当前请求: {e}")
+            return False
+        finally:
+            # reinit 不是业务请求，不应影响失败计数和重试控制状态。
+            self._request_consecutive_failures = snapshot_failures
+            self._request_started = snapshot_started
+            self._limit_probe_consumed = snapshot_limit_probe_consumed
+            self._sync_request_state_file()
+            self._client_refresh_in_progress = False
 
     def _resolve_authuser(self):
         """解析用户指定账号：支持索引(0/1/2...)或邮箱"""
@@ -404,12 +499,15 @@ class GeminiExporter:
         # 尝试通过页面内容匹配邮箱 -> authuser 索引
         for idx in range(10):
             try:
+                self._before_request("resolve_authuser_probe")
                 resp = self.client.get(f"{GEMINI_BASE}/app", params={"authuser": str(idx)})
                 if email in resp.text.lower():
                     self.authuser = str(idx)
                     print(f"  authuser: {self.authuser} (邮箱匹配)")
                     return
-            except Exception:
+            except Exception as e:
+                if isinstance(e, RequestBackoffLimitReachedError):
+                    raise
                 pass
 
         # 无法匹配索引时，直接透传邮箱给 authuser 参数
@@ -470,14 +568,141 @@ class GeminiExporter:
         self.reqid += 100000
         return str(self.reqid)
 
-    def _client_get_with_retry(self, url, params=None, attempts=6):
+    @staticmethod
+    def _request_backoff_seconds(consecutive_failures):
+        if consecutive_failures < 3:
+            return 0.0
+        if consecutive_failures < 6:
+            return float(min(4, 2 ** (consecutive_failures - 3)))
+        if consecutive_failures < 9:
+            return float(min(32, 8 * (2 ** (consecutive_failures - 6))))
+        return float(min(REQUEST_BACKOFF_MAX_SECONDS, 60 * (2 ** (consecutive_failures - 9))))
+
+    def _request_backoff_ms(self):
+        return int(round(self._request_backoff_seconds(self._request_consecutive_failures) * 1000))
+
+    def _current_request_state(self, updated_at=None):
+        now_iso = updated_at or datetime.datetime.now(datetime.UTC).isoformat()
+        return {
+            "consecutiveFailures": self._request_consecutive_failures,
+            "backoffMs": self._request_backoff_ms(),
+            "updatedAt": now_iso,
+        }
+
+    def _sync_request_state_file(self):
+        account_dir = self._request_state_account_dir
+        if account_dir is None:
+            return
+        state = self._load_sync_state(account_dir)
+        if not isinstance(state, dict):
+            state = {}
+        now_iso = datetime.datetime.now(datetime.UTC).isoformat()
+        state["version"] = int(state.get("version") or 1)
+        state["accountId"] = state.get("accountId") or account_dir.name
+        state["updatedAt"] = now_iso
+        state["requestState"] = self._current_request_state(now_iso)
+        self._write_sync_state(account_dir, state)
+
+    def _set_request_state_scope(self, account_dir):
+        self._request_state_account_dir = Path(account_dir)
+        # 新任务作用域开始时重置请求起始标记。
+        self._request_started = False
+        self._client_reinit_failure_mark = -1
+        self._client_reinit_attempted_for_scope = False
+        state = self._load_sync_state(self._request_state_account_dir)
+        if not isinstance(state, dict):
+            return
+        request_state = state.get("requestState")
+        if isinstance(request_state, dict):
+            count = request_state.get("consecutiveFailures")
+            if isinstance(count, int) and count >= 0:
+                self._request_consecutive_failures = min(count, REQUEST_BACKOFF_LIMIT_FAILURES)
+                return
+        full_sync = state.get("fullSync")
+        if isinstance(full_sync, dict):
+            count = full_sync.get("listingConsecutiveFailures")
+            if isinstance(count, int) and count >= 0:
+                self._request_consecutive_failures = min(count, REQUEST_BACKOFF_LIMIT_FAILURES)
+
+    def _before_request(self, label, verbose=True):
+        backoff_sec = self._request_backoff_seconds(self._request_consecutive_failures)
+        if (
+            not self._client_refresh_in_progress
+            and not self._client_reinit_attempted_for_scope
+            and abs(backoff_sec - REQUEST_REINIT_BACKOFF_SECONDS) < 1e-9
+            and self._request_consecutive_failures != self._client_reinit_failure_mark
+        ):
+            self._client_reinit_attempted_for_scope = True
+            self._client_reinit_failure_mark = self._request_consecutive_failures
+            self._reinit_http_client_and_auth(label, verbose=verbose)
+            backoff_sec = self._request_backoff_seconds(self._request_consecutive_failures)
+
+        if backoff_sec >= REQUEST_BACKOFF_MAX_SECONDS:
+            if not self._request_started and not self._limit_probe_consumed:
+                self._limit_probe_consumed = True
+                if verbose:
+                    print(
+                        "  [backoff] 连续失败达到上限，放行一次启动探测请求:"
+                        f" failures={self._request_consecutive_failures}, op={label}"
+                    )
+            else:
+                self._sync_request_state_file()
+                raise RequestBackoffLimitReachedError(
+                    "请求连续失败达到退避上限，触发全局兜底提前结束: "
+                    f"failures={self._request_consecutive_failures}, "
+                    f"wait={backoff_sec:.0f}s, op={label}"
+                )
+        if self._request_started:
+            delay_sec = REQUEST_DELAY + random.triangular(
+                REQUEST_JITTER_MIN,
+                REQUEST_JITTER_MAX,
+                REQUEST_JITTER_MODE,
+            )
+            if verbose:
+                print(f"  [delay] {label} 随机暂停: {delay_sec:.3f}s")
+            time.sleep(delay_sec)
+        if 0 < backoff_sec < REQUEST_BACKOFF_MAX_SECONDS:
+            self._sync_request_state_file()
+            if verbose:
+                print(
+                    "  [backoff] 连续失败退避等待:"
+                    f" failures={self._request_consecutive_failures}, wait={backoff_sec:.2f}s, op={label}"
+                )
+            time.sleep(backoff_sec)
+
+        self._request_started = True
+
+    def _mark_request_success(self):
+        if self._request_consecutive_failures == 0:
+            return
+        self._request_consecutive_failures = 0
+        self._limit_probe_consumed = False
+        self._client_reinit_failure_mark = -1
+        self._client_reinit_attempted_for_scope = False
+        self._sync_request_state_file()
+
+    def _mark_request_failure(self):
+        self._request_consecutive_failures = min(
+            self._request_consecutive_failures + 1,
+            REQUEST_BACKOFF_LIMIT_FAILURES,
+        )
+        self._sync_request_state_file()
+
+    def _client_get_with_retry(self, url, params=None, attempts=6, count_as_business_request=True):
         last_err = None
-        for i in range(attempts):
+        for _ in range(attempts):
             try:
-                return self.client.get(url, params=params)
+                self._before_request("http_get")
+                resp = self.client.get(url, params=params)
+                if count_as_business_request:
+                    self._mark_request_success()
+                return resp
             except Exception as e:
+                if isinstance(e, RequestBackoffLimitReachedError):
+                    raise
+                if count_as_business_request:
+                    self._mark_request_failure()
                 last_err = e
-                time.sleep(0.4 * (i + 1))
         if last_err:
             raise last_err
         raise RuntimeError("GET 请求失败")
@@ -498,6 +723,33 @@ class GeminiExporter:
             return datetime.datetime.fromtimestamp(int(ts), datetime.UTC).isoformat()
         except (TypeError, ValueError, OSError):
             return None
+
+    @staticmethod
+    def _coerce_epoch_seconds(value):
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            s = value.strip()
+            if s.isdigit():
+                return int(s)
+        return None
+
+    @staticmethod
+    def _diagnose_auth_page(html, final_url):
+        text = str(html or "").lower()
+        url_text = str(final_url or "").lower()
+        hints = []
+        if "accounts.google.com" in url_text or "servicelogin" in text:
+            hints.append("命中 Google 登录页")
+        if "consent.google.com" in url_text:
+            hints.append("命中 consent 页面")
+        if "unusual traffic" in text or "/sorry/" in url_text:
+            hints.append("可能触发异常流量风控")
+        if "recaptcha" in text or "g-recaptcha" in text or "captcha" in text:
+            hints.append("可能触发验证码挑战")
+        if not hints:
+            hints.append("页面结构变化或返回非 Gemini app 页面")
+        return "；".join(hints)
 
     @staticmethod
     def normalize_chat_id(chat_id):
@@ -530,7 +782,12 @@ class GeminiExporter:
         params = self._authuser_params()
         if params.get("authuser") is not None:
             print(f"  使用 authuser: {params['authuser']}")
-        resp = self._client_get_with_retry(f"{GEMINI_BASE}/app", params=params)
+        # init_auth 只做认证参数刷新，不参与业务请求成功/失败计数。
+        resp = self._client_get_with_retry(
+            f"{GEMINI_BASE}/app",
+            params=params,
+            count_as_business_request=False,
+        )
         if resp.status_code != 200:
             raise RuntimeError(f"获取 Gemini 页面失败: HTTP {resp.status_code}")
 
@@ -539,7 +796,14 @@ class GeminiExporter:
         # 提取 SNlM0e (at token)
         at_match = re.search(r'"SNlM0e":"([^"]+)"', html)
         if not at_match:
-            raise RuntimeError("无法提取 CSRF token (SNlM0e)，可能未登录")
+            title_match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.I | re.S)
+            page_title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else "-"
+            final_url = str(resp.url)
+            diagnosis = self._diagnose_auth_page(html, final_url)
+            raise RuntimeError(
+                "无法提取 CSRF token (SNlM0e); "
+                f"url={final_url}; title={page_title}; hint={diagnosis}"
+            )
         self.at = at_match.group(1)
 
         # 提取 cfb2h (bl - server version)
@@ -586,16 +850,21 @@ class GeminiExporter:
 
         url = f"{GEMINI_BASE}/_/BardChatUi/data/batchexecute"
         req_start = time.perf_counter()
-        resp = self.client.post(
-            url,
-            params=params,
-            data=data,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-                "x-goog-ext-73010989-jspb": "[0]",
-                "x-goog-ext-525001261-jspb": "[1,null,null,null,null,null,null,null,[4]]",
-            },
-        )
+        self._before_request(f"batchexecute:{rpcid}")
+        try:
+            resp = self.client.post(
+                url,
+                params=params,
+                data=data,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                    "x-goog-ext-73010989-jspb": "[0]",
+                    "x-goog-ext-525001261-jspb": "[1,null,null,null,null,null,null,null,[4]]",
+                },
+            )
+        except Exception:
+            self._mark_request_failure()
+            raise
         timing_log(
             "_batchexecute",
             req_start,
@@ -605,14 +874,17 @@ class GeminiExporter:
         )
 
         if resp.status_code != 200:
+            self._mark_request_failure()
             print(f"  [debug] 响应内容: {resp.text[:500]}")
             raise RuntimeError(f"batchexecute 失败: HTTP {resp.status_code}")
 
         results = parse_batchexecute_response(resp.text)
         for rid, data_inner in results:
             if rid == rpcid:
+                self._mark_request_success()
                 return data_inner
 
+        self._mark_request_failure()
         print(f"  [debug] 响应中未找到 {rpcid}，已解析 {len(results)} 项: "
               f"{[r[0] for r in results]}")
         print(f"  [debug] 原始响应 (前500字符): {resp.text[:500]}")
@@ -686,7 +958,6 @@ class GeminiExporter:
                 break
 
             cursor = next_token
-            time.sleep(REQUEST_DELAY)
 
         print(f"  共 {len(all_chats)} 个对话")
         return all_chats
@@ -740,7 +1011,6 @@ class GeminiExporter:
                 break
 
             cursor = next_cursor
-            time.sleep(REQUEST_DELAY)
 
         return all_turns
 
@@ -768,23 +1038,8 @@ class GeminiExporter:
             if not next_token or not isinstance(next_token, str):
                 return None
 
-            time.sleep(REQUEST_DELAY)
             payload = json.dumps([BATCH_SIZE, next_token])
             result = self._batchexecute("MaZiqc", payload, source_path="/app")
-
-    def get_chat_summary_by_id(self, chat_id):
-        """按 chat_id 查询会话列表条目（id/title/latest_update）。"""
-        target = self.normalize_chat_id(chat_id)
-        cursor = None
-        while True:
-            items, next_cursor = self.get_chats_page(cursor)
-            for item in items:
-                if item.get("id") == target:
-                    return item
-            if not next_cursor:
-                return None
-            cursor = next_cursor
-            time.sleep(REQUEST_DELAY)
 
     def is_chat_updated(self, chat_id, last_update_ts):
         """比较会话最新更新时间，返回是否有更新"""
@@ -1269,6 +1524,31 @@ class GeminiExporter:
         )
 
     @staticmethod
+    def _infer_media_type(media_hint):
+        if not isinstance(media_hint, str) or not media_hint:
+            return "file"
+        ext = Path(media_hint).suffix.lower().lstrip(".")
+        if ext in {"jpg", "jpeg", "png", "webp", "gif", "bmp", "avif", "heic", "heif", "svg"}:
+            return "image"
+        if ext in {"mp4", "mov", "webm", "mkv", "m4v", "avi", "3gp"}:
+            return "video"
+        return "file"
+
+    @staticmethod
+    def _media_log_fields(url_text, media_type=None, media_hint=None):
+        host = "-"
+        if isinstance(url_text, str) and url_text:
+            try:
+                host = (urlparse(url_text).hostname or "-").lower()
+            except Exception:
+                host = "-"
+
+        kind = media_type if media_type in {"image", "video", "file"} else None
+        if kind is None:
+            kind = GeminiExporter._infer_media_type(media_hint)
+        return {"media": kind, "domain": host}
+
+    @staticmethod
     def _append_authuser(url, authuser):
         if authuser is None:
             return url
@@ -1284,16 +1564,12 @@ class GeminiExporter:
             parsed.fragment,
         ))
 
-    def _download_one_media_no_cdp(self, url, cookie_header, referer):
+    def _download_one_media_no_cdp(self, url, cookie_header, referer, media_type=None, media_hint=None):
         base_headers = {
             "accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-            "accept-language": "en-US,en;q=0.9",
+            "accept-language": BROWSER_ACCEPT_LANGUAGE,
             "referer": referer,
-            "user-agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/144.0.0.0 Safari/537.36"
-            ),
+            "user-agent": BROWSER_USER_AGENT,
         }
 
         current_url = url
@@ -1303,8 +1579,8 @@ class GeminiExporter:
             if host in PROTECTED_MEDIA_HOSTS:
                 headers["cookie"] = cookie_header
 
-            req_start = time.perf_counter()
             try:
+                self._before_request("media_http_get", verbose=False)
                 resp = self.client.get(
                     current_url,
                     headers=headers,
@@ -1312,38 +1588,47 @@ class GeminiExporter:
                     timeout=45.0,
                 )
             except Exception as e:
-                timing_log(
-                    "_download_one_media_no_cdp",
-                    req_start,
-                    hop=hop + 1,
-                    status="exception",
-                    url=current_url,
+                if isinstance(e, RequestBackoffLimitReachedError):
+                    raise
+                self._mark_request_failure()
+                media_fields = self._media_log_fields(current_url, media_type=media_type, media_hint=media_hint)
+                print(
+                    f"  [media-fail] httpx 下载异常: {e}"
+                    f" | media={media_fields['media']} domain={media_fields['domain']}"
                 )
-                print(f"  [media-fail] httpx 下载异常: {e} | url={current_url}")
                 return None
-            timing_log(
-                "_download_one_media_no_cdp",
-                req_start,
-                hop=hop + 1,
-                status=resp.status_code,
-                url=current_url,
-            )
+            media_fields = self._media_log_fields(current_url, media_type=media_type, media_hint=media_hint)
 
             if resp.status_code in (301, 302, 303, 307, 308):
                 location = resp.headers.get("location")
                 if not location:
-                    print(f"  [media-fail] 重定向缺少 location | url={current_url}")
+                    self._mark_request_failure()
+                    print(
+                        "  [media-fail] 重定向缺少 location"
+                        f" | media={media_fields['media']} domain={media_fields['domain']}"
+                    )
                     return None
+                self._mark_request_success()
                 current_url = urljoin(current_url, location)
                 continue
 
             if resp.status_code == 200:
+                self._mark_request_success()
                 return resp.content
 
-            print(f"  [media-fail] 非200状态码={resp.status_code} | url={current_url}")
+            self._mark_request_failure()
+            print(
+                f"  [media-fail] 非200状态码={resp.status_code}"
+                f" | media={media_fields['media']} domain={media_fields['domain']}"
+            )
             return None
 
-        print(f"  [media-fail] 重定向次数超限 | url={url}")
+        self._mark_request_failure()
+        media_fields = self._media_log_fields(url, media_type=media_type, media_hint=media_hint)
+        print(
+            "  [media-fail] 重定向次数超限"
+            f" | media={media_fields['media']} domain={media_fields['domain']}"
+        )
         return None
 
     def _download_media_batch_no_cdp(self, media_list, stats):
@@ -1361,6 +1646,8 @@ class GeminiExporter:
             filepath = item["filepath"]
             url = item["url"]
             media_id = item.get("media_id") or filepath.name
+            media_type = item.get("media_type")
+            media_hint = media_id or filepath.name
 
             if filepath.exists():
                 stats["media_downloaded"] += 1
@@ -1374,9 +1661,21 @@ class GeminiExporter:
             content = None
             for candidate_url in candidates:
                 try:
-                    content = self._download_one_media_no_cdp(candidate_url, cookie_header, referer)
+                    content = self._download_one_media_no_cdp(
+                        candidate_url,
+                        cookie_header,
+                        referer,
+                        media_type=media_type,
+                        media_hint=media_hint,
+                    )
                 except Exception as e:
-                    print(f"  [media-fail] 媒体下载异常: {e} | url={candidate_url}")
+                    if isinstance(e, RequestBackoffLimitReachedError):
+                        raise
+                    media_fields = self._media_log_fields(candidate_url, media_type=media_type, media_hint=media_hint)
+                    print(
+                        f"  [media-fail] 媒体下载异常: {e}"
+                        f" | media={media_fields['media']} domain={media_fields['domain']}"
+                    )
                     content = None
                 if content:
                     break
@@ -1387,7 +1686,11 @@ class GeminiExporter:
                 stats["media_downloaded"] += 1
                 timing_log("_download_media_batch_no_cdp", item_start, media_id=media_id, status="ok")
             else:
-                print(f"  [media-fail] 媒体下载失败，已跳过: {filepath.name} | url={url}")
+                media_fields = self._media_log_fields(url, media_type=media_type, media_hint=media_hint)
+                print(
+                    f"  [media-fail] 媒体下载失败，已跳过: {filepath.name}"
+                    f" | media={media_fields['media']} domain={media_fields['domain']}"
+                )
                 stats["media_failed"] += 1
                 timing_log("_download_media_batch_no_cdp", item_start, media_id=media_id, status="failed")
                 failed_items.append({
@@ -1591,7 +1894,12 @@ class GeminiExporter:
         missing_url = [p for p in pending if not p.get("url")]
 
         retry_batch = [
-            {"url": item["url"], "filepath": Path(media_dir) / item["media_id"], "media_id": item["media_id"]}
+            {
+                "url": item["url"],
+                "filepath": Path(media_dir) / item["media_id"],
+                "media_id": item["media_id"],
+                "media_type": self._infer_media_type(item["media_id"]),
+            }
             for item in downloadable
         ]
         failed_items = self.download_media_batch(retry_batch, media_dir, stats) if retry_batch else []
@@ -1865,17 +2173,71 @@ class GeminiExporter:
             index_map[cid] = item
         return ordered_ids, index_map
 
+    @classmethod
+    def _normalize_conversation_status(cls, value, default=None):
+        fallback = default or cls.CONVERSATION_STATUS_NORMAL
+        if isinstance(value, str):
+            normalized = value.strip()
+            if normalized:
+                return normalized
+        return fallback
+
+    @classmethod
+    def _status_for_remote_summary(cls, existing=None):
+        existing = existing if isinstance(existing, dict) else {}
+        current_status = cls._normalize_conversation_status(existing.get("status"))
+        if current_status == cls.CONVERSATION_STATUS_HIDDEN:
+            return cls.CONVERSATION_STATUS_HIDDEN
+        return cls.CONVERSATION_STATUS_NORMAL
+
+    @classmethod
+    def _build_lost_summary(cls, bare_id, existing=None):
+        existing = existing if isinstance(existing, dict) else {}
+        last_message = existing.get("lastMessage")
+        if not isinstance(last_message, str):
+            last_message = ""
+
+        message_count = existing.get("messageCount")
+        if not isinstance(message_count, int) or message_count < 0:
+            message_count = 0
+
+        image_count = existing.get("imageCount")
+        if not isinstance(image_count, int) or image_count < 0:
+            image_count = 0
+        video_count = existing.get("videoCount")
+        if not isinstance(video_count, int) or video_count < 0:
+            video_count = 0
+
+        return {
+            "id": bare_id,
+            "title": existing.get("title") or bare_id,
+            "lastMessage": last_message,
+            "messageCount": message_count,
+            "hasMedia": bool(existing.get("hasMedia", False)),
+            "hasFailedData": bool(existing.get("hasFailedData", False)),
+            "imageCount": image_count,
+            "videoCount": video_count,
+            "updatedAt": existing.get("updatedAt"),
+            "remoteHash": existing.get("remoteHash"),
+            "status": cls.CONVERSATION_STATUS_LOST,
+        }
+
     @staticmethod
     def _build_summary_from_chat_listing(chat, existing=None):
         """将列表页 chat 条目转换为 conversations.json 的 summary 条目。"""
         existing = existing if isinstance(existing, dict) else {}
+        status = GeminiExporter._status_for_remote_summary(existing)
         bare_id = str(chat.get("id", "")).replace("c_", "")
         title = chat.get("title")
         if not isinstance(title, str):
             title = existing.get("title", "")
-        updated_at = chat.get("latest_update_iso") or existing.get("updatedAt")
-        remote_ts = chat.get("latest_update_ts")
-        remote_hash = str(remote_ts) if remote_ts is not None else existing.get("remoteHash")
+        remote_ts = GeminiExporter._coerce_epoch_seconds(chat.get("latest_update_ts"))
+        if remote_ts is not None:
+            updated_at = GeminiExporter._to_iso_utc(remote_ts)
+            remote_hash = str(remote_ts)
+        else:
+            updated_at = existing.get("updatedAt")
+            remote_hash = existing.get("remoteHash")
 
         msg_count = existing.get("messageCount", 0)
         if not isinstance(msg_count, int):
@@ -1897,8 +2259,8 @@ class GeminiExporter:
             "imageCount": image_count,
             "videoCount": video_count,
             "updatedAt": updated_at,
-            "syncedAt": existing.get("syncedAt"),
             "remoteHash": remote_hash,
+            "status": status,
         }
 
     @staticmethod
@@ -1930,16 +2292,21 @@ class GeminiExporter:
         bare_id = conv_id.replace("c_", "")
 
         ts_list = [t["timestamp"] for t in parsed_turns if isinstance(t.get("timestamp"), int)]
-        created_at = GeminiExporter._to_iso_utc(min(ts_list)) if ts_list else now_iso
-        updated_at = GeminiExporter._to_iso_utc(max(ts_list)) if ts_list else now_iso
-        if not updated_at:
-            updated_at = chat_info.get("latest_update_iso") or now_iso
-        if not created_at:
-            created_at = updated_at
+        created_at = GeminiExporter._to_iso_utc(min(ts_list)) if ts_list else None
 
-        remote_hash = (
-            str(chat_info["latest_update_ts"]) if chat_info.get("latest_update_ts") else None
-        )
+        remote_ts = GeminiExporter._coerce_epoch_seconds(chat_info.get("latest_update_ts"))
+        if remote_ts is None and ts_list:
+            remote_ts = max(ts_list)
+
+        updated_at = GeminiExporter._to_iso_utc(remote_ts)
+        if not updated_at:
+            chat_iso = chat_info.get("latest_update_iso")
+            if isinstance(chat_iso, str) and chat_iso.strip():
+                updated_at = chat_iso.strip()
+        if not created_at:
+            created_at = updated_at or now_iso
+
+        remote_hash = str(remote_ts) if remote_ts is not None else None
 
         rows = [{
             "type": "meta",
@@ -1948,7 +2315,6 @@ class GeminiExporter:
             "title": title,
             "createdAt": created_at,
             "updatedAt": updated_at,
-            "syncedAt": now_iso,
             "remoteHash": remote_hash,
         }]
 
@@ -2133,7 +2499,12 @@ class GeminiExporter:
                         f["preview_media_id"] = self._video_preview_name(media_id)
                     target = global_media_dir / fname
                     if not target.exists() and not any(item["filepath"] == target for item in batch_list):
-                        batch_list.append({"url": url, "filepath": target, "media_id": media_id})
+                        batch_list.append({
+                            "url": url,
+                            "filepath": target,
+                            "media_id": media_id,
+                            "media_type": f.get("type"),
+                        })
 
         return batch_list
 
@@ -2164,7 +2535,6 @@ class GeminiExporter:
             if not next_token:
                 break
 
-            time.sleep(REQUEST_DELAY)
             payload = json.dumps([conv_id, DETAIL_PAGE_SIZE, next_token, 1, [1], [4], None, 1])
             result = self._batchexecute("hNvQHb", payload, source_path=source_path)
 
@@ -2176,11 +2546,10 @@ class GeminiExporter:
     def export_list_only(self, output_dir=None):
         """
         仅同步会话列表（分页），不拉取对话详情。
-
-        - 复用 MaZiqc 列表接口
-        - 每页完成后写入 conversations.json + sync_state.json
-        - 支持从 sync_state.fullSync.listingCursor 断点续传
-        - 调用前需先完成 init_auth（由上层统一初始化）
+        规则：
+        - 按 cursor 连续分页拉取，异常时记录当前 cursor 并标记失败
+        - 正常拉完后 cursor 清空
+        - 本地索引始终做并集更新，不强制覆盖已有落盘数据
         """
         base_dir = Path(output_dir) if output_dir else OUTPUT_DIR
         base_dir.mkdir(parents=True, exist_ok=True)
@@ -2194,6 +2563,7 @@ class GeminiExporter:
         account_dir.mkdir(parents=True, exist_ok=True)
         conv_dir.mkdir(parents=True, exist_ok=True)
         media_dir.mkdir(parents=True, exist_ok=True)
+        self._set_request_state_scope(account_dir)
 
         print(f"[*] 账号: {account_info['email'] or account_id}")
         print(f"[*] 仅同步列表到: {account_dir.absolute()}")
@@ -2202,33 +2572,98 @@ class GeminiExporter:
         sync_state = self._load_sync_state(account_dir)
         full_sync = sync_state.get("fullSync") if isinstance(sync_state, dict) else None
 
-        resume_cursor = None
+        def _normalize_id_list(raw):
+            if not isinstance(raw, list):
+                return []
+            out = []
+            seen = set()
+            for cid in raw:
+                if not isinstance(cid, str):
+                    continue
+                normalized = cid.strip()
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                out.append(normalized)
+            return out
+
         started_at = datetime.datetime.now(datetime.UTC).isoformat()
-        if isinstance(full_sync, dict):
-            phase = full_sync.get("phase")
-            if phase and phase != "done":
-                cursor_candidate = full_sync.get("listingCursor")
-                if isinstance(cursor_candidate, str) and cursor_candidate:
-                    resume_cursor = cursor_candidate
-                started_at = full_sync.get("startedAt") or started_at
+        baseline_existing_ids = _normalize_id_list(existing_order)
+        fetched_order = []
+        resume_cursor = None
+
+        if isinstance(full_sync, dict) and full_sync.get("phase") == "listing":
+            started_at = full_sync.get("startedAt") or started_at
+            cursor_candidate = full_sync.get("listingCursor")
+            if isinstance(cursor_candidate, str) and cursor_candidate:
+                resume_cursor = cursor_candidate
+            fetched_order = _normalize_id_list(full_sync.get("listingFetchedIds"))
+            baseline_candidate = _normalize_id_list(full_sync.get("baselineIds"))
+            if baseline_candidate:
+                baseline_existing_ids = baseline_candidate
+
+        conv_index = dict(existing_index)
+        fetched_seen = set()
+        for cid in fetched_order:
+            fetched_seen.add(cid)
 
         if resume_cursor:
-            print("[*] 检测到未完成列表同步，继续断点拉取...")
-            ordered_ids = list(existing_order)
-            conv_index = dict(existing_index)
+            print("[*] 检测到上次列表同步中断，继续从 cursor 拉取...")
         else:
-            print("[*] 从第一页开始全量刷新列表...")
-            ordered_ids = []
-            conv_index = {}
+            if self._request_consecutive_failures > 0:
+                print("[*] 检测到列表请求连续失败，按失败计数从第一页重试...")
+            else:
+                print("[*] 从第一页开始拉取列表...")
+            fetched_order = []
+            fetched_seen = set()
 
-        ordered_set = set(ordered_ids)
+        def _build_partial_summaries():
+            summaries = []
+            seen = set()
+            for cid in fetched_order:
+                summary = conv_index.get(cid) or existing_index.get(cid)
+                if not isinstance(summary, dict) or cid in seen:
+                    continue
+                summaries.append(summary)
+                seen.add(cid)
+            for cid in baseline_existing_ids:
+                if cid in seen:
+                    continue
+                summary = existing_index.get(cid)
+                if not isinstance(summary, dict):
+                    continue
+                summaries.append(summary)
+                seen.add(cid)
+            return summaries
 
-        def persist_state(phase, cursor, error=None):
+        def _persist_state(phase, cursor, error=None):
             now_iso = datetime.datetime.now(datetime.UTC).isoformat()
-            summaries = [conv_index[cid] for cid in ordered_ids if cid in conv_index]
-            listing_total = len(summaries) if phase == "done" else None
-            listing_fetched = len(summaries)
-            completed_at = now_iso if phase == "done" else None
+            remote_count = len(fetched_order)
+            lost_count = 0
+            failure_count = self._request_consecutive_failures
+            backoff_ms = self._request_backoff_ms()
+
+            if phase == "done":
+                summaries = []
+                remote_set = set()
+                for cid in fetched_order:
+                    summary = conv_index.get(cid) or existing_index.get(cid)
+                    if not isinstance(summary, dict):
+                        continue
+                    summaries.append(summary)
+                    remote_set.add(cid)
+                for cid in baseline_existing_ids:
+                    if cid in remote_set:
+                        continue
+                    summaries.append(self._build_lost_summary(cid, existing_index.get(cid)))
+                    lost_count += 1
+                listing_cursor = None
+                listing_fetched_ids = []
+            else:
+                summaries = _build_partial_summaries()
+                listing_cursor = cursor
+                listing_fetched_ids = list(fetched_order)
+
             current_state = self._load_sync_state(account_dir)
             pending_conversations = (
                 current_state.get("pendingConversations")
@@ -2242,72 +2677,79 @@ class GeminiExporter:
                 "version": 1,
                 "accountId": account_id,
                 "updatedAt": now_iso,
+                "requestState": self._current_request_state(now_iso),
                 "concurrency": 1,
                 "fullSync": {
                     "phase": phase,
                     "startedAt": started_at,
-                    "listingCursor": cursor,
-                    "listingTotal": listing_total,
-                    "listingFetched": listing_fetched,
+                    "listingCursor": listing_cursor,
+                    "listingTotal": remote_count if phase == "done" else None,
+                    "listingFetched": remote_count,
+                    "listingFetchedIds": listing_fetched_ids,
+                    "listingConsecutiveFailures": failure_count,
+                    "listingBackoffMs": backoff_ms,
                     "conversationsToFetch": [],
                     "conversationsFetched": 0,
                     "conversationsFailed": [],
-                    "completedAt": completed_at,
+                    "completedAt": now_iso if phase == "done" else None,
                     "errorMessage": error,
+                    "baselineIds": baseline_existing_ids,
+                    "lostCount": lost_count if phase == "done" else None,
                 },
                 "pendingConversations": pending_conversations,
             })
 
-            # 列表同步阶段先按已落盘的列表数量展示会话数；详情抓取后可再由全量/增量流程覆盖。
             account_info["conversationCount"] = len(summaries)
-            account_info["remoteConversationCount"] = len(summaries) if phase == "done" else account_info.get("remoteConversationCount")
-            account_info["lastSyncAt"] = now_iso
             if phase == "done":
+                account_info["remoteConversationCount"] = remote_count
                 account_info["lastSyncResult"] = "success"
             elif error:
                 account_info["lastSyncResult"] = "partial" if summaries else "failed"
             else:
                 account_info["lastSyncResult"] = "partial" if summaries else account_info.get("lastSyncResult")
-
+            account_info["lastSyncAt"] = now_iso
             self._write_accounts_json(base_dir, account_info)
             self._write_account_meta(account_dir, account_info)
+            return {"remoteCount": remote_count, "lostCount": lost_count}
 
         cursor = resume_cursor
         page = 0
-
-        try:
-            while True:
-                page += 1
+        while True:
+            page += 1
+            try:
                 chats, next_cursor = self.get_chats_page(cursor)
+            except Exception as e:
+                _persist_state("listing", cursor, str(e))
+                raise
 
-                if not chats and not next_cursor:
-                    persist_state("done", None, None)
-                    print("[*] 列表同步完成（无更多分页）")
-                    break
+            if not chats and not next_cursor:
+                result = _persist_state("done", None, None)
+                if result["lostCount"] > 0:
+                    print(f"  [lost] 标记已丢失会话: {result['lostCount']} 个")
+                print("[*] 列表同步完成（无更多分页）")
+                break
 
-                for chat in chats:
-                    bare_id = str(chat.get("id", "")).replace("c_", "")
-                    if not bare_id:
-                        continue
-                    existing = conv_index.get(bare_id) or existing_index.get(bare_id)
-                    conv_index[bare_id] = self._build_summary_from_chat_listing(chat, existing)
-                    if bare_id not in ordered_set:
-                        ordered_set.add(bare_id)
-                        ordered_ids.append(bare_id)
+            for chat in chats:
+                bare_id = str(chat.get("id", "")).replace("c_", "")
+                if not bare_id:
+                    continue
+                existing = conv_index.get(bare_id) or existing_index.get(bare_id)
+                conv_index[bare_id] = self._build_summary_from_chat_listing(chat, existing)
+                if bare_id not in fetched_seen:
+                    fetched_seen.add(bare_id)
+                    fetched_order.append(bare_id)
 
-                phase = "done" if not next_cursor else "listing"
-                persist_state(phase, next_cursor, None)
-                print(f"  第 {page} 页: {len(chats)} 个对话 (累计 {len(ordered_ids)})")
+            phase = "done" if not next_cursor else "listing"
+            result = _persist_state(phase, next_cursor, None)
+            print(f"  第 {page} 页: {len(chats)} 个对话 (累计 {result['remoteCount']})")
 
-                if not next_cursor:
-                    print("[*] 列表同步完成")
-                    break
+            if not next_cursor:
+                if result["lostCount"] > 0:
+                    print(f"  [lost] 标记已丢失会话: {result['lostCount']} 个")
+                print("[*] 列表同步完成")
+                break
 
-                cursor = next_cursor
-                time.sleep(REQUEST_DELAY)
-        except Exception as e:
-            persist_state("listing", cursor, str(e))
-            raise
+            cursor = next_cursor
 
     def sync_single_conversation(self, conversation_id, output_dir=None):
         """
@@ -2327,6 +2769,7 @@ class GeminiExporter:
         account_dir.mkdir(parents=True, exist_ok=True)
         conv_dir.mkdir(parents=True, exist_ok=True)
         media_dir.mkdir(parents=True, exist_ok=True)
+        self._set_request_state_scope(account_dir)
 
         conv_id = self.normalize_chat_id(conversation_id)
         bare_id = conv_id.replace("c_", "")
@@ -2359,13 +2802,20 @@ class GeminiExporter:
 
         _, existing_index = self._load_conversations_index(account_dir)
         existing_summary = existing_index.get(bare_id, {}) if isinstance(existing_index, dict) else {}
-        chat_info = self.get_chat_summary_by_id(conv_id) or {
+        existing_status = self._normalize_conversation_status(
+            existing_summary.get("status"),
+            self.CONVERSATION_STATUS_NORMAL,
+        )
+
+        latest_update_ts = self._coerce_epoch_seconds(existing_summary.get("remoteHash"))
+
+        chat_info = {
             "id": conv_id,
             "title": existing_summary.get("title", ""),
-            "latest_update_ts": None,
+            "latest_update_ts": latest_update_ts,
             "latest_update_iso": existing_summary.get("updatedAt"),
         }
-        title = chat_info.get("title") or existing_summary.get("title") or bare_id
+        title = chat_info.get("title") or bare_id
         chat_info["title"] = title
 
         def _safe_int(value, default=0):
@@ -2445,6 +2895,7 @@ class GeminiExporter:
                 })
 
             state["updatedAt"] = now_iso_local
+            state["requestState"] = self._current_request_state(now_iso_local)
             state["pendingConversations"] = updated_pending
             self._write_sync_state(account_dir, state)
 
@@ -2490,6 +2941,8 @@ class GeminiExporter:
             now_iso_local = datetime.datetime.now(datetime.UTC).isoformat()
             incremental_base = base_message_count if detail_mode == "incremental" and local_jsonl_exists else 0
             progress_count = max(0, incremental_base + parsed_turn_count * 2)
+            progress_remote_ts = self._coerce_epoch_seconds(chat_info.get("latest_update_ts"))
+            progress_remote_iso = self._to_iso_utc(progress_remote_ts) if progress_remote_ts is not None else None
 
             progress_summary = dict(existing_summary) if isinstance(existing_summary, dict) else {}
             if not progress_summary:
@@ -2502,9 +2955,9 @@ class GeminiExporter:
                     "hasFailedData": False,
                     "imageCount": 0,
                     "videoCount": 0,
-                    "updatedAt": chat_info.get("latest_update_iso"),
-                    "syncedAt": None,
-                    "remoteHash": None,
+                    "updatedAt": progress_remote_iso or chat_info.get("latest_update_iso"),
+                    "remoteHash": str(progress_remote_ts) if progress_remote_ts is not None else None,
+                    "status": existing_status,
                 }
             progress_summary["id"] = bare_id
             progress_summary["title"] = progress_summary.get("title") or title
@@ -2516,11 +2969,15 @@ class GeminiExporter:
             if progress_summary["videoCount"] < 0:
                 progress_summary["videoCount"] = 0
             progress_summary["hasFailedData"] = bool(progress_summary.get("hasFailedData", False))
-            progress_summary["syncedAt"] = now_iso_local
-            if not progress_summary.get("updatedAt") and chat_info.get("latest_update_iso"):
+            if progress_remote_ts is not None:
+                progress_summary["updatedAt"] = progress_remote_iso
+                progress_summary["remoteHash"] = str(progress_remote_ts)
+            elif not progress_summary.get("updatedAt") and chat_info.get("latest_update_iso"):
                 progress_summary["updatedAt"] = chat_info.get("latest_update_iso")
-            if not progress_summary.get("remoteHash") and chat_info.get("latest_update_ts") is not None:
-                progress_summary["remoteHash"] = str(chat_info.get("latest_update_ts"))
+            progress_summary["status"] = self._normalize_conversation_status(
+                progress_summary.get("status"),
+                existing_status,
+            )
 
             progress_index[bare_id] = progress_summary
             progress_summaries = list(progress_index.values())
@@ -2567,7 +3024,6 @@ class GeminiExporter:
 
                 if hit_existing or not next_cursor:
                     break
-                time.sleep(REQUEST_DELAY)
         except Exception as e:
             try:
                 tmp_turns_file.write_text(
@@ -2689,11 +3145,12 @@ class GeminiExporter:
                     "imageCount": image_count,
                     "videoCount": video_count,
                     "updatedAt": meta_row.get("updatedAt"),
-                    "syncedAt": meta_row.get("syncedAt"),
                     "remoteHash": meta_row.get("remoteHash"),
+                    "status": existing_status,
                 }
             else:
-                now_iso = datetime.datetime.now(datetime.UTC).isoformat()
+                remote_ts = self._coerce_epoch_seconds(chat_info.get("latest_update_ts"))
+                remote_iso = self._to_iso_utc(remote_ts) if remote_ts is not None else None
                 summary = dict(existing_summary) if isinstance(existing_summary, dict) else {}
                 if not summary:
                     summary = {
@@ -2705,9 +3162,9 @@ class GeminiExporter:
                         "hasFailedData": False,
                         "imageCount": 0,
                         "videoCount": 0,
-                        "updatedAt": chat_info.get("latest_update_iso"),
-                        "syncedAt": now_iso,
-                        "remoteHash": None,
+                        "updatedAt": remote_iso or chat_info.get("latest_update_iso"),
+                        "remoteHash": str(remote_ts) if remote_ts is not None else None,
+                        "status": existing_status,
                     }
                 summary["id"] = bare_id
                 summary["title"] = summary.get("title") or title
@@ -2719,11 +3176,11 @@ class GeminiExporter:
                 if not isinstance(video_count, int) or video_count < 0:
                     video_count = 0
                 summary["videoCount"] = video_count
-                if chat_info.get("latest_update_iso") and not summary.get("updatedAt"):
+                if remote_ts is not None:
+                    summary["updatedAt"] = remote_iso
+                    summary["remoteHash"] = str(remote_ts)
+                elif chat_info.get("latest_update_iso") and not summary.get("updatedAt"):
                     summary["updatedAt"] = chat_info.get("latest_update_iso")
-                if chat_info.get("latest_update_ts") is not None:
-                    summary["remoteHash"] = str(chat_info.get("latest_update_ts"))
-                summary["syncedAt"] = now_iso
                 summary["hasFailedData"] = bool(summary.get("hasFailedData", False))
         else:
             print(f"  轮次: {len(raw_turns)}")
@@ -2786,10 +3243,14 @@ class GeminiExporter:
                 "imageCount": image_count,
                 "videoCount": video_count,
                 "updatedAt": meta_row.get("updatedAt") or chat_info.get("latest_update_iso"),
-                "syncedAt": meta_row.get("syncedAt"),
                 "remoteHash": meta_row.get("remoteHash"),
+                "status": existing_status,
             }
 
+        summary["status"] = self._normalize_conversation_status(
+            summary.get("status"),
+            existing_status,
+        )
         merged[bare_id] = summary
         summaries = list(merged.values())
         summaries.sort(key=lambda s: _updated_sort_num(s.get("updatedAt")), reverse=True)
@@ -2858,6 +3319,8 @@ class GeminiExporter:
         account_dir.mkdir(parents=True, exist_ok=True)
         conv_dir.mkdir(parents=True, exist_ok=True)
         media_dir.mkdir(parents=True, exist_ok=True)
+        self._set_request_state_scope(account_dir)
+        existing_order, existing_index = self._load_conversations_index(account_dir)
 
         print(f"[*] 账号: {account_info['email'] or account_id}")
         print(f"[*] 输出目录: {account_dir.absolute()}")
@@ -2904,6 +3367,8 @@ class GeminiExporter:
             conv_id = chat["id"]
             bare_id = conv_id.replace("c_", "")
             title = chat.get("title", "")
+            existing_summary = existing_index.get(bare_id)
+            remote_status = self._status_for_remote_summary(existing_summary)
             print(f"\n[{idx + 1}/{total}] {title} ({conv_id})")
 
             try:
@@ -2977,8 +3442,8 @@ class GeminiExporter:
                     "imageCount": image_count,
                     "videoCount": video_count,
                     "updatedAt": meta_row.get("updatedAt"),
-                    "syncedAt": meta_row.get("syncedAt"),
                     "remoteHash": meta_row.get("remoteHash"),
+                    "status": remote_status,
                 })
                 stats["success"] += 1
 
@@ -2987,6 +3452,7 @@ class GeminiExporter:
                 import traceback; traceback.print_exc()
                 stats["failed"] += 1
                 failed_ids.append(bare_id)
+                chat_remote_ts = self._coerce_epoch_seconds(chat.get("latest_update_ts"))
                 conv_summaries.append({
                     "id": bare_id,
                     "title": title,
@@ -2996,12 +3462,17 @@ class GeminiExporter:
                     "hasFailedData": False,
                     "imageCount": 0,
                     "videoCount": 0,
-                    "updatedAt": chat.get("latest_update_iso"),
-                    "syncedAt": None,
-                    "remoteHash": None,
+                    "updatedAt": self._to_iso_utc(chat_remote_ts) or chat.get("latest_update_iso"),
+                    "remoteHash": str(chat_remote_ts) if chat_remote_ts is not None else None,
+                    "status": remote_status,
                 })
 
-            time.sleep(REQUEST_DELAY)
+        remote_ids = {row.get("id") for row in conv_summaries if isinstance(row, dict)}
+        lost_ids = [cid for cid in existing_order if cid not in remote_ids]
+        for cid in lost_ids:
+            conv_summaries.append(self._build_lost_summary(cid, existing_index.get(cid)))
+        if lost_ids:
+            print(f"  [lost] 标记已丢失会话: {len(lost_ids)} 个")
 
         # 5. 写入账号结构文件
         account_info["conversationCount"] = stats["success"]
@@ -3020,6 +3491,7 @@ class GeminiExporter:
             "version": 1,
             "accountId": account_id,
             "updatedAt": now_iso,
+            "requestState": self._current_request_state(now_iso),
             "concurrency": 3,
             "fullSync": {
                 "phase": "done",
@@ -3070,15 +3542,9 @@ class GeminiExporter:
         account_dir.mkdir(parents=True, exist_ok=True)
         conv_dir.mkdir(parents=True, exist_ok=True)
         media_dir.mkdir(parents=True, exist_ok=True)
+        self._set_request_state_scope(account_dir)
 
         print(f"[*] 账号: {account_info['email'] or account_id}")
-
-        chats = self.get_all_chats()
-        if not chats:
-            print("[!] 未找到任何对话")
-            return
-
-        account_info["remoteConversationCount"] = len(chats)
 
         global_seen_urls = self._load_media_manifest_new(account_dir)
         global_used_names = set(global_seen_urls.values())
@@ -3097,35 +3563,104 @@ class GeminiExporter:
         stop_chat = None
 
         # 读取现有 conversations.json 构建索引
-        conv_index = {}
-        conv_index_file = account_dir / "conversations.json"
-        if conv_index_file.exists():
-            try:
-                data = json.loads(conv_index_file.read_text(encoding="utf-8"))
-                for item in data.get("items", []):
-                    conv_index[item["id"]] = item
-            except Exception:
-                pass
+        existing_order, existing_index = self._load_conversations_index(account_dir)
+        conv_index = dict(existing_index)
 
-        for chat in chats:
-            stats["checked"] += 1
+        def _iso_to_epoch_seconds(iso_text):
+            if not isinstance(iso_text, str):
+                return None
+            candidate = iso_text.strip()
+            if not candidate:
+                return None
+            if candidate.endswith("Z"):
+                candidate = f"{candidate[:-1]}+00:00"
+            try:
+                return int(datetime.datetime.fromisoformat(candidate).timestamp())
+            except Exception:
+                return None
+
+        def _summary_to_epoch_seconds(summary):
+            if not isinstance(summary, dict):
+                return None
+            remote_hash_ts = self._coerce_epoch_seconds(summary.get("remoteHash"))
+            if remote_hash_ts is not None:
+                return remote_hash_ts
+            return _iso_to_epoch_seconds(summary.get("updatedAt"))
+
+        chats_to_update = []
+        scanned_order = []
+        scanned_seen = set()
+        listing_cursor = None
+        listing_exhausted = False
+
+        while True:
+            items, next_cursor = self.get_chats_page(listing_cursor)
+            if not items and not next_cursor:
+                listing_exhausted = True
+                break
+
+            for chat in items:
+                conv_id = chat.get("id")
+                if not isinstance(conv_id, str) or not conv_id:
+                    continue
+                bare_id = conv_id.replace("c_", "")
+                stats["checked"] += 1
+
+                if bare_id not in scanned_seen:
+                    scanned_seen.add(bare_id)
+                    scanned_order.append(bare_id)
+
+                conv_index[bare_id] = self._build_summary_from_chat_listing(
+                    chat,
+                    conv_index.get(bare_id),
+                )
+
+                local_summary = existing_index.get(bare_id)
+                local_updated_ts = _summary_to_epoch_seconds(local_summary)
+                remote_latest_ts = chat.get("latest_update_ts")
+
+                # 命中首个未更新会话，停止列表继续下探：
+                # 当前会话及其后续更旧会话均视为未更新。
+                if (
+                    isinstance(remote_latest_ts, int)
+                    and local_updated_ts is not None
+                    and int(remote_latest_ts) == int(local_updated_ts)
+                ):
+                    stop_chat = conv_id
+                    print(f"[*] 命中未更新会话，停止列表扫描: {conv_id}")
+                    break
+
+                needs_detail_sync = True
+                if (
+                    isinstance(remote_latest_ts, int)
+                    and local_updated_ts is not None
+                    and int(remote_latest_ts) <= int(local_updated_ts)
+                ):
+                    needs_detail_sync = False
+
+                if needs_detail_sync:
+                    chats_to_update.append(chat)
+                else:
+                    print(f"  [skip] 无远端更新，跳过详情拉取: {conv_id}")
+
+            if stop_chat:
+                break
+
+            if not next_cursor:
+                listing_exhausted = True
+                break
+            listing_cursor = next_cursor
+
+        if listing_exhausted:
+            account_info["remoteConversationCount"] = len(scanned_seen)
+        elif not isinstance(account_info.get("remoteConversationCount"), int):
+            account_info["remoteConversationCount"] = len(existing_order)
+
+        for chat in chats_to_update:
             conv_id = chat["id"]
             bare_id = conv_id.replace("c_", "")
             title = chat.get("title", "")
             jsonl_file = conv_dir / f"{bare_id}.jsonl"
-
-            local_hash = self._remote_hash_from_jsonl(jsonl_file)
-            remote_latest_ts = chat.get("latest_update_ts")
-
-            # 命中首个未更新会话，停止继续下探
-            if local_hash is not None and remote_latest_ts is not None:
-                try:
-                    if int(remote_latest_ts) <= int(local_hash):
-                        stop_chat = conv_id
-                        print(f"[*] 命中未更新会话，停止: {conv_id}")
-                        break
-                except (TypeError, ValueError):
-                    pass
 
             print(f"\n[*] 增量检查: {title} ({conv_id})")
             existing_ids = self._build_existing_turn_id_set_new(jsonl_file)
@@ -3134,7 +3669,6 @@ class GeminiExporter:
 
             if not raw_new_turns:
                 print("  无新增 turn")
-                time.sleep(REQUEST_DELAY)
                 continue
             if removed_turns > 0:
                 print(f"  [dedupe] 增量抓取结果去重: {removed_turns} 个重复 turn")
@@ -3223,44 +3757,51 @@ class GeminiExporter:
                 "imageCount": image_count,
                 "videoCount": video_count,
                 "updatedAt": meta_row.get("updatedAt"),
-                "syncedAt": meta_row.get("syncedAt"),
                 "remoteHash": meta_row.get("remoteHash"),
+                "status": self._status_for_remote_summary(conv_index.get(bare_id)),
             }
 
             print(f"  新增 turn: {len(parsed_new_turns)}")
             stats["updated"] += 1
-            time.sleep(REQUEST_DELAY)
 
-        # 为 chat_list 中出现但本地无记录的对话补充占位 summary
-        for chat in chats:
-            bare_id = chat["id"].replace("c_", "")
-            if bare_id not in conv_index:
-                conv_index[bare_id] = {
-                    "id": bare_id,
-                    "title": chat.get("title", ""),
-                    "lastMessage": "",
-                    "messageCount": 0,
-                    "hasMedia": False,
-                    "hasFailedData": False,
-                    "imageCount": 0,
-                    "videoCount": 0,
-                    "updatedAt": chat.get("latest_update_iso"),
-                    "syncedAt": None,
-                    "remoteHash": None,
-                }
-
-        # 按 chats 原顺序排列 summaries
+        # 构建会话摘要输出顺序：
+        # 1) 已扫描到的远端顺序（最新 -> 较旧）
+        # 2) 若提前停止，未扫描的本地会话保持原顺序追加
+        # 3) 若完整扫描，则可安全标记丢失会话
         summaries = []
         seen_ids = set()
-        for chat in chats:
-            bare_id = chat["id"].replace("c_", "")
-            if bare_id not in seen_ids:
-                seen_ids.add(bare_id)
-                if bare_id in conv_index:
-                    summaries.append(conv_index[bare_id])
+        for bare_id in scanned_order:
+            if bare_id in seen_ids:
+                continue
+            seen_ids.add(bare_id)
+            summary = conv_index.get(bare_id)
+            if isinstance(summary, dict):
+                summaries.append(summary)
+
+        if listing_exhausted:
+            lost_ids = [cid for cid in existing_order if cid not in seen_ids]
+            for cid in lost_ids:
+                summaries.append(self._build_lost_summary(cid, existing_index.get(cid)))
+                seen_ids.add(cid)
+            if lost_ids:
+                print(f"  [lost] 标记已丢失会话: {len(lost_ids)} 个")
+        else:
+            for cid in existing_order:
+                if cid in seen_ids:
+                    continue
+                summary = conv_index.get(cid)
+                if isinstance(summary, dict):
+                    summaries.append(summary)
+                    seen_ids.add(cid)
+
+        for cid, summary in conv_index.items():
+            if cid in seen_ids or not isinstance(summary, dict):
+                continue
+            summaries.append(summary)
+            seen_ids.add(cid)
 
         # 写入账号结构文件
-        account_info["conversationCount"] = len([s for s in summaries if s.get("syncedAt")])
+        account_info["conversationCount"] = len(summaries)
         account_info["lastSyncAt"] = now_iso
         account_info["lastSyncResult"] = "success"
         self._write_accounts_json(base_dir, account_info)
@@ -3270,6 +3811,7 @@ class GeminiExporter:
             "version": 1,
             "accountId": account_id,
             "updatedAt": now_iso,
+            "requestState": self._current_request_state(now_iso),
             "concurrency": 3,
             "fullSync": None,
             "pendingConversations": [],

@@ -48,6 +48,7 @@ class GeminiWorker:
         self._exporters: Dict[str, Any] = {}
         self._exporter_cls: Optional[Any] = None
         self._cookies_loader: Optional[Callable[[], Dict[str, str]]] = None
+        self._backoff_limit_error_cls: Optional[type[BaseException]] = None
 
         self._worker_thread = threading.Thread(target=self._job_loop, daemon=True)
         self._worker_thread.start()
@@ -101,15 +102,37 @@ class GeminiWorker:
             "csrf token",
             "snlm0e",
             "未登录",
-            "auth",
-            "cookies",
+            "servicelogin",
+            "accounts.google.com",
+            "consent 页面",
+            "consent page",
+            "hint=命中 google 登录页",
+            "hint=命中 consent 页面",
+            "获取 gemini 页面失败: http 403",
+            "cookies 读取失败",
+            "cookie",
             "http 401",
-            "http 403",
-            "forbidden",
         ]
         return any(k in text for k in keywords)
 
+    def _is_backoff_limit_error(self, exc: BaseException) -> bool:
+        cls = self._backoff_limit_error_cls
+        if cls is not None and isinstance(exc, cls):
+            return True
+        text = str(exc).lower()
+        return (
+            "请求连续失败达到退避上限" in text
+            or "触发全局兜底提前结束" in text
+            or "request backoff limit" in text
+        )
+
     def _to_error(self, exc: BaseException) -> Dict[str, Any]:
+        if self._is_backoff_limit_error(exc):
+            return {
+                "code": "REQUEST_BACKOFF_LIMIT",
+                "message": str(exc) or exc.__class__.__name__,
+                "retryable": False,
+            }
         is_auth = self._is_auth_error(exc)
         code = "AUTH_EXPIRED" if is_auth else "SCRIPT_ERROR"
         return {
@@ -119,13 +142,22 @@ class GeminiWorker:
         }
 
     def _ensure_export_api(self) -> None:
-        if self._exporter_cls is not None and self._cookies_loader is not None:
+        if (
+            self._exporter_cls is not None
+            and self._cookies_loader is not None
+            and self._backoff_limit_error_cls is not None
+        ):
             return
         try:
-            from gemini_export import GeminiExporter, get_cookies_from_local_browser
+            from gemini_export import (
+                GeminiExporter,
+                RequestBackoffLimitReachedError,
+                get_cookies_from_local_browser,
+            )
         except Exception as exc:
             raise RuntimeError(f"导出脚本不可用: {exc}") from exc
         self._exporter_cls = GeminiExporter
+        self._backoff_limit_error_cls = RequestBackoffLimitReachedError
         self._cookies_loader = get_cookies_from_local_browser
 
     def _get_cookies(self, force_refresh: bool = False) -> Dict[str, str]:
@@ -209,6 +241,8 @@ class GeminiWorker:
         try:
             return fn(exporter)
         except Exception as exc:
+            if self._is_backoff_limit_error(exc):
+                raise
             if not self._is_auth_error(exc):
                 raise
             exporter = self._get_exporter(account_id, force_refresh=True)
@@ -228,12 +262,32 @@ class GeminiWorker:
         items = data.get("items", []) if isinstance(data, dict) else []
         return [row for row in items if isinstance(row, dict)]
 
+    @staticmethod
+    def _conversation_status(row: Dict[str, Any]) -> str:
+        status = row.get("status")
+        if isinstance(status, str):
+            status = status.strip()
+            if status:
+                return status
+        return "normal"
+
+    @classmethod
+    def _is_lost_conversation(cls, row: Dict[str, Any]) -> bool:
+        return cls._conversation_status(row) == "lost"
+
     def _load_conversation_ids(self, account_id: str) -> list[str]:
         out: list[str] = []
+        seen: set[str] = set()
         for row in self._load_conversation_items(account_id):
+            if self._is_lost_conversation(row):
+                continue
             cid = row.get("id")
             if isinstance(cid, str) and cid.strip():
-                out.append(cid.strip())
+                normalized = cid.strip()
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                out.append(normalized)
         return out
 
     @staticmethod
@@ -262,43 +316,35 @@ class GeminiWorker:
         account_dir = self.output_dir / "accounts" / account_id
         conv_dir = account_dir / "conversations"
         ids: set[str] = set()
-
-        sync_state_file = account_dir / "sync_state.json"
-        if sync_state_file.exists():
-            try:
-                sync_state = json.loads(sync_state_file.read_text(encoding="utf-8"))
-            except Exception:
-                sync_state = {}
-            full_sync = sync_state.get("fullSync") if isinstance(sync_state, dict) else None
-            failed = full_sync.get("conversationsFailed") if isinstance(full_sync, dict) else []
-            if isinstance(failed, list):
-                for cid in failed:
-                    if isinstance(cid, str) and cid.strip():
-                        ids.add(cid.strip())
+        item_map: Dict[str, Dict[str, Any]] = {}
+        for row in self._load_conversation_items(account_id):
+            cid = row.get("id")
+            if isinstance(cid, str) and cid.strip():
+                item_map[cid.strip()] = row
 
         if conv_dir.exists():
             for jsonl_path in conv_dir.glob("*.jsonl"):
                 if self._jsonl_has_failed_marker(jsonl_path):
-                    ids.add(jsonl_path.stem)
+                    cid = jsonl_path.stem
+                    row = item_map.get(cid)
+                    if isinstance(row, dict) and self._is_lost_conversation(row):
+                        continue
+                    ids.add(cid)
 
         return sorted(ids)
 
     def _collect_empty_conversation_ids(self, account_id: str) -> list[str]:
-        account_dir = self.output_dir / "accounts" / account_id
-        conv_dir = account_dir / "conversations"
         out: list[str] = []
 
         for row in self._load_conversation_items(account_id):
+            if self._is_lost_conversation(row):
+                continue
             cid = row.get("id")
             if not isinstance(cid, str) or not cid.strip():
                 continue
             cid = cid.strip()
-            jsonl_path = conv_dir / f"{cid}.jsonl"
-            synced_at = row.get("syncedAt")
             message_count = row.get("messageCount")
-            index_empty = synced_at is None or message_count == 0
-            local_empty = not self._jsonl_has_message_rows(jsonl_path)
-            if index_empty or local_empty:
+            if isinstance(message_count, int) and message_count == 0:
                 out.append(cid)
 
         return out
@@ -312,11 +358,13 @@ class GeminiWorker:
     ) -> Dict[str, Any]:
         total = len(conv_ids)
         if total == 0:
+            self._log(phase, "当前对话任务列表更新进度: 0/0")
             self._emit_job_state(job, "running", phase=phase, progress={"current": 0, "total": 0})
             return {"succeeded": [], "failed": []}
 
         succeeded: list[str] = []
         failed: list[str] = []
+        self._log(phase, f"当前对话任务列表更新进度: 0/{total}")
 
         for idx, cid in enumerate(conv_ids, start=1):
             sub_job = {
@@ -339,8 +387,20 @@ class GeminiWorker:
                     progress={"current": idx, "total": total},
                     error=self._to_error(exc),
                 )
+                if self._is_backoff_limit_error(exc):
+                    self._log(
+                        phase,
+                        "触发全局退避兜底，提前结束当前全量批次: "
+                        f"{idx}/{total}, cid={cid}",
+                    )
+                    raise
                 failed.append(cid)
 
+            self._log(
+                phase,
+                f"当前对话任务列表更新进度: {idx}/{total}"
+                f" (success={len(succeeded)}, failed={len(failed)}, cid={cid})",
+            )
             self._emit_job_state(
                 job,
                 "running",
@@ -392,6 +452,7 @@ class GeminiWorker:
 
         self._log("sync_full", f"开始全量同步: account={account_id}")
 
+        # 1) 所有记录中的失败重试（对话、媒体等）
         retry_failed_ids = self._collect_failed_conversation_ids(account_id)
         self._log("retry_failed", f"失败记录重试: {len(retry_failed_ids)}")
         retry_result = self._sync_conversation_batch(job, account_id, retry_failed_ids, "retry_failed")
@@ -399,20 +460,29 @@ class GeminiWorker:
         failed_ids.update(retry_result["failed"])
         failed_ids.difference_update(retry_result["succeeded"])
 
+        # 2) 同步列表中 messageCount=0 的空对话
         empty_ids = [cid for cid in self._collect_empty_conversation_ids(account_id) if cid not in success_ids]
-        self._log("sync_empty", f"空会话补齐: {len(empty_ids)}")
+        self._log("sync_empty", f"空会话补齐(message=0): {len(empty_ids)}")
         empty_result = self._sync_conversation_batch(job, account_id, empty_ids, "sync_empty")
         success_ids.update(empty_result["succeeded"])
         failed_ids.update(empty_result["failed"])
         failed_ids.difference_update(empty_result["succeeded"])
 
+        # 3) 拉最新列表，识别新增 ID，并同步新增（去重）
         before_ids = self._load_conversation_ids(account_id)
+        before_set = set(before_ids)
         self._emit_job_state(job, "running", phase="refresh_list")
         self._log("refresh_list", "拉取最新列表并识别新增会话")
         self._execute_sync_list(job)
         after_ids = self._load_conversation_ids(account_id)
-        before_set = set(before_ids)
-        new_ids = [cid for cid in after_ids if cid not in before_set and cid not in success_ids]
+
+        new_ids: list[str] = []
+        new_seen: set[str] = set()
+        for cid in after_ids:
+            if cid in before_set or cid in success_ids or cid in new_seen:
+                continue
+            new_seen.add(cid)
+            new_ids.append(cid)
 
         self._log("sync_new", f"新增会话同步: {len(new_ids)}")
         new_result = self._sync_conversation_batch(job, account_id, new_ids, "sync_new")
@@ -420,7 +490,17 @@ class GeminiWorker:
         failed_ids.update(new_result["failed"])
         failed_ids.difference_update(new_result["succeeded"])
 
-        remaining_old_ids = [cid for cid in after_ids if cid not in success_ids]
+        # 4) 检查剩余老会话 detail 更新
+        remaining_old_ids: list[str] = []
+        old_seen: set[str] = set()
+        for cid in after_ids:
+            if cid not in before_set:
+                continue
+            if cid in success_ids or cid in old_seen:
+                continue
+            old_seen.add(cid)
+            remaining_old_ids.append(cid)
+
         self._log("sync_old", f"剩余老会话检查更新: {len(remaining_old_ids)}")
         old_result = self._sync_conversation_batch(job, account_id, remaining_old_ids, "sync_old")
         success_ids.update(old_result["succeeded"])
@@ -457,7 +537,10 @@ class GeminiWorker:
                 done_progress = result.get("progress") if isinstance(result, dict) else None
                 self._emit_job_state(job, "done", progress=done_progress)
             except Exception as exc:
-                traceback.print_exc(file=sys.stderr)
+                if self._is_backoff_limit_error(exc):
+                    self._log("job_loop", f"任务因全局退避兜底提前结束: {exc}")
+                else:
+                    traceback.print_exc(file=sys.stderr)
                 self._emit_job_state(job, "failed", error=self._to_error(exc))
             finally:
                 self._queue.task_done()

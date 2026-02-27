@@ -1,11 +1,13 @@
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { TopBar } from "./components/TopBar";
 import { Sidebar } from "./components/Sidebar";
 import { ChatView } from "./components/ChatView";
 import { AccountPicker } from "./components/AccountPicker";
-import { Account, Conversation, ConversationSummary } from "./data/mockData";
+import { Account, Conversation, ConversationSummary } from "./data/types";
 import { ThemeContext, lightTheme, darkTheme } from "./theme";
 
 type Screen = "account-picker" | "chat";
@@ -33,6 +35,22 @@ interface WorkerJobStatePayload {
   error?: WorkerJobError;
 }
 
+interface AccountExportStats {
+  accountId: string;
+  conversationCount: number;
+  conversationFileCount: number;
+  mediaFileCount: number;
+  totalFileCount: number;
+  totalBytes: number;
+  estimatedZipBytes: number;
+}
+
+interface AccountExportResult extends AccountExportStats {
+  zipPath: string;
+  fileName: string;
+  zipSizeBytes: number;
+}
+
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
@@ -54,6 +72,58 @@ function toNullableNumber(value: unknown): number | null {
 
 function toSafeNumber(value: unknown, fallback = 0): number {
   return typeof value === "number" && !Number.isNaN(value) ? value : fallback;
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let val = bytes;
+  let idx = 0;
+  while (val >= 1024 && idx < units.length - 1) {
+    val /= 1024;
+    idx += 1;
+  }
+  const fixed = idx === 0 ? 0 : (val >= 100 ? 0 : 1);
+  return `${val.toFixed(fixed)} ${units[idx]}`;
+}
+
+function parseAccountExportStatsPayload(json: string): AccountExportStats | null {
+  try {
+    const parsed: unknown = JSON.parse(json);
+    if (!isObjectRecord(parsed)) return null;
+    const accountId = toNonEmptyStringOrNull(parsed.accountId);
+    if (!accountId) return null;
+    return {
+      accountId,
+      conversationCount: toSafeNumber(parsed.conversationCount, 0),
+      conversationFileCount: toSafeNumber(parsed.conversationFileCount, 0),
+      mediaFileCount: toSafeNumber(parsed.mediaFileCount, 0),
+      totalFileCount: toSafeNumber(parsed.totalFileCount, 0),
+      totalBytes: toSafeNumber(parsed.totalBytes, 0),
+      estimatedZipBytes: toSafeNumber(parsed.estimatedZipBytes, 0),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function parseAccountExportResultPayload(json: string): AccountExportResult | null {
+  const stats = parseAccountExportStatsPayload(json);
+  if (!stats) return null;
+  try {
+    const parsed: unknown = JSON.parse(json);
+    if (!isObjectRecord(parsed)) return null;
+    const zipPath = toNonEmptyStringOrNull(parsed.zipPath);
+    if (!zipPath) return null;
+    return {
+      ...stats,
+      zipPath,
+      fileName: toNonEmptyStringOrNull(parsed.fileName) ?? "account-export.zip",
+      zipSizeBytes: toSafeNumber(parsed.zipSizeBytes, 0),
+    };
+  } catch {
+    return null;
+  }
 }
 
 function toAccount(raw: unknown): Account | null {
@@ -114,8 +184,13 @@ function parseSummariesPayload(json: string): ConversationSummary[] {
   try {
     const parsed: unknown = JSON.parse(json);
     if (!Array.isArray(parsed)) return [];
-    const items = parsed as ConversationSummary[];
-    return [...items].sort((a, b) => {
+    const items = parsed
+      .filter((item): item is Record<string, unknown> => isObjectRecord(item))
+      .map((item) => ({
+        ...(item as unknown as ConversationSummary),
+        status: toNonEmptyStringOrNull(item.status) ?? "normal",
+      }));
+    return items.sort((a, b) => {
       const ta = Date.parse(a.updatedAt ?? "");
       const tb = Date.parse(b.updatedAt ?? "");
       const va = Number.isNaN(ta) ? -Infinity : ta;
@@ -125,6 +200,10 @@ function parseSummariesPayload(json: string): ConversationSummary[] {
   } catch {
     return [];
   }
+}
+
+function isHiddenSummary(summary: ConversationSummary): boolean {
+  return summary.status === "hidden";
 }
 
 function parseConversationPayload(json: string): Conversation | null {
@@ -153,6 +232,11 @@ function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [listSyncing, setListSyncing] = useState(false);
   const [fullSyncing, setFullSyncing] = useState(false);
+  const [preparingExportData, setPreparingExportData] = useState(false);
+  const [exportingAccountData, setExportingAccountData] = useState(false);
+  const [showExportConfirm, setShowExportConfirm] = useState(false);
+  const [exportStats, setExportStats] = useState<AccountExportStats | null>(null);
+  const [exportNotice, setExportNotice] = useState<{ title: string; lines: string[] } | null>(null);
   const [clearingAccountData, setClearingAccountData] = useState(false);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
   const [isDark, setIsDark] = useState(false);
@@ -203,9 +287,10 @@ function App() {
     const loaded = parseSummariesPayload(
       await invoke<string>("load_conversation_summaries", { accountId }),
     );
+    const visibleLoaded = loaded.filter((c) => !isHiddenSummary(c));
     setConversationSummaries(loaded);
     setSelectedId((prev) =>
-      prev && loaded.some((c) => c.id === prev) ? prev : (loaded[0]?.id ?? null),
+      prev && visibleLoaded.some((c) => c.id === prev) ? prev : (visibleLoaded[0]?.id ?? null),
     );
   }
 
@@ -269,10 +354,11 @@ function App() {
         const loaded = parseSummariesPayload(
           await invoke<string>("load_conversation_summaries", { accountId }),
         );
+        const visibleLoaded = loaded.filter((c) => !isHiddenSummary(c));
         if (cancelled) return;
         setConversationSummaries(loaded);
         setSelectedId((prev) =>
-          prev && loaded.some((c) => c.id === prev) ? prev : (loaded[0]?.id ?? null),
+          prev && visibleLoaded.some((c) => c.id === prev) ? prev : (visibleLoaded[0]?.id ?? null),
         );
       } catch (e) {
         console.error("加载对话列表失败:", e);
@@ -342,10 +428,11 @@ function App() {
         const loaded = parseSummariesPayload(
           await invoke<string>("load_conversation_summaries", { accountId }),
         );
+        const visibleLoaded = loaded.filter((c) => !isHiddenSummary(c));
         if (cancelled) return;
         setConversationSummaries(loaded);
         setSelectedId((prev) =>
-          prev && loaded.some((c) => c.id === prev) ? prev : (loaded[0]?.id ?? null),
+          prev && visibleLoaded.some((c) => c.id === prev) ? prev : (visibleLoaded[0]?.id ?? null),
         );
       } catch (e) {
         console.error("轮询刷新对话列表失败:", e);
@@ -567,25 +654,111 @@ function App() {
     await syncConversation(conversationId);
   }
 
-  async function handleClearAccountData() {
-    if (!currentAccount || clearingAccountData) {
+  async function handleExportAccountData() {
+    if (!currentAccount || exportingAccountData || preparingExportData || clearingAccountData) return;
+    setPreparingExportData(true);
+    try {
+      const accountId = currentAccount.id;
+      const stats = parseAccountExportStatsPayload(
+        await invoke<string>("get_account_export_stats", { accountId }),
+      );
+      if (!stats) {
+        throw new Error("读取导出统计失败");
+      }
+      setExportStats(stats);
+      setShowExportConfirm(true);
+    } catch (e) {
+      console.error("导出账号数据失败:", e);
+      const msg = e instanceof Error ? e.message : String(e);
+      setExportNotice({
+        title: "导出账号数据失败",
+        lines: [msg],
+      });
+    } finally {
+      setPreparingExportData(false);
+    }
+  }
+
+  async function confirmExportAccountData() {
+    if (!currentAccount || !exportStats || exportingAccountData || preparingExportData) {
+      setShowExportConfirm(false);
       return;
     }
-    if (listSyncing || fullSyncing || syncingConversationIds.length > 0) {
-      window.alert("当前有同步任务进行中，暂时不能清空账号数据。请等待同步结束后重试。");
+
+    setShowExportConfirm(false);
+    setExportStats(null);
+    const startedAt = Date.now();
+    setExportingAccountData(true);
+    try {
+      const accountId = currentAccount.id;
+      const selectedOutput = await open({
+        directory: true,
+        multiple: false,
+        title: "选择导出目录",
+      });
+      if (!selectedOutput) {
+        return;
+      }
+      const outputDir = Array.isArray(selectedOutput) ? selectedOutput[0] : selectedOutput;
+      if (!outputDir || typeof outputDir !== "string") {
+        throw new Error("未选择有效导出目录");
+      }
+
+      const result = parseAccountExportResultPayload(
+        await invoke<string>("export_account_zip", { accountId, outputDir }),
+      );
+      if (!result) {
+        throw new Error("导出失败：返回结果异常");
+      }
+      try {
+        await revealItemInDir(result.zipPath);
+      } catch (revealErr) {
+        console.error("定位导出文件失败:", revealErr);
+      }
+
+      setExportNotice({
+        title: "导出完成",
+        lines: [
+          `文件: ${result.fileName}`,
+          `大小: ${formatBytes(result.zipSizeBytes)}`,
+          `路径: ${result.zipPath}`,
+        ],
+      });
+    } catch (e) {
+      console.error("导出账号数据失败:", e);
+      const msg = e instanceof Error ? e.message : String(e);
+      setExportNotice({
+        title: "导出账号数据失败",
+        lines: [msg],
+      });
+    } finally {
+      const elapsed = Date.now() - startedAt;
+      if (elapsed < 450) {
+        await new Promise((resolve) => window.setTimeout(resolve, 450 - elapsed));
+      }
+      setExportingAccountData(false);
+    }
+  }
+
+  async function handleClearAccountData() {
+    if (!currentAccount || clearingAccountData || exportingAccountData || preparingExportData) {
+      return;
+    }
+    if (listSyncing || fullSyncing || syncingConversationIds.length > 0 || exportingAccountData || preparingExportData) {
+      window.alert("当前有任务进行中，暂时不能清空账号数据。请等待任务结束后重试。");
       return;
     }
     setShowClearConfirm(true);
   }
 
   async function confirmClearAccountData() {
-    if (!currentAccount || clearingAccountData) {
+    if (!currentAccount || clearingAccountData || exportingAccountData || preparingExportData) {
       setShowClearConfirm(false);
       return;
     }
-    if (listSyncing || fullSyncing || syncingConversationIds.length > 0) {
+    if (listSyncing || fullSyncing || syncingConversationIds.length > 0 || exportingAccountData || preparingExportData) {
       setShowClearConfirm(false);
-      window.alert("当前有同步任务进行中，暂时不能清空账号数据。请等待同步结束后重试。");
+      window.alert("当前有任务进行中，暂时不能清空账号数据。请等待任务结束后重试。");
       return;
     }
 
@@ -636,10 +809,13 @@ function App() {
   }
 
   const anySyncTaskRunning =
-    listSyncing || fullSyncing || syncingConversationIds.length > 0;
+    listSyncing || fullSyncing || syncingConversationIds.length > 0 || exportingAccountData || preparingExportData;
+  const visibleConversationSummaries = conversationSummaries.filter((c) => !isHiddenSummary(c));
   const selectedSummary = selectedId
-    ? conversationSummaries.find((c) => c.id === selectedId) ?? null
+    ? visibleConversationSummaries.find((c) => c.id === selectedId) ?? null
     : null;
+  const clearDialogBg = theme.isDark ? "#171b22" : "#ffffff";
+  const clearDialogBorder = theme.isDark ? "rgba(255,255,255,0.14)" : "rgba(15,23,42,0.14)";
 
   if (screen === "account-picker" || !currentAccount) {
     return (
@@ -678,7 +854,7 @@ function App() {
           }}
         />
         <Sidebar
-          conversations={conversationSummaries}
+          conversations={visibleConversationSummaries}
           selectedId={selectedId}
           onSelect={setSelectedId}
           collapsed={sidebarCollapsed}
@@ -686,8 +862,11 @@ function App() {
           fullSyncing={fullSyncing}
           onSyncList={handleSyncList}
           onSyncFull={handleSyncAll}
+          exportingAccountData={exportingAccountData || preparingExportData}
+          disableExportAccountData={clearingAccountData || exportingAccountData || preparingExportData}
+          onExportAccountData={handleExportAccountData}
           clearingAccountData={clearingAccountData}
-          disableClearAccountData={listSyncing || fullSyncing || syncingConversationIds.length > 0}
+          disableClearAccountData={listSyncing || fullSyncing || syncingConversationIds.length > 0 || exportingAccountData || preparingExportData}
           onClearAccountData={handleClearAccountData}
           currentAccount={currentAccount}
           accounts={accounts}
@@ -729,6 +908,130 @@ function App() {
           <ChatView conversation={selectedConversation} mediaDir={mediaDir} mediaVersion={mediaVersion} />
         </div>
       </div>
+      {showExportConfirm && exportStats && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 10000,
+            background: "rgba(0,0,0,0.32)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <div
+            style={{
+              width: 420,
+              maxWidth: "calc(100vw - 32px)",
+              borderRadius: 12,
+              background: clearDialogBg,
+              border: `1px solid ${clearDialogBorder}`,
+              boxShadow: theme.isDark ? "0 18px 40px rgba(0,0,0,0.45)" : "0 18px 40px rgba(0,0,0,0.2)",
+              padding: 16,
+            }}
+          >
+            <div style={{ fontSize: 15, fontWeight: 700, color: theme.text, marginBottom: 8 }}>
+              导出当前账号数据
+            </div>
+            <div style={{ fontSize: 13, color: theme.textSub, lineHeight: 1.55, marginBottom: 12 }}>
+              账号「{currentAccount.name || currentAccount.email || currentAccount.id}」将打包为 ZIP。
+            </div>
+            <div style={{ fontSize: 12, color: theme.textSub, lineHeight: 1.6, marginBottom: 14 }}>
+              <div>对话数: {exportStats.conversationCount}（详情文件 {exportStats.conversationFileCount}）</div>
+              <div>媒体文件: {exportStats.mediaFileCount}</div>
+              <div>文件总数: {exportStats.totalFileCount}</div>
+              <div>当前体积: {formatBytes(exportStats.totalBytes)}</div>
+              <div>预估压缩后: {formatBytes(exportStats.estimatedZipBytes)}</div>
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+              <button
+                onClick={() => {
+                  setShowExportConfirm(false);
+                  setExportStats(null);
+                }}
+                style={{
+                  border: `1px solid ${clearDialogBorder}`,
+                  background: "transparent",
+                  color: theme.text,
+                  borderRadius: 8,
+                  padding: "7px 12px",
+                  fontSize: 12,
+                  cursor: "pointer",
+                }}
+              >
+                取消
+              </button>
+              <button
+                onClick={() => { void confirmExportAccountData(); }}
+                style={{
+                  border: "none",
+                  background: "#0071e3",
+                  color: "#fff",
+                  borderRadius: 8,
+                  padding: "7px 12px",
+                  fontSize: 12,
+                  fontWeight: 600,
+                  cursor: "pointer",
+                }}
+              >
+                开始导出
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {exportNotice && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 10001,
+            background: "rgba(0,0,0,0.32)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <div
+            style={{
+              width: 430,
+              maxWidth: "calc(100vw - 32px)",
+              borderRadius: 12,
+              background: clearDialogBg,
+              border: `1px solid ${clearDialogBorder}`,
+              boxShadow: theme.isDark ? "0 18px 40px rgba(0,0,0,0.45)" : "0 18px 40px rgba(0,0,0,0.2)",
+              padding: 16,
+            }}
+          >
+            <div style={{ fontSize: 15, fontWeight: 700, color: theme.text, marginBottom: 8 }}>
+              {exportNotice.title}
+            </div>
+            <div style={{ fontSize: 12, color: theme.textSub, lineHeight: 1.6, marginBottom: 14 }}>
+              {exportNotice.lines.map((line, idx) => (
+                <div key={`${idx}_${line}`}>{line}</div>
+              ))}
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end" }}>
+              <button
+                onClick={() => setExportNotice(null)}
+                style={{
+                  border: "none",
+                  background: "#0071e3",
+                  color: "#fff",
+                  borderRadius: 8,
+                  padding: "7px 12px",
+                  fontSize: 12,
+                  fontWeight: 600,
+                  cursor: "pointer",
+                }}
+              >
+                知道了
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {showClearConfirm && (
         <div
           style={{
@@ -746,8 +1049,8 @@ function App() {
               width: 380,
               maxWidth: "calc(100vw - 32px)",
               borderRadius: 12,
-              background: theme.cardBg,
-              border: `1px solid ${theme.border}`,
+              background: clearDialogBg,
+              border: `1px solid ${clearDialogBorder}`,
               boxShadow: theme.isDark ? "0 18px 40px rgba(0,0,0,0.45)" : "0 18px 40px rgba(0,0,0,0.2)",
               padding: 16,
             }}
@@ -762,7 +1065,7 @@ function App() {
               <button
                 onClick={() => setShowClearConfirm(false)}
                 style={{
-                  border: `1px solid ${theme.border}`,
+                  border: `1px solid ${clearDialogBorder}`,
                   background: "transparent",
                   color: theme.text,
                   borderRadius: 8,

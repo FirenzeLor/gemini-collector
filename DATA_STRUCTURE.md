@@ -73,6 +73,7 @@ interface ConversationSummary {
   lastMessage: string;       // 纯文本摘要，最多 80 字符
   messageCount: number;
   hasMedia: boolean;
+  status?: string;           // normal | lost | hidden | ...（可扩展）
   updatedAt: string;         // ISO 8601
   syncedAt: string | null;   // null = 仅有索引条目，详情尚未拉取
   remoteHash: string | null;

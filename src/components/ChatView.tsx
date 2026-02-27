@@ -6,7 +6,7 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneLight, vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
-import { Attachment, Conversation, ConvMessage } from "../data/mockData";
+import { Attachment, Conversation, ConvMessage } from "../data/types";
 import { useTheme } from "../theme";
 
 const loadedImageUrlCache = new Set<string>();
@@ -236,7 +236,7 @@ export function ChatView({ conversation, mediaDir, mediaVersion = 0 }: ChatViewP
         <div style={{ textAlign: "center", color: t.textMuted, fontSize: 13, marginTop: 60 }}>暂无消息记录</div>
       ) : (
         <Virtuoso
-          key={`${conversation.id}:${conversation.syncedAt}:${mediaVersion}`}
+          key={`${conversation.id}:${conversation.updatedAt}:${mediaVersion}`}
           data={conversation.messages}
           followOutput="smooth"
           initialTopMostItemIndex={conversation.messages.length - 1}
@@ -244,7 +244,7 @@ export function ChatView({ conversation, mediaDir, mediaVersion = 0 }: ChatViewP
             <MessageBubble
               message={msg}
               mediaDir={mediaDir}
-              cacheKey={`${conversation.id}:${conversation.syncedAt}:${mediaVersion}`}
+              cacheKey={`${conversation.id}:${conversation.updatedAt}:${mediaVersion}`}
             />
           )}
           style={{ flex: 1 }}
