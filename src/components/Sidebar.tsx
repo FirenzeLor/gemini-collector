@@ -5,6 +5,8 @@ import { useTheme } from "../theme";
 
 interface SidebarProps {
   conversations: ConversationSummary[];
+  conversationSortMode?: "updated_desc" | "size_desc";
+  onToggleConversationSort?: () => void;
   selectedId: string | null;
   onSelect: (id: string) => void;
   collapsed: boolean;
@@ -44,6 +46,7 @@ function formatConvTime(iso: string): string {
 
 export function Sidebar({
   conversations, selectedId, onSelect, collapsed,
+  conversationSortMode = "updated_desc", onToggleConversationSort,
   listSyncing, fullSyncing, onSyncList, onSyncFull, clearingAccountData, onClearAccountData,
   exportingAccountData = false, disableExportAccountData = false, onExportAccountData,
   disableClearAccountData = false,
@@ -122,6 +125,42 @@ export function Sidebar({
               }}
             >
               <ExportIcon spinning={exportingAccountData} color={exportingAccountData ? "#0071e3" : t.textMuted} />
+            </button>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onToggleConversationSort?.();
+              }}
+              title={
+                conversationSortMode === "size_desc"
+                  ? "当前按大小倒序（消息条数），点击切换为按更新时间新到旧"
+                  : "当前按更新时间新到旧，点击切换为按大小倒序（消息条数）"
+              }
+              style={{
+                height: 22,
+                borderRadius: 6,
+                border: "none",
+                background: "transparent",
+                cursor: "pointer",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                flexShrink: 0,
+                padding: "0 6px",
+                color: t.textMuted,
+                fontSize: 10.5,
+                fontWeight: 700,
+                letterSpacing: 0.2,
+                transition: "background 0.12s",
+              }}
+              onMouseEnter={(e) => {
+                (e.currentTarget as HTMLElement).style.background = t.btnHoverBg;
+              }}
+              onMouseLeave={(e) => {
+                (e.currentTarget as HTMLElement).style.background = "transparent";
+              }}
+            >
+              {conversationSortMode === "size_desc" ? "大小↓" : "时间↓"}
             </button>
             <button
               onClick={(e) => {
