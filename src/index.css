@@ -16,17 +16,29 @@
 
 /* Custom scrollbar */
 ::-webkit-scrollbar {
-  width: 6px;
+  width: 10px;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(0,0,0,0.15);
-  border-radius: 3px;
+  background: rgba(0,0,0,0.22);
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(0,0,0,0.25);
+  background: rgba(0,0,0,0.35);
+  background-clip: padding-box;
+}
+/* Dark mode scrollbar — matches dot color rgba(255,255,255,0.30) */
+.dark ::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.30);
+  background-clip: padding-box;
+}
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: rgba(255,255,255,0.45);
+  background-clip: padding-box;
 }
 
 

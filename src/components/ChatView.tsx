@@ -99,11 +99,11 @@ function fixMarkdown(content: string): string {
 // ─── Timeline constants ────────────────────────────────────────────────────
 const TL_PAD = 18;       // top/bottom padding inside long canvas (px)
 const TL_MIN_GAP = 18;   // minimum vertical gap between dots (px)
-const TL_BAR_WIDTH = 20; // total bar width (px)
-const TL_BAR_RIGHT = 6;  // bar distance from right edge of parent (px)
+const TL_BAR_WIDTH = 25; // total bar width (px)
+const TL_BAR_RIGHT = 8;  // bar distance from right edge of parent (px)
 const TL_HIT = 20;       // dot hit-area size (px)
 const TL_DOT = 9;        // normal dot visual diameter (px)
-const TL_DOT_ACTIVE = 14; // active dot visual diameter (px)
+const TL_DOT_ACTIVE = 9; // active dot visual diameter (px)
 
 // ─── Timeline utility functions ────────────────────────────────────────────
 
