@@ -1,7 +1,7 @@
-import React, { useMemo, useState } from "react";
+import React, { useMemo, useState, useRef, useEffect } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Virtuoso } from "react-virtuoso";
+import { Virtuoso, VirtuosoHandle } from "react-virtuoso";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
@@ -96,6 +96,298 @@ function fixMarkdown(content: string): string {
     .replace(/(\*+)([^\x00-\x7F])/g, "$1\u200B$2");
 }
 
+// ─── Timeline constants ────────────────────────────────────────────────────
+const TL_PAD = 12;       // top/bottom padding inside long canvas (px)
+const TL_MIN_GAP = 12;   // minimum vertical gap between dots (px)
+const TL_BAR_WIDTH = 20; // total bar width (px)
+const TL_HIT = 28;       // dot hit-area size (px)
+const TL_DOT = 6;        // normal dot visual diameter (px)
+const TL_DOT_ACTIVE = 10; // active dot visual diameter (px)
+
+// ─── Timeline utility functions ────────────────────────────────────────────
+
+/** Three-pass min-gap enforcement (forward → backward → forward). */
+function applyMinGap(
+  positions: number[],
+  minTop: number,
+  maxTop: number,
+  gap: number,
+): number[] {
+  const n = positions.length;
+  if (n === 0) return positions;
+  const out = positions.slice();
+
+  out[0] = Math.max(minTop, Math.min(out[0], maxTop));
+  for (let i = 1; i < n; i++) {
+    out[i] = Math.max(positions[i], out[i - 1] + gap);
+  }
+
+  if (out[n - 1] > maxTop) {
+    out[n - 1] = maxTop;
+    for (let i = n - 2; i >= 0; i--) {
+      out[i] = Math.min(out[i], out[i + 1] - gap);
+    }
+    if (out[0] < minTop) {
+      out[0] = minTop;
+      for (let i = 1; i < n; i++) {
+        out[i] = Math.max(out[i], out[i - 1] + gap);
+      }
+    }
+  }
+
+  for (let i = 0; i < n; i++) {
+    out[i] = Math.max(minTop, Math.min(maxTop, out[i]));
+  }
+  return out;
+}
+
+/** First index where arr[i] >= x. */
+function lowerBound(arr: number[], x: number): number {
+  let lo = 0, hi = arr.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (arr[mid] < x) lo = mid + 1; else hi = mid;
+  }
+  return lo;
+}
+
+/** Last index where arr[i] <= x. */
+function upperBound(arr: number[], x: number): number {
+  let lo = 0, hi = arr.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (arr[mid] <= x) lo = mid + 1; else hi = mid;
+  }
+  return lo - 1;
+}
+
+// ─── ConversationTimeline ──────────────────────────────────────────────────
+
+interface TimelineProps {
+  messages: ConvMessage[];
+  scrollerEl: HTMLElement | null;
+  visibleRange: { startIndex: number; endIndex: number };
+  onJumpTo: (globalIndex: number) => void;
+}
+
+function ConversationTimeline({ messages, scrollerEl, visibleRange, onJumpTo }: TimelineProps) {
+  const t = useTheme();
+  const barRef = useRef<HTMLDivElement>(null);
+  const innerRef = useRef<HTMLDivElement>(null);
+  const [barHeight, setBarHeight] = useState(0);
+  const [dotRange, setDotRange] = useState({ start: 0, end: -1 });
+  // Tracks current translateY offset imperatively (avoids state for animation path)
+  const offsetRef = useRef(0);
+
+  // ── Collect user messages with global indices ──────────────────────────
+  const userMsgs = useMemo(() => {
+    const result: { globalIndex: number; text: string }[] = [];
+    for (let i = 0; i < messages.length; i++) {
+      if (messages[i].role === "user") {
+        result.push({ globalIndex: i, text: messages[i].text });
+      }
+    }
+    return result;
+  }, [messages]);
+
+  const N = userMsgs.length;
+
+  // ── Long-canvas geometry ───────────────────────────────────────────────
+  const { contentHeight, yPositions } = useMemo((): {
+    contentHeight: number;
+    yPositions: number[];
+  } => {
+    if (N === 0 || barHeight === 0) return { contentHeight: barHeight, yPositions: [] };
+    const needed = 2 * TL_PAD + Math.max(0, N - 1) * TL_MIN_GAP;
+    const ch = Math.max(barHeight, Math.ceil(needed));
+    const usableC = Math.max(1, ch - 2 * TL_PAD);
+    const desired = userMsgs.map((_, i) =>
+      TL_PAD + (N <= 1 ? 0 : i / (N - 1)) * usableC,
+    );
+    const yPos = applyMinGap(desired, TL_PAD, TL_PAD + usableC, TL_MIN_GAP);
+    return { contentHeight: ch, yPositions: yPos };
+  }, [N, barHeight, userMsgs]);
+
+  // ── Active local index: closest user message to mid of visible range ──
+  const activeLocalIdx = useMemo(() => {
+    if (N === 0) return 0;
+    const mid = Math.round((visibleRange.startIndex + visibleRange.endIndex) / 2);
+    let idx = 0;
+    for (let i = 0; i < N; i++) {
+      if (userMsgs[i].globalIndex <= mid) idx = i;
+      else break;
+    }
+    return idx;
+  }, [visibleRange, userMsgs, N]);
+
+  // ── ResizeObserver for bar height ──────────────────────────────────────
+  useEffect(() => {
+    const el = barRef.current;
+    if (!el) return;
+    const h0 = el.clientHeight;
+    if (h0 > 0) setBarHeight(h0);
+    const ro = new ResizeObserver(([entry]) => {
+      const h = entry.contentRect.height;
+      if (h > 0) setBarHeight(h);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // ── Recompute dotRange when geometry changes (before scroll sync fires) ─
+  useEffect(() => {
+    if (yPositions.length === 0 || barHeight === 0) return;
+    const offset = offsetRef.current;
+    const buffer = Math.max(100, barHeight);
+    const s = lowerBound(yPositions, offset - buffer);
+    const e = Math.max(s - 1, upperBound(yPositions, offset + barHeight + buffer));
+    setDotRange({ start: s, end: e });
+  }, [yPositions, barHeight]);
+
+  // ── Scroll sync: main scroller → translateY of inner track ────────────
+  useEffect(() => {
+    const inner = innerRef.current;
+    if (!scrollerEl || !inner || barHeight === 0 || yPositions.length === 0) return;
+
+    let rafId: number | null = null;
+
+    const sync = () => {
+      rafId = null;
+      const { scrollTop, scrollHeight, clientHeight } = scrollerEl;
+      const maxMain = Math.max(1, scrollHeight - clientHeight);
+      const ratio = Math.max(0, Math.min(1, scrollTop / maxMain));
+      const maxTimeline = Math.max(0, contentHeight - barHeight);
+      const target = Math.round(ratio * maxTimeline);
+
+      if (Math.abs(offsetRef.current - target) > 1) {
+        offsetRef.current = target;
+        inner.style.transform = `translateY(-${target}px)`;
+
+        // Update virtual window
+        const buffer = Math.max(100, barHeight);
+        const s = lowerBound(yPositions, target - buffer);
+        const e = Math.max(s - 1, upperBound(yPositions, target + barHeight + buffer));
+        setDotRange(prev =>
+          prev.start === s && prev.end === e ? prev : { start: s, end: e },
+        );
+      }
+    };
+
+    const onScroll = () => {
+      if (rafId !== null) return;
+      rafId = requestAnimationFrame(sync);
+    };
+
+    scrollerEl.addEventListener("scroll", onScroll, { passive: true });
+    sync(); // initial alignment
+    return () => {
+      scrollerEl.removeEventListener("scroll", onScroll);
+      if (rafId !== null) cancelAnimationFrame(rafId);
+    };
+  }, [scrollerEl, contentHeight, barHeight, yPositions]);
+
+  // ── Inject hover / focus styles once ──────────────────────────────────
+  useEffect(() => {
+    const id = "conv-timeline-styles";
+    if (document.getElementById(id)) return;
+    const style = document.createElement("style");
+    style.id = id;
+    style.textContent = `
+      .conv-tl-dot { outline: none; }
+      .conv-tl-dot:hover .conv-tl-pip { transform: scale(1.5); }
+      .conv-tl-dot:focus-visible .conv-tl-pip {
+        box-shadow: 0 0 0 2px #0071e3aa !important;
+      }
+    `;
+    document.head.appendChild(style);
+  }, []);
+
+  if (N === 0) return null;
+
+  const dotColor = t.isDark ? "rgba(255,255,255,0.22)" : "rgba(0,0,0,0.18)";
+  const borderColor = t.isDark ? "rgba(255,255,255,0.07)" : "rgba(0,0,0,0.06)";
+  const bgColor = t.isDark ? "rgba(255,255,255,0.025)" : "rgba(0,0,0,0.022)";
+
+  return (
+    <div
+      ref={barRef}
+      style={{
+        width: TL_BAR_WIDTH,
+        flexShrink: 0,
+        position: "relative",
+        overflow: "hidden",
+        alignSelf: "stretch",
+        borderLeft: `1px solid ${borderColor}`,
+        background: bgColor,
+      }}
+    >
+      {/* Inner long-canvas track, moved via translateY */}
+      <div
+        ref={innerRef}
+        style={{
+          position: "absolute",
+          top: 0,
+          left: 0,
+          width: "100%",
+          height: contentHeight,
+          willChange: "transform",
+        }}
+      >
+        {userMsgs.slice(dotRange.start, dotRange.end + 1).map((msg, i) => {
+          const localIdx = dotRange.start + i;
+          const y = yPositions[localIdx];
+          const isActive = localIdx === activeLocalIdx;
+          const preview = msg.text.trim().replace(/\s+/g, " ").slice(0, 44) || "（空消息）";
+          const dotSize = isActive ? TL_DOT_ACTIVE : TL_DOT;
+
+          return (
+            <button
+              key={msg.globalIndex}
+              className="conv-tl-dot"
+              title={preview}
+              aria-label={`跳转：${preview}`}
+              onClick={() => onJumpTo(msg.globalIndex)}
+              style={{
+                position: "absolute",
+                top: y,
+                left: "50%",
+                transform: "translate(-50%, -50%)",
+                width: TL_HIT,
+                height: TL_HIT,
+                border: "none",
+                background: "transparent",
+                cursor: "pointer",
+                padding: 0,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                borderRadius: "50%",
+              }}
+            >
+              <span
+                className="conv-tl-pip"
+                style={{
+                  display: "block",
+                  width: dotSize,
+                  height: dotSize,
+                  borderRadius: "50%",
+                  background: isActive ? "#0071e3" : dotColor,
+                  boxShadow: isActive
+                    ? "0 0 0 2.5px #0071e344, 0 0 7px #0071e366"
+                    : "none",
+                  transition:
+                    "width 0.15s ease, height 0.15s ease, background 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease",
+                  flexShrink: 0,
+                }}
+              />
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function markdownCodeLanguage(className?: string): string {
   const matched = /language-([\w-]+)/.exec(className || "");
   return matched?.[1] || "text";
@@ -175,7 +467,11 @@ function MarkdownCodeBlock({
 // Format ISO 8601 timestamp to "HH:MM"
 function formatMsgTime(iso: string): string {
   try {
-    return new Date(iso).toTimeString().slice(0, 5);
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso;
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    return `${hh}:${mm}`;
   } catch {
     return iso;
   }
@@ -184,7 +480,12 @@ function formatMsgTime(iso: string): string {
 // Format ISO 8601 to "YYYY-MM-DD"
 function formatMsgDate(iso: string): string {
   try {
-    return iso.slice(0, 10);
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso;
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${y}-${m}-${day}`;
   } catch {
     return iso;
   }
@@ -198,6 +499,9 @@ interface ChatViewProps {
 
 export function ChatView({ conversation, mediaDir, mediaVersion = 0 }: ChatViewProps) {
   const t = useTheme();
+  const virtuosoRef = useRef<VirtuosoHandle>(null);
+  const [scrollerEl, setScrollerEl] = useState<HTMLElement | null>(null);
+  const [visibleRange, setVisibleRange] = useState({ startIndex: 0, endIndex: 0 });
   const parseWarning =
     conversation && typeof conversation.parseWarning === "string" && conversation.parseWarning.trim()
       ? conversation.parseWarning.trim()
@@ -235,20 +539,33 @@ export function ChatView({ conversation, mediaDir, mediaVersion = 0 }: ChatViewP
       {conversation.messages.length === 0 ? (
         <div style={{ textAlign: "center", color: t.textMuted, fontSize: 13, marginTop: 60 }}>暂无消息记录</div>
       ) : (
-        <Virtuoso
-          key={`${conversation.id}:${conversation.updatedAt}:${mediaVersion}`}
-          data={conversation.messages}
-          followOutput="smooth"
-          initialTopMostItemIndex={conversation.messages.length - 1}
-          itemContent={(_, msg) => (
-            <MessageBubble
-              message={msg}
-              mediaDir={mediaDir}
-              cacheKey={`${conversation.id}:${conversation.updatedAt}:${mediaVersion}`}
-            />
-          )}
-          style={{ flex: 1 }}
-        />
+        <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
+          <Virtuoso
+            ref={virtuosoRef}
+            scrollerRef={(ref) => setScrollerEl(ref instanceof HTMLElement ? ref : null)}
+            rangeChanged={setVisibleRange}
+            key={`${conversation.id}:${conversation.updatedAt}:${mediaVersion}`}
+            data={conversation.messages}
+            followOutput="smooth"
+            initialTopMostItemIndex={conversation.messages.length - 1}
+            itemContent={(_, msg) => (
+              <MessageBubble
+                message={msg}
+                mediaDir={mediaDir}
+                cacheKey={`${conversation.id}:${conversation.updatedAt}:${mediaVersion}`}
+              />
+            )}
+            style={{ flex: 1 }}
+          />
+          <ConversationTimeline
+            messages={conversation.messages}
+            scrollerEl={scrollerEl}
+            visibleRange={visibleRange}
+            onJumpTo={(idx) =>
+              virtuosoRef.current?.scrollToIndex({ index: idx, behavior: "smooth", align: "start" })
+            }
+          />
+        </div>
       )}
     </div>
   );
