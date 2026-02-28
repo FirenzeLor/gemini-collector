@@ -348,6 +348,8 @@ function ConversationTimeline({ messages, scrollerEl, visibleRange, onJumpTo }: 
         from { opacity: 0; transform: translateY(-50%) translateX(4px); }
         to   { opacity: 1; transform: translateY(-50%) translateX(0); }
       }
+      [data-tl-scroller]::-webkit-scrollbar { display: none; }
+      [data-tl-scroller] { scrollbar-width: none; }
     `;
     document.head.appendChild(style);
   }, []);
@@ -355,12 +357,6 @@ function ConversationTimeline({ messages, scrollerEl, visibleRange, onJumpTo }: 
   if (N === 0) return null;
 
   const dotColor = t.isDark ? "rgba(255,255,255,0.30)" : "rgba(0,0,0,0.22)";
-  const barBg = t.isDark
-    ? "rgba(15,17,22,0.72)"
-    : "rgba(248,248,252,0.72)";
-  const barBorder = t.isDark
-    ? "rgba(255,255,255,0.10)"
-    : "rgba(0,0,0,0.08)";
 
   // Tooltip text: first ~150 chars of the hovered user message
   const tooltipText = hovered !== null
@@ -374,20 +370,14 @@ function ConversationTimeline({ messages, scrollerEl, visibleRange, onJumpTo }: 
         ref={barRef}
         style={{
           position: "absolute",
-          // Stay clear of the native scrollbar (≈15px on macOS "always show" mode)
-          right: 22,
-          // Vertical breathing room from the chat top/bottom
-          top: 8,
-          bottom: 8,
+          // Hug the right edge; dots center at parentRight-18px,
+          // which clears the 20px message padding zone (no text underneath).
+          right: 4,
+          top: 0,
+          bottom: 0,
           width: TL_BAR_WIDTH,
-          background: barBg,
-          backdropFilter: "blur(20px) saturate(130%)",
-          WebkitBackdropFilter: "blur(20px) saturate(130%)",
-          borderRadius: 10,
-          border: `1px solid ${barBorder}`,
-          boxShadow: t.isDark
-            ? "0 2px 20px rgba(0,0,0,0.40)"
-            : "0 2px 20px rgba(0,0,0,0.10)",
+          // Fully transparent — only the dots themselves are visible.
+          background: "transparent",
           zIndex: 10,
           overflow: "hidden",
         }}
@@ -665,7 +655,14 @@ export function ChatView({ conversation, mediaDir, mediaVersion = 0 }: ChatViewP
         <div style={{ flex: 1, position: "relative", overflow: "hidden" }}>
           <Virtuoso
             ref={virtuosoRef}
-            scrollerRef={(ref) => setScrollerEl(ref instanceof HTMLElement ? ref : null)}
+            scrollerRef={(ref) => {
+              if (ref instanceof HTMLElement) {
+                ref.setAttribute("data-tl-scroller", "");
+                setScrollerEl(ref);
+              } else {
+                setScrollerEl(null);
+              }
+            }}
             rangeChanged={setVisibleRange}
             key={`${conversation.id}:${conversation.updatedAt}:${mediaVersion}`}
             data={conversation.messages}
