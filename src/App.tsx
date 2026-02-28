@@ -273,6 +273,11 @@ function App() {
 
   const theme = isDark ? darkTheme : lightTheme;
 
+  // Sync dark mode to <html> class so index.css scrollbar selectors work
+  useEffect(() => {
+    document.documentElement.classList.toggle("dark", isDark);
+  }, [isDark]);
+
   function pruneAutoSyncAttempts(nowMs: number) {
     const map = autoSyncAttemptedAtRef.current;
     for (const [key, ts] of map.entries()) {
