@@ -170,14 +170,31 @@ interface TimelineProps {
   onJumpTo: (globalIndex: number) => void;
 }
 
+interface HoveredInfo {
+  localIdx: number;
+  /** screen-space Y of the dot center */
+  screenY: number;
+  /** screen-space X of the bar's left edge (tooltip anchor) */
+  barLeft: number;
+}
+
 function ConversationTimeline({ messages, scrollerEl, visibleRange, onJumpTo }: TimelineProps) {
   const t = useTheme();
   const barRef = useRef<HTMLDivElement>(null);
-  const innerRef = useRef<HTMLDivElement>(null);
+  // The true scroll container: overflow-y scroll with hidden scrollbar.
+  // scrollTop is driven by main-scroll sync; user wheel also scrolls it independently.
+  const trackRef = useRef<HTMLDivElement>(null);
   const [barHeight, setBarHeight] = useState(0);
   const [dotRange, setDotRange] = useState({ start: 0, end: -1 });
-  // Tracks current translateY offset imperatively (avoids state for animation path)
-  const offsetRef = useRef(0);
+  const [hovered, setHovered] = useState<HoveredInfo | null>(null);
+  // Set to true while we write trackRef.scrollTop programmatically so the
+  // track's own scroll listener can ignore that event.
+  const isSyncingRef = useRef(false);
+
+  // ── Refs holding latest geometry so event listeners stay stable ────────
+  const yPositionsRef = useRef<number[]>([]);
+  const barHeightRef = useRef(0);
+  const contentHeightRef = useRef(0);
 
   // ── Collect user messages with global indices ──────────────────────────
   const userMsgs = useMemo(() => {
@@ -208,7 +225,12 @@ function ConversationTimeline({ messages, scrollerEl, visibleRange, onJumpTo }: 
     return { contentHeight: ch, yPositions: yPos };
   }, [N, barHeight, userMsgs]);
 
-  // ── Active local index: closest user message to mid of visible range ──
+  // Keep refs in sync with latest geometry values
+  useEffect(() => { yPositionsRef.current = yPositions; }, [yPositions]);
+  useEffect(() => { barHeightRef.current = barHeight; }, [barHeight]);
+  useEffect(() => { contentHeightRef.current = contentHeight; }, [contentHeight]);
+
+  // ── Active local index ─────────────────────────────────────────────────
   const activeLocalIdx = useMemo(() => {
     if (N === 0) return 0;
     const mid = Math.round((visibleRange.startIndex + visibleRange.endIndex) / 2);
@@ -219,6 +241,18 @@ function ConversationTimeline({ messages, scrollerEl, visibleRange, onJumpTo }: 
     }
     return idx;
   }, [visibleRange, userMsgs, N]);
+
+  // ── Stable helper: recompute dotRange from a given scrollTop ──────────
+  // Uses refs so this function never changes reference, keeping listeners stable.
+  const updateDotRange = React.useCallback((scrollTop: number) => {
+    const yPos = yPositionsRef.current;
+    const bh = barHeightRef.current;
+    if (yPos.length === 0 || bh === 0) return;
+    const buffer = Math.max(100, bh);
+    const s = lowerBound(yPos, scrollTop - buffer);
+    const e = Math.max(s - 1, upperBound(yPos, scrollTop + bh + buffer));
+    setDotRange(prev => prev.start === s && prev.end === e ? prev : { start: s, end: e });
+  }, []);
 
   // ── ResizeObserver for bar height ──────────────────────────────────────
   useEffect(() => {
@@ -234,42 +268,52 @@ function ConversationTimeline({ messages, scrollerEl, visibleRange, onJumpTo }: 
     return () => ro.disconnect();
   }, []);
 
-  // ── Recompute dotRange when geometry changes (before scroll sync fires) ─
+  // ── Recompute visible dots when geometry changes ───────────────────────
   useEffect(() => {
     if (yPositions.length === 0 || barHeight === 0) return;
-    const offset = offsetRef.current;
-    const buffer = Math.max(100, barHeight);
-    const s = lowerBound(yPositions, offset - buffer);
-    const e = Math.max(s - 1, upperBound(yPositions, offset + barHeight + buffer));
-    setDotRange({ start: s, end: e });
-  }, [yPositions, barHeight]);
+    updateDotRange(trackRef.current?.scrollTop ?? 0);
+  }, [yPositions, barHeight, updateDotRange]);
 
-  // ── Scroll sync: main scroller → translateY of inner track ────────────
+  // ── Track scroll listener: user-driven wheel on the timeline ──────────
+  // When the user scrolls the track independently, update the virtual window
+  // without touching the main scroller. isSyncingRef guards against echoing
+  // our own programmatic scrollTop writes.
   useEffect(() => {
-    const inner = innerRef.current;
-    if (!scrollerEl || !inner || barHeight === 0 || yPositions.length === 0) return;
+    const track = trackRef.current;
+    if (!track) return;
+    const onTrackScroll = () => {
+      if (isSyncingRef.current) return;
+      updateDotRange(track.scrollTop);
+    };
+    track.addEventListener("scroll", onTrackScroll, { passive: true });
+    return () => track.removeEventListener("scroll", onTrackScroll);
+  }, [updateDotRange]);
+
+  // ── Main scroller → track sync ─────────────────────────────────────────
+  useEffect(() => {
+    const track = trackRef.current;
+    if (!scrollerEl || !track) return;
 
     let rafId: number | null = null;
 
     const sync = () => {
       rafId = null;
+      const bh = barHeightRef.current;
+      const ch = contentHeightRef.current;
+      if (bh === 0 || yPositionsRef.current.length === 0) return;
+
       const { scrollTop, scrollHeight, clientHeight } = scrollerEl;
       const maxMain = Math.max(1, scrollHeight - clientHeight);
       const ratio = Math.max(0, Math.min(1, scrollTop / maxMain));
-      const maxTimeline = Math.max(0, contentHeight - barHeight);
+      const maxTimeline = Math.max(0, ch - bh);
       const target = Math.round(ratio * maxTimeline);
 
-      if (Math.abs(offsetRef.current - target) > 1) {
-        offsetRef.current = target;
-        inner.style.transform = `translateY(-${target}px)`;
-
-        // Update virtual window
-        const buffer = Math.max(100, barHeight);
-        const s = lowerBound(yPositions, target - buffer);
-        const e = Math.max(s - 1, upperBound(yPositions, target + barHeight + buffer));
-        setDotRange(prev =>
-          prev.start === s && prev.end === e ? prev : { start: s, end: e },
-        );
+      if (Math.abs(track.scrollTop - target) > 1) {
+        // Mark as programmatic so onTrackScroll ignores it
+        isSyncingRef.current = true;
+        track.scrollTop = target;
+        isSyncingRef.current = false;
+        updateDotRange(target);
       }
     };
 
@@ -279,24 +323,30 @@ function ConversationTimeline({ messages, scrollerEl, visibleRange, onJumpTo }: 
     };
 
     scrollerEl.addEventListener("scroll", onScroll, { passive: true });
-    sync(); // initial alignment
+    sync(); // initial alignment on mount / conversation change
     return () => {
       scrollerEl.removeEventListener("scroll", onScroll);
       if (rafId !== null) cancelAnimationFrame(rafId);
     };
-  }, [scrollerEl, contentHeight, barHeight, yPositions]);
+  }, [scrollerEl, updateDotRange]);
 
-  // ── Inject hover / focus styles once ──────────────────────────────────
+  // ── Inject CSS once: hide scrollbar + dot hover / focus styles ─────────
   useEffect(() => {
     const id = "conv-timeline-styles";
     if (document.getElementById(id)) return;
     const style = document.createElement("style");
     style.id = id;
     style.textContent = `
+      .conv-tl-track::-webkit-scrollbar { display: none; }
+      .conv-tl-track { scrollbar-width: none; }
       .conv-tl-dot { outline: none; }
-      .conv-tl-dot:hover .conv-tl-pip { transform: scale(1.5); }
+      .conv-tl-dot:hover .conv-tl-pip { transform: scale(1.55) !important; }
       .conv-tl-dot:focus-visible .conv-tl-pip {
-        box-shadow: 0 0 0 2px #0071e3aa !important;
+        outline: 2px solid #0071e3; outline-offset: 3px;
+      }
+      @keyframes conv-tl-tooltip-in {
+        from { opacity: 0; transform: translateY(-50%) translateX(4px); }
+        to   { opacity: 1; transform: translateY(-50%) translateX(0); }
       }
     `;
     document.head.appendChild(style);
@@ -304,87 +354,158 @@ function ConversationTimeline({ messages, scrollerEl, visibleRange, onJumpTo }: 
 
   if (N === 0) return null;
 
-  const dotColor = t.isDark ? "rgba(255,255,255,0.22)" : "rgba(0,0,0,0.18)";
-  const borderColor = t.isDark ? "rgba(255,255,255,0.07)" : "rgba(0,0,0,0.06)";
-  const bgColor = t.isDark ? "rgba(255,255,255,0.025)" : "rgba(0,0,0,0.022)";
+  const dotColor = t.isDark ? "rgba(255,255,255,0.30)" : "rgba(0,0,0,0.22)";
+  const barBg = t.isDark
+    ? "rgba(15,17,22,0.72)"
+    : "rgba(248,248,252,0.72)";
+  const barBorder = t.isDark
+    ? "rgba(255,255,255,0.10)"
+    : "rgba(0,0,0,0.08)";
+
+  // Tooltip text: first ~150 chars of the hovered user message
+  const tooltipText = hovered !== null
+    ? (userMsgs[hovered.localIdx]?.text ?? "").trim().replace(/\s+/g, " ").slice(0, 150)
+    : "";
 
   return (
-    <div
-      ref={barRef}
-      style={{
-        width: TL_BAR_WIDTH,
-        flexShrink: 0,
-        position: "relative",
-        overflow: "hidden",
-        alignSelf: "stretch",
-        borderLeft: `1px solid ${borderColor}`,
-        background: bgColor,
-      }}
-    >
-      {/* Inner long-canvas track, moved via translateY */}
+    <>
+      {/* ── Floating frosted-glass bar (absolute, overlaid) ── */}
       <div
-        ref={innerRef}
+        ref={barRef}
         style={{
           position: "absolute",
+          right: 0,
           top: 0,
-          left: 0,
-          width: "100%",
-          height: contentHeight,
-          willChange: "transform",
+          bottom: 0,
+          width: TL_BAR_WIDTH,
+          background: barBg,
+          backdropFilter: "blur(20px) saturate(130%)",
+          WebkitBackdropFilter: "blur(20px) saturate(130%)",
+          borderRadius: "10px 0 0 10px",
+          border: `1px solid ${barBorder}`,
+          borderRight: "none",
+          boxShadow: t.isDark
+            ? "-2px 0 16px rgba(0,0,0,0.35)"
+            : "-2px 0 16px rgba(0,0,0,0.08)",
+          zIndex: 10,
+          overflow: "hidden",
         }}
       >
-        {userMsgs.slice(dotRange.start, dotRange.end + 1).map((msg, i) => {
-          const localIdx = dotRange.start + i;
-          const y = yPositions[localIdx];
-          const isActive = localIdx === activeLocalIdx;
-          const preview = msg.text.trim().replace(/\s+/g, " ").slice(0, 44) || "（空消息）";
-          const dotSize = isActive ? TL_DOT_ACTIVE : TL_DOT;
+        {/* ── Scrollable track (overflow-y scroll, scrollbar hidden via CSS) ── */}
+        <div
+          ref={trackRef}
+          className="conv-tl-track"
+          style={{
+            width: "100%",
+            height: "100%",
+            overflowY: "scroll",
+          }}
+        >
+          {/* Long-canvas content */}
+          <div style={{ position: "relative", height: contentHeight, width: "100%" }}>
+            {userMsgs.slice(dotRange.start, dotRange.end + 1).map((msg, i) => {
+              const localIdx = dotRange.start + i;
+              const y = yPositions[localIdx];
+              const isActive = localIdx === activeLocalIdx;
+              const dotSize = isActive ? TL_DOT_ACTIVE : TL_DOT;
 
-          return (
-            <button
-              key={msg.globalIndex}
-              className="conv-tl-dot"
-              title={preview}
-              aria-label={`跳转：${preview}`}
-              onClick={() => onJumpTo(msg.globalIndex)}
-              style={{
-                position: "absolute",
-                top: y,
-                left: "50%",
-                transform: "translate(-50%, -50%)",
-                width: TL_HIT,
-                height: TL_HIT,
-                border: "none",
-                background: "transparent",
-                cursor: "pointer",
-                padding: 0,
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                borderRadius: "50%",
-              }}
-            >
-              <span
-                className="conv-tl-pip"
-                style={{
-                  display: "block",
-                  width: dotSize,
-                  height: dotSize,
-                  borderRadius: "50%",
-                  background: isActive ? "#0071e3" : dotColor,
-                  boxShadow: isActive
-                    ? "0 0 0 2.5px #0071e344, 0 0 7px #0071e366"
-                    : "none",
-                  transition:
-                    "width 0.15s ease, height 0.15s ease, background 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease",
-                  flexShrink: 0,
-                }}
-              />
-            </button>
-          );
-        })}
+              return (
+                <button
+                  key={msg.globalIndex}
+                  className="conv-tl-dot"
+                  aria-label={`跳转到：${msg.text.slice(0, 40)}`}
+                  onClick={() => onJumpTo(msg.globalIndex)}
+                  onMouseEnter={(e) => {
+                    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                    const barRect = barRef.current?.getBoundingClientRect();
+                    setHovered({
+                      localIdx,
+                      screenY: rect.top + rect.height / 2,
+                      barLeft: barRect?.left ?? rect.left,
+                    });
+                  }}
+                  onMouseLeave={() => setHovered(null)}
+                  style={{
+                    position: "absolute",
+                    top: y,
+                    left: "50%",
+                    transform: "translate(-50%, -50%)",
+                    width: TL_HIT,
+                    height: TL_HIT,
+                    border: "none",
+                    background: "transparent",
+                    cursor: "pointer",
+                    padding: 0,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    borderRadius: "50%",
+                  }}
+                >
+                  <span
+                    className="conv-tl-pip"
+                    style={{
+                      display: "block",
+                      width: dotSize,
+                      height: dotSize,
+                      borderRadius: "50%",
+                      background: isActive ? "#0071e3" : dotColor,
+                      boxShadow: isActive
+                        ? "0 0 0 2.5px #0071e340, 0 0 8px #0071e360"
+                        : "none",
+                      transition:
+                        "width 0.15s ease, height 0.15s ease, background 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease",
+                      flexShrink: 0,
+                    }}
+                  />
+                </button>
+              );
+            })}
+          </div>
+        </div>
       </div>
-    </div>
+
+      {/* ── Tooltip card (position:fixed — not clipped by parent overflow) ── */}
+      {hovered !== null && tooltipText && (
+        <div
+          style={{
+            position: "fixed",
+            // anchor to the bar's left edge, 10px gap
+            right: window.innerWidth - hovered.barLeft + 10,
+            // center on the dot's Y, clamped to stay on screen
+            top: Math.max(8, Math.min(
+              window.innerHeight - 120,
+              hovered.screenY,
+            )),
+            transform: "translateY(-50%)",
+            zIndex: 1000,
+            maxWidth: 240,
+            pointerEvents: "none",
+            background: t.isDark
+              ? "rgba(20,23,30,0.92)"
+              : "rgba(255,255,255,0.94)",
+            backdropFilter: "blur(18px) saturate(120%)",
+            WebkitBackdropFilter: "blur(18px) saturate(120%)",
+            borderRadius: 10,
+            border: t.isDark
+              ? "1px solid rgba(255,255,255,0.13)"
+              : "1px solid rgba(0,0,0,0.09)",
+            padding: "9px 13px",
+            fontSize: 12.5,
+            lineHeight: 1.55,
+            color: t.text,
+            boxShadow: "0 6px 24px rgba(0,0,0,0.22)",
+            wordBreak: "break-word",
+            whiteSpace: "pre-wrap",
+            overflow: "hidden",
+            // Fade in
+            animation: "conv-tl-tooltip-in 0.12s ease",
+          }}
+        >
+          {tooltipText}
+        </div>
+      )}
+    </>
   );
 }
 
@@ -539,7 +660,8 @@ export function ChatView({ conversation, mediaDir, mediaVersion = 0 }: ChatViewP
       {conversation.messages.length === 0 ? (
         <div style={{ textAlign: "center", color: t.textMuted, fontSize: 13, marginTop: 60 }}>暂无消息记录</div>
       ) : (
-        <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
+        // position:relative so the absolutely-positioned timeline bar can anchor to it
+        <div style={{ flex: 1, position: "relative", overflow: "hidden" }}>
           <Virtuoso
             ref={virtuosoRef}
             scrollerRef={(ref) => setScrollerEl(ref instanceof HTMLElement ? ref : null)}
@@ -555,7 +677,7 @@ export function ChatView({ conversation, mediaDir, mediaVersion = 0 }: ChatViewP
                 cacheKey={`${conversation.id}:${conversation.updatedAt}:${mediaVersion}`}
               />
             )}
-            style={{ flex: 1 }}
+            style={{ position: "absolute", inset: 0 }}
           />
           <ConversationTimeline
             messages={conversation.messages}
