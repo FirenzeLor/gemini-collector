@@ -181,15 +181,13 @@ interface HoveredInfo {
 function ConversationTimeline({ messages, scrollerEl, visibleRange, onJumpTo }: TimelineProps) {
   const t = useTheme();
   const barRef = useRef<HTMLDivElement>(null);
-  // The true scroll container: overflow-y scroll with hidden scrollbar.
-  // scrollTop is driven by main-scroll sync; user wheel also scrolls it independently.
-  const trackRef = useRef<HTMLDivElement>(null);
+  // Long-canvas inner div; moved via translateY (no scroll container = no scrollbar artifact).
+  const innerRef = useRef<HTMLDivElement>(null);
+  // Current timeline offset in px (mirrors innerRef transform).
+  const offsetRef = useRef(0);
   const [barHeight, setBarHeight] = useState(0);
   const [dotRange, setDotRange] = useState({ start: 0, end: -1 });
   const [hovered, setHovered] = useState<HoveredInfo | null>(null);
-  // Set to true while we write trackRef.scrollTop programmatically so the
-  // track's own scroll listener can ignore that event.
-  const isSyncingRef = useRef(false);
 
   // ── Refs holding latest geometry so event listeners stay stable ────────
   const yPositionsRef = useRef<number[]>([]);
@@ -271,63 +269,58 @@ function ConversationTimeline({ messages, scrollerEl, visibleRange, onJumpTo }: 
   // ── Recompute visible dots when geometry changes ───────────────────────
   useEffect(() => {
     if (yPositions.length === 0 || barHeight === 0) return;
-    updateDotRange(trackRef.current?.scrollTop ?? 0);
+    updateDotRange(offsetRef.current);
   }, [yPositions, barHeight, updateDotRange]);
 
-  // ── Track scroll listener: user-driven wheel on the timeline ──────────
-  // When the user scrolls the track independently, update the virtual window
-  // without touching the main scroller. isSyncingRef guards against echoing
-  // our own programmatic scrollTop writes.
+  // ── Wheel capture on bar: independent timeline scroll ─────────────────
   useEffect(() => {
-    const track = trackRef.current;
-    if (!track) return;
-    const onTrackScroll = () => {
-      if (isSyncingRef.current) return;
-      updateDotRange(track.scrollTop);
+    const bar = barRef.current;
+    if (!bar) return;
+    const handleWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const ch = contentHeightRef.current;
+      const bh = barHeightRef.current;
+      const maxOffset = Math.max(0, ch - bh);
+      const newOffset = Math.max(0, Math.min(maxOffset, offsetRef.current + e.deltaY));
+      if (Math.abs(newOffset - offsetRef.current) > 0.5) {
+        offsetRef.current = newOffset;
+        if (innerRef.current) {
+          innerRef.current.style.transform = `translateY(-${newOffset}px)`;
+        }
+        updateDotRange(newOffset);
+      }
     };
-    track.addEventListener("scroll", onTrackScroll, { passive: true });
-    return () => track.removeEventListener("scroll", onTrackScroll);
+    bar.addEventListener("wheel", handleWheel, { passive: false });
+    return () => bar.removeEventListener("wheel", handleWheel);
   }, [updateDotRange]);
 
-  // ── Main scroller → track sync ─────────────────────────────────────────
+  // ── Main scroller → translateY sync ───────────────────────────────────
   useEffect(() => {
-    const track = trackRef.current;
-    if (!scrollerEl || !track) return;
-
+    if (!scrollerEl) return;
     let rafId: number | null = null;
-
     const sync = () => {
       rafId = null;
+      const inner = innerRef.current;
+      if (!inner) return;
       const bh = barHeightRef.current;
       const ch = contentHeightRef.current;
       if (bh === 0 || yPositionsRef.current.length === 0) return;
-
       const { scrollTop, scrollHeight, clientHeight } = scrollerEl;
       const maxMain = Math.max(1, scrollHeight - clientHeight);
       const ratio = Math.max(0, Math.min(1, scrollTop / maxMain));
       const maxTimeline = Math.max(0, ch - bh);
       const target = Math.round(ratio * maxTimeline);
-
-      if (Math.abs(track.scrollTop - target) > 1) {
-        // Mark as programmatic so onTrackScroll ignores it
-        isSyncingRef.current = true;
-        track.scrollTop = target;
-        isSyncingRef.current = false;
+      if (Math.abs(offsetRef.current - target) > 1) {
+        offsetRef.current = target;
+        inner.style.transform = `translateY(-${target}px)`;
         updateDotRange(target);
       }
     };
-
-    const onScroll = () => {
-      if (rafId !== null) return;
-      rafId = requestAnimationFrame(sync);
-    };
-
+    const onScroll = () => { if (rafId !== null) return; rafId = requestAnimationFrame(sync); };
     scrollerEl.addEventListener("scroll", onScroll, { passive: true });
-    sync(); // initial alignment on mount / conversation change
-    return () => {
-      scrollerEl.removeEventListener("scroll", onScroll);
-      if (rafId !== null) cancelAnimationFrame(rafId);
-    };
+    sync();
+    return () => { scrollerEl.removeEventListener("scroll", onScroll); if (rafId !== null) cancelAnimationFrame(rafId); };
   }, [scrollerEl, updateDotRange]);
 
   // ── Inject CSS once: hide scrollbar + dot hover / focus styles ─────────
@@ -337,8 +330,6 @@ function ConversationTimeline({ messages, scrollerEl, visibleRange, onJumpTo }: 
     const style = document.createElement("style");
     style.id = id;
     style.textContent = `
-      .conv-tl-track::-webkit-scrollbar { display: none; }
-      .conv-tl-track { scrollbar-width: none; }
       .conv-tl-dot { outline: none; }
       .conv-tl-dot:hover .conv-tl-pip { transform: scale(1.55) !important; }
       .conv-tl-dot:focus-visible .conv-tl-pip {
@@ -348,8 +339,6 @@ function ConversationTimeline({ messages, scrollerEl, visibleRange, onJumpTo }: 
         from { opacity: 0; transform: translateY(-50%) translateX(4px); }
         to   { opacity: 1; transform: translateY(-50%) translateX(0); }
       }
-      [data-tl-scroller]::-webkit-scrollbar { display: none; }
-      [data-tl-scroller] { scrollbar-width: none; }
     `;
     document.head.appendChild(style);
   }, []);
@@ -382,19 +371,19 @@ function ConversationTimeline({ messages, scrollerEl, visibleRange, onJumpTo }: 
           overflow: "hidden",
         }}
       >
-        {/* ── Scrollable track (overflow-y scroll, scrollbar hidden via CSS) ── */}
+        {/* ── Long-canvas inner div, moved via translateY (no scroll container) ── */}
         <div
-          ref={trackRef}
-          className="conv-tl-track"
+          ref={innerRef}
           style={{
+            position: "absolute",
+            top: 0,
+            left: 0,
             width: "100%",
-            height: "100%",
-            overflowY: "scroll",
+            height: contentHeight,
+            willChange: "transform",
           }}
         >
-          {/* Long-canvas content */}
-          <div style={{ position: "relative", height: contentHeight, width: "100%" }}>
-            {userMsgs.slice(dotRange.start, dotRange.end + 1).map((msg, i) => {
+          {userMsgs.slice(dotRange.start, dotRange.end + 1).map((msg, i) => {
               const localIdx = dotRange.start + i;
               const y = yPositions[localIdx];
               const isActive = localIdx === activeLocalIdx;
@@ -452,7 +441,6 @@ function ConversationTimeline({ messages, scrollerEl, visibleRange, onJumpTo }: 
                 </button>
               );
             })}
-          </div>
         </div>
       </div>
 
@@ -461,8 +449,8 @@ function ConversationTimeline({ messages, scrollerEl, visibleRange, onJumpTo }: 
         <div
           style={{
             position: "fixed",
-            // anchor to the bar's left edge, 10px gap
-            right: window.innerWidth - hovered.barLeft + 10,
+            // Fixed offset from viewport right: bar is right:4 + width:20 = 24px, +6px gap = 30px
+            right: TL_BAR_WIDTH + 4 + 6,
             // center on the dot's Y, clamped to stay on screen
             top: Math.max(8, Math.min(
               window.innerHeight - 120,
