@@ -374,19 +374,20 @@ function ConversationTimeline({ messages, scrollerEl, visibleRange, onJumpTo }: 
         ref={barRef}
         style={{
           position: "absolute",
-          right: 0,
-          top: 0,
-          bottom: 0,
+          // Stay clear of the native scrollbar (≈15px on macOS "always show" mode)
+          right: 22,
+          // Vertical breathing room from the chat top/bottom
+          top: 8,
+          bottom: 8,
           width: TL_BAR_WIDTH,
           background: barBg,
           backdropFilter: "blur(20px) saturate(130%)",
           WebkitBackdropFilter: "blur(20px) saturate(130%)",
-          borderRadius: "10px 0 0 10px",
+          borderRadius: 10,
           border: `1px solid ${barBorder}`,
-          borderRight: "none",
           boxShadow: t.isDark
-            ? "-2px 0 16px rgba(0,0,0,0.35)"
-            : "-2px 0 16px rgba(0,0,0,0.08)",
+            ? "0 2px 20px rgba(0,0,0,0.40)"
+            : "0 2px 20px rgba(0,0,0,0.10)",
           zIndex: 10,
           overflow: "hidden",
         }}
