@@ -29,9 +29,6 @@
   background: rgba(0,0,0,0.25);
 }
 
-/* Hide Virtuoso chat scroller native scrollbar (timeline bar provides navigation) */
-[data-tl-scroller]::-webkit-scrollbar { display: none; }
-[data-tl-scroller] { scrollbar-width: none; }
 
 @keyframes mediaLoadingDiagonalSweep {
   0% {
