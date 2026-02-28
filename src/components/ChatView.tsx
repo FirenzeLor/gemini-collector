@@ -97,12 +97,13 @@ function fixMarkdown(content: string): string {
 }
 
 // ─── Timeline constants ────────────────────────────────────────────────────
-const TL_PAD = 12;       // top/bottom padding inside long canvas (px)
-const TL_MIN_GAP = 12;   // minimum vertical gap between dots (px)
+const TL_PAD = 18;       // top/bottom padding inside long canvas (px)
+const TL_MIN_GAP = 18;   // minimum vertical gap between dots (px)
 const TL_BAR_WIDTH = 20; // total bar width (px)
-const TL_HIT = 28;       // dot hit-area size (px)
-const TL_DOT = 6;        // normal dot visual diameter (px)
-const TL_DOT_ACTIVE = 10; // active dot visual diameter (px)
+const TL_BAR_RIGHT = 6;  // bar distance from right edge of parent (px)
+const TL_HIT = 20;       // dot hit-area size (px)
+const TL_DOT = 9;        // normal dot visual diameter (px)
+const TL_DOT_ACTIVE = 14; // active dot visual diameter (px)
 
 // ─── Timeline utility functions ────────────────────────────────────────────
 
@@ -187,7 +188,8 @@ function ConversationTimeline({ messages, scrollerEl, visibleRange, onJumpTo }: 
   const offsetRef = useRef(0);
   const [barHeight, setBarHeight] = useState(0);
   const [dotRange, setDotRange] = useState({ start: 0, end: -1 });
-  const [hovered, setHovered] = useState<HoveredInfo | null>(null);
+  const [hovered, setHovered] = useState<{ info: HoveredInfo; visible: boolean } | null>(null);
+  const tooltipTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ── Refs holding latest geometry so event listeners stay stable ────────
   const yPositionsRef = useRef<number[]>([]);
@@ -251,6 +253,9 @@ function ConversationTimeline({ messages, scrollerEl, visibleRange, onJumpTo }: 
     const e = Math.max(s - 1, upperBound(yPos, scrollTop + bh + buffer));
     setDotRange(prev => prev.start === s && prev.end === e ? prev : { start: s, end: e });
   }, []);
+
+  // ── Cleanup tooltip fade-out timer on unmount ─────────────────────────
+  useEffect(() => () => { if (tooltipTimerRef.current) clearTimeout(tooltipTimerRef.current); }, []);
 
   // ── ResizeObserver for bar height ──────────────────────────────────────
   useEffect(() => {
@@ -336,8 +341,12 @@ function ConversationTimeline({ messages, scrollerEl, visibleRange, onJumpTo }: 
         outline: 2px solid #0071e3; outline-offset: 3px;
       }
       @keyframes conv-tl-tooltip-in {
-        from { opacity: 0; transform: translateY(-50%) translateX(4px); }
+        from { opacity: 0; transform: translateY(-50%) translateX(6px); }
         to   { opacity: 1; transform: translateY(-50%) translateX(0); }
+      }
+      @keyframes conv-tl-tooltip-out {
+        from { opacity: 1; transform: translateY(-50%) translateX(0); }
+        to   { opacity: 0; transform: translateY(-50%) translateX(6px); }
       }
     `;
     document.head.appendChild(style);
@@ -349,7 +358,7 @@ function ConversationTimeline({ messages, scrollerEl, visibleRange, onJumpTo }: 
 
   // Tooltip text: first ~150 chars of the hovered user message
   const tooltipText = hovered !== null
-    ? (userMsgs[hovered.localIdx]?.text ?? "").trim().replace(/\s+/g, " ").slice(0, 150)
+    ? (userMsgs[hovered.info.localIdx]?.text ?? "").trim().replace(/\s+/g, " ").slice(0, 150)
     : "";
 
   return (
@@ -361,7 +370,7 @@ function ConversationTimeline({ messages, scrollerEl, visibleRange, onJumpTo }: 
           position: "absolute",
           // Hug the right edge; dots center at parentRight-18px,
           // which clears the 20px message padding zone (no text underneath).
-          right: 4,
+          right: TL_BAR_RIGHT,
           top: 0,
           bottom: 0,
           width: TL_BAR_WIDTH,
@@ -396,15 +405,22 @@ function ConversationTimeline({ messages, scrollerEl, visibleRange, onJumpTo }: 
                   aria-label={`跳转到：${msg.text.slice(0, 40)}`}
                   onClick={() => onJumpTo(msg.globalIndex)}
                   onMouseEnter={(e) => {
+                    if (tooltipTimerRef.current) clearTimeout(tooltipTimerRef.current);
                     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
                     const barRect = barRef.current?.getBoundingClientRect();
                     setHovered({
-                      localIdx,
-                      screenY: rect.top + rect.height / 2,
-                      barLeft: barRect?.left ?? rect.left,
+                      info: {
+                        localIdx,
+                        screenY: rect.top + rect.height / 2,
+                        barLeft: barRect?.left ?? rect.left,
+                      },
+                      visible: true,
                     });
                   }}
-                  onMouseLeave={() => setHovered(null)}
+                  onMouseLeave={() => {
+                    setHovered(prev => prev ? { ...prev, visible: false } : null);
+                    tooltipTimerRef.current = setTimeout(() => setHovered(null), 180);
+                  }}
                   style={{
                     position: "absolute",
                     top: y,
@@ -449,14 +465,17 @@ function ConversationTimeline({ messages, scrollerEl, visibleRange, onJumpTo }: 
         <div
           style={{
             position: "fixed",
-            // Fixed offset from viewport right: bar is right:4 + width:20 = 24px, +6px gap = 30px
-            right: TL_BAR_WIDTH + 4 + 6,
+            // Fixed offset from viewport right: bar occupies [TL_BAR_RIGHT, TL_BAR_RIGHT+TL_BAR_WIDTH], +6px gap
+            right: TL_BAR_RIGHT + TL_BAR_WIDTH + 6,
             // center on the dot's Y, clamped to stay on screen
             top: Math.max(8, Math.min(
               window.innerHeight - 120,
-              hovered.screenY,
+              hovered.info.screenY,
             )),
-            transform: "translateY(-50%)",
+            // Symmetric fade in/out: same keyframe magnitude both directions
+            animation: hovered.visible
+              ? "conv-tl-tooltip-in 0.16s ease forwards"
+              : "conv-tl-tooltip-out 0.16s ease forwards",
             zIndex: 1000,
             maxWidth: 240,
             pointerEvents: "none",
@@ -477,8 +496,6 @@ function ConversationTimeline({ messages, scrollerEl, visibleRange, onJumpTo }: 
             wordBreak: "break-word",
             whiteSpace: "pre-wrap",
             overflow: "hidden",
-            // Fade in
-            animation: "conv-tl-tooltip-in 0.12s ease",
           }}
         >
           {tooltipText}
@@ -1035,7 +1052,7 @@ function MessageBubble({
   ) : null;
 
   return (
-    <div style={{ display: "flex", justifyContent: isUser ? "flex-end" : "flex-start", padding: "4px 20px", gap: 8 }}>
+    <div style={{ display: "flex", justifyContent: isUser ? "flex-end" : "flex-start", padding: "4px 26px 4px 20px", gap: 8 }}>
       <div style={{ maxWidth: isUser ? "62%" : "94%" }}>
         {isUser && attachmentsBlock}
         {hasText && (
