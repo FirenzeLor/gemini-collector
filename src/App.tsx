@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -11,6 +11,7 @@ import { Account, Conversation, ConversationSummary } from "./data/types";
 import { ThemeContext, lightTheme, darkTheme } from "./theme";
 
 type Screen = "account-picker" | "chat";
+type ConversationSortMode = "updated_desc" | "size_desc";
 const AUTO_SYNC_RETRY_MS = 60 * 1000;
 const AUTO_SYNC_STALE_MS = 24 * 60 * 60 * 1000;
 const AUTO_SYNC_TRACK_MAX = 500;
@@ -184,19 +185,12 @@ function parseSummariesPayload(json: string): ConversationSummary[] {
   try {
     const parsed: unknown = JSON.parse(json);
     if (!Array.isArray(parsed)) return [];
-    const items = parsed
+    return parsed
       .filter((item): item is Record<string, unknown> => isObjectRecord(item))
       .map((item) => ({
         ...(item as unknown as ConversationSummary),
         status: toNonEmptyStringOrNull(item.status) ?? "normal",
       }));
-    return items.sort((a, b) => {
-      const ta = Date.parse(a.updatedAt ?? "");
-      const tb = Date.parse(b.updatedAt ?? "");
-      const va = Number.isNaN(ta) ? -Infinity : ta;
-      const vb = Number.isNaN(tb) ? -Infinity : tb;
-      return vb - va;
-    });
   } catch {
     return [];
   }
@@ -204,6 +198,36 @@ function parseSummariesPayload(json: string): ConversationSummary[] {
 
 function isHiddenSummary(summary: ConversationSummary): boolean {
   return summary.status === "hidden";
+}
+
+function summaryUpdatedSortValue(summary: ConversationSummary): number {
+  const ts = Date.parse(summary.updatedAt ?? "");
+  return Number.isNaN(ts) ? -Infinity : ts;
+}
+
+function summarySizeSortValue(summary: ConversationSummary): number {
+  if (!Number.isFinite(summary.messageCount)) return 0;
+  return Math.max(0, summary.messageCount);
+}
+
+function sortConversationSummaries(
+  items: ConversationSummary[],
+  mode: ConversationSortMode,
+): ConversationSummary[] {
+  return [...items].sort((a, b) => {
+    const updatedDiff = summaryUpdatedSortValue(b) - summaryUpdatedSortValue(a);
+    const sizeDiff = summarySizeSortValue(b) - summarySizeSortValue(a);
+
+    if (mode === "size_desc") {
+      if (sizeDiff !== 0) return sizeDiff;
+      if (updatedDiff !== 0) return updatedDiff;
+    } else {
+      if (updatedDiff !== 0) return updatedDiff;
+      if (sizeDiff !== 0) return sizeDiff;
+    }
+
+    return a.id.localeCompare(b.id);
+  });
 }
 
 function parseConversationPayload(json: string): Conversation | null {
@@ -239,6 +263,7 @@ function App() {
   const [exportNotice, setExportNotice] = useState<{ title: string; lines: string[] } | null>(null);
   const [clearingAccountData, setClearingAccountData] = useState(false);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [conversationSortMode, setConversationSortMode] = useState<ConversationSortMode>("updated_desc");
   const [isDark, setIsDark] = useState(false);
   const autoSyncAttemptedAtRef = useRef<Map<string, number>>(new Map());
   const hasSyncingRef = useRef(false);
@@ -810,7 +835,10 @@ function App() {
 
   const anySyncTaskRunning =
     listSyncing || fullSyncing || syncingConversationIds.length > 0 || exportingAccountData || preparingExportData;
-  const visibleConversationSummaries = conversationSummaries.filter((c) => !isHiddenSummary(c));
+  const visibleConversationSummaries = useMemo(() => {
+    const visibleItems = conversationSummaries.filter((c) => !isHiddenSummary(c));
+    return sortConversationSummaries(visibleItems, conversationSortMode);
+  }, [conversationSummaries, conversationSortMode]);
   const selectedSummary = selectedId
     ? visibleConversationSummaries.find((c) => c.id === selectedId) ?? null
     : null;
@@ -855,6 +883,10 @@ function App() {
         />
         <Sidebar
           conversations={visibleConversationSummaries}
+          conversationSortMode={conversationSortMode}
+          onToggleConversationSort={() =>
+            setConversationSortMode((prev) => (prev === "updated_desc" ? "size_desc" : "updated_desc"))
+          }
           selectedId={selectedId}
           onSelect={setSelectedId}
           collapsed={sidebarCollapsed}

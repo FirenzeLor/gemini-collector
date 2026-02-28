@@ -226,6 +226,7 @@ class GeminiWorker:
             user=authuser,
             account_id=account_id,
             account_email=email,
+            cookies_refresher=self._cookies_loader,
         )
         with contextlib.redirect_stdout(sys.stderr):
             exporter.init_auth()
@@ -241,9 +242,7 @@ class GeminiWorker:
         try:
             return fn(exporter)
         except Exception as exc:
-            if self._is_backoff_limit_error(exc):
-                raise
-            if not self._is_auth_error(exc):
+            if not self._is_auth_error(exc) and not self._is_backoff_limit_error(exc):
                 raise
             exporter = self._get_exporter(account_id, force_refresh=True)
             return fn(exporter)
@@ -358,13 +357,13 @@ class GeminiWorker:
     ) -> Dict[str, Any]:
         total = len(conv_ids)
         if total == 0:
-            self._log(phase, "当前对话任务列表更新进度: 0/0")
+            self._log(phase, "进度: 0/0")
             self._emit_job_state(job, "running", phase=phase, progress={"current": 0, "total": 0})
             return {"succeeded": [], "failed": []}
 
         succeeded: list[str] = []
         failed: list[str] = []
-        self._log(phase, f"当前对话任务列表更新进度: 0/{total}")
+        self._log(phase, f"进度: 0/{total}")
 
         for idx, cid in enumerate(conv_ids, start=1):
             sub_job = {
@@ -398,8 +397,7 @@ class GeminiWorker:
 
             self._log(
                 phase,
-                f"当前对话任务列表更新进度: {idx}/{total}"
-                f" (success={len(succeeded)}, failed={len(failed)}, cid={cid})",
+                f"进度: {idx}/{total} ok={len(succeeded)} fail={len(failed)} cid={cid}",
             )
             self._emit_job_state(
                 job,
@@ -410,14 +408,15 @@ class GeminiWorker:
 
         return {"succeeded": succeeded, "failed": failed}
 
-    def _execute_sync_list(self, job: Dict[str, Any]) -> Dict[str, Any]:
+    def _execute_sync_list(self, job: Dict[str, Any], stop_on_unchanged: bool = False) -> Dict[str, Any]:
         account_id = job["accountId"]
 
         def run(exporter: Any) -> Dict[str, Any]:
             with contextlib.redirect_stdout(sys.stderr):
-                exporter.export_list_only(output_dir=str(self.output_dir))
+                list_result = exporter.export_list_only(output_dir=str(self.output_dir), stop_on_unchanged=stop_on_unchanged)
             total = len(self._load_conversation_ids(account_id))
-            return {"total": total}
+            updated_ids = list_result.get("updatedIds", []) if isinstance(list_result, dict) else []
+            return {"total": total, "updatedIds": updated_ids}
 
         return self._run_with_auth_retry(account_id, run)
 
@@ -473,8 +472,9 @@ class GeminiWorker:
         before_set = set(before_ids)
         self._emit_job_state(job, "running", phase="refresh_list")
         self._log("refresh_list", "拉取最新列表并识别新增会话")
-        self._execute_sync_list(job)
+        list_job_result = self._execute_sync_list(job, stop_on_unchanged=True)
         after_ids = self._load_conversation_ids(account_id)
+        updated_ids_from_list: set[str] = set(list_job_result.get("updatedIds", []))
 
         new_ids: list[str] = []
         new_seen: set[str] = set()
@@ -490,13 +490,17 @@ class GeminiWorker:
         failed_ids.update(new_result["failed"])
         failed_ids.difference_update(new_result["succeeded"])
 
-        # 4) 检查剩余老会话 detail 更新
+        # 4) 检查有更新的老会话 detail
+        # updated_ids_from_list 由列表扫描阶段识别（remote_ts > local_ts），
+        # 下探提前终止后未扫描的老会话不在其中，无需重新拉取。
         remaining_old_ids: list[str] = []
         old_seen: set[str] = set()
         for cid in after_ids:
             if cid not in before_set:
                 continue
             if cid in success_ids or cid in old_seen:
+                continue
+            if cid not in updated_ids_from_list:
                 continue
             old_seen.add(cid)
             remaining_old_ids.append(cid)
@@ -618,7 +622,7 @@ def main() -> None:
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError as exc:
-                print(f"[worker] request json parse error: {exc}", file=sys.stderr)
+                print(f"[worker:stdin] JSON 解析错误: {exc}", file=sys.stderr)
                 continue
 
             if not isinstance(msg, dict):

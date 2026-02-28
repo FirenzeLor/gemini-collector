@@ -373,7 +373,7 @@ class GeminiExporter:
     CONVERSATION_STATUS_LOST = "lost"
     CONVERSATION_STATUS_HIDDEN = "hidden"
 
-    def __init__(self, cookies: dict, user=None, account_id=None, account_email=None):
+    def __init__(self, cookies: dict, user=None, account_id=None, account_email=None, cookies_refresher=None):
         self.cookies = cookies
         self.user_spec = str(user).strip() if user is not None else None
         self.account_id_override = str(account_id).strip() if account_id else None
@@ -394,7 +394,9 @@ class GeminiExporter:
         self._request_started = False
         self._request_consecutive_failures = 0
         self._limit_probe_consumed = False
+        self._last_delay_sec = 0.0
         self._request_state_account_dir = None
+        self._cookies_refresher = cookies_refresher
 
     @staticmethod
     def _collect_runtime_google_cookies(client):
@@ -436,6 +438,17 @@ class GeminiExporter:
         if runtime_cookie_overrides:
             candidate_cookies.update(runtime_cookie_overrides)
 
+        fresh_cookies_for_commit = None
+        if self._cookies_refresher is not None:
+            try:
+                fresh_cookies = self._cookies_refresher()
+                if fresh_cookies:
+                    candidate_cookies.update(fresh_cookies)
+                    fresh_cookies_for_commit = dict(candidate_cookies)
+            except Exception as _refresh_err:
+                if verbose:
+                    print(f"  [reinit] 浏览器 cookie 刷新失败，使用缓存 cookies: {_refresh_err}")
+
         new_client = self._create_http_client(cookies=candidate_cookies)
         self.client = new_client
 
@@ -447,6 +460,8 @@ class GeminiExporter:
                     f" op={trigger_label}"
                 )
             self.init_auth()
+            if fresh_cookies_for_commit is not None:
+                self.cookies = fresh_cookies_for_commit
             refreshed_cookie_overrides = self._collect_runtime_google_cookies(new_client)
             if refreshed_cookie_overrides:
                 self.cookies.update(refreshed_cookie_overrides)
@@ -658,8 +673,7 @@ class GeminiExporter:
                 REQUEST_JITTER_MAX,
                 REQUEST_JITTER_MODE,
             )
-            if verbose:
-                print(f"  [delay] {label} 随机暂停: {delay_sec:.3f}s")
+            self._last_delay_sec = delay_sec
             time.sleep(delay_sec)
         if 0 < backoff_sec < REQUEST_BACKOFF_MAX_SECONDS:
             self._sync_request_state_file()
@@ -733,6 +747,29 @@ class GeminiExporter:
             if s.isdigit():
                 return int(s)
         return None
+
+    @staticmethod
+    def _iso_to_epoch_seconds(iso_text):
+        if not isinstance(iso_text, str):
+            return None
+        candidate = iso_text.strip()
+        if not candidate:
+            return None
+        if candidate.endswith("Z"):
+            candidate = f"{candidate[:-1]}+00:00"
+        try:
+            return int(datetime.datetime.fromisoformat(candidate).timestamp())
+        except Exception:
+            return None
+
+    @staticmethod
+    def _summary_to_epoch_seconds(summary):
+        if not isinstance(summary, dict):
+            return None
+        remote_hash_ts = GeminiExporter._coerce_epoch_seconds(summary.get("remoteHash"))
+        if remote_hash_ts is not None:
+            return remote_hash_ts
+        return GeminiExporter._iso_to_epoch_seconds(summary.get("updatedAt"))
 
     @staticmethod
     def _diagnose_auth_page(html, final_url):
@@ -871,6 +908,7 @@ class GeminiExporter:
             rpc=rpcid,
             status=resp.status_code,
             source=source_path or "/app",
+            delay=f"{self._last_delay_sec*1000:.0f}ms",
         )
 
         if resp.status_code != 200:
@@ -933,6 +971,7 @@ class GeminiExporter:
             cursor="init" if cursor is None else "next",
             items=len(items),
             has_next=bool(next_token),
+            delay=f"{self._last_delay_sec*1000:.0f}ms",
         )
         return items, next_token
 
@@ -991,6 +1030,7 @@ class GeminiExporter:
             cursor="init" if cursor is None else "next",
             turns=len(turns),
             has_next=bool(next_cursor),
+            delay=f"{self._last_delay_sec*1000:.0f}ms",
         )
         return turns, next_cursor
 
@@ -1651,7 +1691,7 @@ class GeminiExporter:
 
             if filepath.exists():
                 stats["media_downloaded"] += 1
-                timing_log("_download_media_batch_no_cdp", item_start, media_id=media_id, status="skip_exists")
+                timing_log("_download_media_batch_no_cdp", item_start, media_id=media_id, status="skip_exists", size=f"{filepath.stat().st_size / 1024:.1f}KB")
                 continue
 
             # 多账号登录下媒体权限与 authuser 强相关；直接使用带 authuser 的 URL，
@@ -1684,7 +1724,7 @@ class GeminiExporter:
                 filepath.parent.mkdir(parents=True, exist_ok=True)
                 filepath.write_bytes(content)
                 stats["media_downloaded"] += 1
-                timing_log("_download_media_batch_no_cdp", item_start, media_id=media_id, status="ok")
+                timing_log("_download_media_batch_no_cdp", item_start, media_id=media_id, status="ok", size=f"{len(content) / 1024:.1f}KB")
             else:
                 media_fields = self._media_log_fields(url, media_type=media_type, media_hint=media_hint)
                 print(
@@ -1757,6 +1797,81 @@ class GeminiExporter:
             seen.add(row_id)
             deduped.append(row)
         return deduped, removed
+
+    @staticmethod
+    def _message_row_sort_num(row):
+        if not isinstance(row, dict):
+            return float("-inf")
+        ts = row.get("timestamp")
+        if not isinstance(ts, str) or not ts.strip():
+            return float("-inf")
+        parsed = GeminiExporter._iso_to_epoch_seconds(ts)
+        if parsed is None:
+            return float("-inf")
+        return parsed
+
+    @staticmethod
+    def _is_message_rows_sorted_by_timestamp(message_rows):
+        if not isinstance(message_rows, list) or len(message_rows) <= 1:
+            return True
+        prev = float("-inf")
+        for row in message_rows:
+            cur = GeminiExporter._message_row_sort_num(row)
+            if cur < prev:
+                return False
+            prev = cur
+        return True
+
+    @staticmethod
+    def _merge_message_rows_for_write(new_msg_rows, existing_msg_rows):
+        """
+        合并新增与已有 message 行：
+        - 以新增行为优先去重（同 id 取 new）
+        - 线性归并（两段输入必须已按 timestamp 升序）
+        """
+        new_deduped, removed_new_dup = GeminiExporter._dedupe_message_rows_by_id(new_msg_rows)
+        new_ids = {
+            row.get("id")
+            for row in new_deduped
+            if isinstance(row, dict) and isinstance(row.get("id"), str) and row.get("id")
+        }
+
+        existing_without_new = []
+        removed_existing_by_new = 0
+        for row in existing_msg_rows:
+            if (
+                isinstance(row, dict)
+                and isinstance(row.get("id"), str)
+                and row.get("id")
+                and row.get("id") in new_ids
+            ):
+                removed_existing_by_new += 1
+                continue
+            existing_without_new.append(row)
+
+        existing_deduped, removed_existing_dup = GeminiExporter._dedupe_message_rows_by_id(existing_without_new)
+        removed_total = removed_new_dup + removed_existing_by_new + removed_existing_dup
+
+        if not GeminiExporter._is_message_rows_sorted_by_timestamp(new_deduped):
+            raise RuntimeError("new_msg_rows 必须按 timestamp 升序")
+        if not GeminiExporter._is_message_rows_sorted_by_timestamp(existing_deduped):
+            raise RuntimeError("existing_msg_rows 必须按 timestamp 升序")
+
+        merged = []
+        i = 0
+        j = 0
+        while i < len(new_deduped) and j < len(existing_deduped):
+            if GeminiExporter._message_row_sort_num(new_deduped[i]) <= GeminiExporter._message_row_sort_num(existing_deduped[j]):
+                merged.append(new_deduped[i])
+                i += 1
+            else:
+                merged.append(existing_deduped[j])
+                j += 1
+        if i < len(new_deduped):
+            merged.extend(new_deduped[i:])
+        if j < len(existing_deduped):
+            merged.extend(existing_deduped[j:])
+        return merged, removed_total
 
     @staticmethod
     def _write_jsonl_rows(jsonl_file, rows):
@@ -2286,12 +2401,27 @@ class GeminiExporter:
         )
 
     @staticmethod
+    def _sort_parsed_turns_by_timestamp(parsed_turns):
+        if not isinstance(parsed_turns, list) or not parsed_turns:
+            return []
+        indexed = list(enumerate(parsed_turns))
+
+        def _sort_key(item):
+            idx, turn = item
+            ts = turn.get("timestamp") if isinstance(turn, dict) else None
+            sort_ts = ts if isinstance(ts, int) else 2**63 - 1
+            return (sort_ts, idx)
+
+        return [turn for _, turn in sorted(indexed, key=_sort_key)]
+
+    @staticmethod
     def _turns_to_jsonl_rows(parsed_turns, conv_id, account_id, title, chat_info):
         """将 parsed_turns 转为新 JSONL 格式行列表（meta 首行 + message 行）"""
         now_iso = datetime.datetime.now(datetime.UTC).isoformat()
         bare_id = conv_id.replace("c_", "")
+        ordered_turns = GeminiExporter._sort_parsed_turns_by_timestamp(parsed_turns)
 
-        ts_list = [t["timestamp"] for t in parsed_turns if isinstance(t.get("timestamp"), int)]
+        ts_list = [t["timestamp"] for t in ordered_turns if isinstance(t.get("timestamp"), int)]
         created_at = GeminiExporter._to_iso_utc(min(ts_list)) if ts_list else None
 
         remote_ts = GeminiExporter._coerce_epoch_seconds(chat_info.get("latest_update_ts"))
@@ -2318,8 +2448,7 @@ class GeminiExporter:
             "remoteHash": remote_hash,
         }]
 
-        # parsed_turns 逆序（新→旧），反转为正序（旧→新）输出
-        for turn in reversed(parsed_turns):
+        for turn in ordered_turns:
             turn_id = turn.get("turn_id") or uuid.uuid4().hex
             ts = GeminiExporter._to_iso_utc(turn.get("timestamp")) or now_iso
 
@@ -2543,13 +2672,14 @@ class GeminiExporter:
     # ------------------------------------------------------------------
     # 主导出流程
     # ------------------------------------------------------------------
-    def export_list_only(self, output_dir=None):
+    def export_list_only(self, output_dir=None, stop_on_unchanged: bool = False):
         """
         仅同步会话列表（分页），不拉取对话详情。
         规则：
         - 按 cursor 连续分页拉取，异常时记录当前 cursor 并标记失败
         - 正常拉完后 cursor 清空
         - 本地索引始终做并集更新，不强制覆盖已有落盘数据
+        - stop_on_unchanged=True：命中首个本地已有且时间戳相同的会话时提前终止，与增量逻辑一致
         """
         base_dir = Path(output_dir) if output_dir else OUTPUT_DIR
         base_dir.mkdir(parents=True, exist_ok=True)
@@ -2636,7 +2766,7 @@ class GeminiExporter:
                 seen.add(cid)
             return summaries
 
-        def _persist_state(phase, cursor, error=None):
+        def _persist_state(phase, cursor, error=None, stopped_early=False):
             now_iso = datetime.datetime.now(datetime.UTC).isoformat()
             remote_count = len(fetched_order)
             lost_count = 0
@@ -2644,19 +2774,23 @@ class GeminiExporter:
             backoff_ms = self._request_backoff_ms()
 
             if phase == "done":
-                summaries = []
-                remote_set = set()
-                for cid in fetched_order:
-                    summary = conv_index.get(cid) or existing_index.get(cid)
-                    if not isinstance(summary, dict):
-                        continue
-                    summaries.append(summary)
-                    remote_set.add(cid)
-                for cid in baseline_existing_ids:
-                    if cid in remote_set:
-                        continue
-                    summaries.append(self._build_lost_summary(cid, existing_index.get(cid)))
-                    lost_count += 1
+                if stopped_early:
+                    # 提前终止：未扫描的旧会话仍存在，直接用并集写盘，不标记 lost
+                    summaries = _build_partial_summaries()
+                else:
+                    summaries = []
+                    remote_set = set()
+                    for cid in fetched_order:
+                        summary = conv_index.get(cid) or existing_index.get(cid)
+                        if not isinstance(summary, dict):
+                            continue
+                        summaries.append(summary)
+                        remote_set.add(cid)
+                    for cid in baseline_existing_ids:
+                        if cid in remote_set:
+                            continue
+                        summaries.append(self._build_lost_summary(cid, existing_index.get(cid)))
+                        lost_count += 1
                 listing_cursor = None
                 listing_fetched_ids = []
             else:
@@ -2712,6 +2846,8 @@ class GeminiExporter:
             self._write_account_meta(account_dir, account_info)
             return {"remoteCount": remote_count, "lostCount": lost_count}
 
+        updated_ids: list[str] = []
+        stop_early = False
         cursor = resume_cursor
         page = 0
         while True:
@@ -2739,6 +2875,23 @@ class GeminiExporter:
                     fetched_seen.add(bare_id)
                     fetched_order.append(bare_id)
 
+                remote_ts = chat.get("latest_update_ts")
+                local_ts = self._summary_to_epoch_seconds(existing_index.get(bare_id))
+                if isinstance(remote_ts, int) and isinstance(local_ts, int):
+                    if int(remote_ts) > int(local_ts):
+                        updated_ids.append(bare_id)
+                    elif stop_on_unchanged and int(remote_ts) == int(local_ts):
+                        print(f"  [stop] 命中未更新会话，停止列表扫描: {bare_id}")
+                        stop_early = True
+                        break
+                # remote_ts 或 local_ts 无法提取时不加入 updated_ids；
+                # 新会话由 sync_new 处理，无内容会话由 sync_empty 处理。
+
+            if stop_early:
+                result = _persist_state("done", None, stopped_early=True)
+                print(f"  第 {page} 页: {len(chats)} 个对话 (累计 {result['remoteCount']}, 提前终止)")
+                break
+
             phase = "done" if not next_cursor else "listing"
             result = _persist_state(phase, next_cursor, None)
             print(f"  第 {page} 页: {len(chats)} 个对话 (累计 {result['remoteCount']})")
@@ -2750,6 +2903,8 @@ class GeminiExporter:
                 break
 
             cursor = next_cursor
+
+        return {"updatedIds": updated_ids}
 
     def sync_single_conversation(self, conversation_id, output_dir=None):
         """
@@ -2770,6 +2925,7 @@ class GeminiExporter:
         conv_dir.mkdir(parents=True, exist_ok=True)
         media_dir.mkdir(parents=True, exist_ok=True)
         self._set_request_state_scope(account_dir)
+        conv_start = time.perf_counter()
 
         conv_id = self.normalize_chat_id(conversation_id)
         bare_id = conv_id.replace("c_", "")
@@ -2984,8 +3140,10 @@ class GeminiExporter:
             progress_summaries.sort(key=lambda s: _updated_sort_num(s.get("updatedAt")), reverse=True)
             self._write_conversations_index(account_dir, account_id, now_iso_local, progress_summaries)
 
+        fetch_start = time.perf_counter()
         try:
             while True:
+                page_start = time.perf_counter()
                 fetched_pages += 1
                 turns, next_cursor = self.get_chat_detail_page(conv_id, cursor)
                 if not turns and not next_cursor:
@@ -3020,7 +3178,8 @@ class GeminiExporter:
                     error_message=None,
                 )
                 _persist_progress_summary(len(raw_turns))
-                print(f"  第 {fetched_pages} 页: {len(page_turns)} 轮 (累计 {len(raw_turns)})")
+                page_ms = (time.perf_counter() - page_start) * 1000
+                print(f"  第 {fetched_pages} 页: {len(page_turns)} 轮 (累计 {len(raw_turns)}) {page_ms:.0f}ms")
 
                 if hit_existing or not next_cursor:
                     break
@@ -3046,6 +3205,9 @@ class GeminiExporter:
         raw_turns, removed_turns = self._dedupe_raw_turns_by_id(raw_turns)
         if removed_turns > 0:
             print(f"  [dedupe] 当前会话分页结果去重: {removed_turns} 个重复 turn")
+
+        fetch_elapsed = time.perf_counter() - fetch_start
+        media_start = time.perf_counter()
 
         global_seen_urls = self._load_media_manifest_new(account_dir)
         global_used_names = set(global_seen_urls.values())
@@ -3087,8 +3249,8 @@ class GeminiExporter:
                             except json.JSONDecodeError:
                                 continue
 
-                merged_msg_rows, removed_msg_rows = self._dedupe_message_rows_by_id(
-                    new_msg_rows + existing_msg_rows
+                merged_msg_rows, removed_msg_rows = self._merge_message_rows_for_write(
+                    new_msg_rows, existing_msg_rows
                 )
                 if removed_msg_rows > 0:
                     print(f"  [dedupe] 合并写盘去重: {removed_msg_rows} 行")
@@ -3284,11 +3446,15 @@ class GeminiExporter:
             except OSError:
                 pass
 
-        print(f"  媒体下载: {media_stats['media_downloaded']}")
-        print(f"  媒体失败: {media_stats['media_failed']}")
-        print(f"  视频预览生成: {media_stats['preview_generated']}")
-        print(f"  视频预览失败: {media_stats['preview_failed']}")
-        print("[*] 单会话同步完成")
+        media_elapsed = time.perf_counter() - media_start
+        total_elapsed = time.perf_counter() - conv_start
+        img = summary.get("imageCount", 0)
+        vid = summary.get("videoCount", 0)
+        print(
+            f"[*] 单会话完成: turns={len(raw_turns)}"
+            f" media={img}(img)/{vid}(vid)"
+            f" text={fetch_elapsed:.1f}s media_dl={media_elapsed:.1f}s total={total_elapsed:.1f}s"
+        )
 
     def export_all(self, output_dir=None, chat_ids=None):
         """
@@ -3566,27 +3732,6 @@ class GeminiExporter:
         existing_order, existing_index = self._load_conversations_index(account_dir)
         conv_index = dict(existing_index)
 
-        def _iso_to_epoch_seconds(iso_text):
-            if not isinstance(iso_text, str):
-                return None
-            candidate = iso_text.strip()
-            if not candidate:
-                return None
-            if candidate.endswith("Z"):
-                candidate = f"{candidate[:-1]}+00:00"
-            try:
-                return int(datetime.datetime.fromisoformat(candidate).timestamp())
-            except Exception:
-                return None
-
-        def _summary_to_epoch_seconds(summary):
-            if not isinstance(summary, dict):
-                return None
-            remote_hash_ts = self._coerce_epoch_seconds(summary.get("remoteHash"))
-            if remote_hash_ts is not None:
-                return remote_hash_ts
-            return _iso_to_epoch_seconds(summary.get("updatedAt"))
-
         chats_to_update = []
         scanned_order = []
         scanned_seen = set()
@@ -3616,7 +3761,7 @@ class GeminiExporter:
                 )
 
                 local_summary = existing_index.get(bare_id)
-                local_updated_ts = _summary_to_epoch_seconds(local_summary)
+                local_updated_ts = self._summary_to_epoch_seconds(local_summary)
                 remote_latest_ts = chat.get("latest_update_ts")
 
                 # 命中首个未更新会话，停止列表继续下探：
@@ -3656,13 +3801,14 @@ class GeminiExporter:
         elif not isinstance(account_info.get("remoteConversationCount"), int):
             account_info["remoteConversationCount"] = len(existing_order)
 
-        for chat in chats_to_update:
+        total_to_update = len(chats_to_update)
+        for idx, chat in enumerate(chats_to_update, start=1):
             conv_id = chat["id"]
             bare_id = conv_id.replace("c_", "")
             title = chat.get("title", "")
             jsonl_file = conv_dir / f"{bare_id}.jsonl"
 
-            print(f"\n[*] 增量检查: {title} ({conv_id})")
+            print(f"\n[{idx}/{total_to_update}] 增量检查: {title} ({conv_id})")
             existing_ids = self._build_existing_turn_id_set_new(jsonl_file)
             raw_new_turns = self.get_chat_detail_incremental(conv_id, existing_ids)
             raw_new_turns, removed_turns = self._dedupe_raw_turns_by_id(raw_new_turns)
@@ -3699,8 +3845,8 @@ class GeminiExporter:
             new_msg_rows = new_rows_full[1:]
 
             # 合并：新消息（正序）在前，旧消息跟随
-            merged_msg_rows, removed_msg_rows = self._dedupe_message_rows_by_id(
-                new_msg_rows + existing_msg_rows
+            merged_msg_rows, removed_msg_rows = self._merge_message_rows_for_write(
+                new_msg_rows, existing_msg_rows
             )
             if removed_msg_rows > 0:
                 print(f"  [dedupe] 增量合并写盘去重: {removed_msg_rows} 行")
