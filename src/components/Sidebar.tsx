@@ -149,9 +149,11 @@ export function Sidebar({
                     right: 0,
                     minWidth: 180,
                     borderRadius: 12,
-                    background: t.isDark ? "#2c2c2e" : "#ffffff",
-                    border: `1px solid ${t.isDark ? "rgba(255,255,255,0.1)" : "rgba(0,0,0,0.08)"}`,
-                    boxShadow: "0 8px 32px rgba(0,0,0,0.18), 0 2px 8px rgba(0,0,0,0.08)",
+                    background: t.cardBg,
+                    border: "none",
+                    backdropFilter: "blur(28px) saturate(115%)",
+                    WebkitBackdropFilter: "blur(28px) saturate(115%)",
+                    boxShadow: "none",
                     padding: "4px 0",
                     zIndex: 1000,
                     animation: "exportMenuIn 0.12s ease-out",
@@ -524,22 +526,16 @@ function ExportMenuItem({
       style={{
         display: "block",
         width: "100%",
-        padding: "0 4px",
+        padding: "9px 16px",
         border: "none",
-        background: "transparent",
+        background: hovered ? (isDark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.07)") : "transparent",
         cursor: disabled ? "default" : "pointer",
-        opacity: disabled ? 0.5 : 1,
         textAlign: "left",
+        opacity: disabled ? 0.5 : 1,
+        transition: "background 0.1s",
       }}
     >
-      <div style={{
-        padding: "9px 12px",
-        borderRadius: 6,
-        background: hovered ? (isDark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.07)") : "transparent",
-        transition: "background 0.1s",
-      }}>
-        <div style={{ fontSize: 13, fontWeight: 500, color: isDark ? "#ffffff" : "#000000", whiteSpace: "nowrap" }}>{label}</div>
-      </div>
+      <div style={{ fontSize: 13, fontWeight: 500, color: isDark ? "#ffffff" : "#000000", whiteSpace: "nowrap" }}>{label}</div>
     </button>
   );
 }
