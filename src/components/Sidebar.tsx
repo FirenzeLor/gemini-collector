@@ -151,8 +151,8 @@ export function Sidebar({
                     minWidth: 180,
                     borderRadius: 12,
                     background: t.isDark
-                      ? `linear-gradient(to top right, rgba(20,24,36,0.96), rgba(40,46,64,0.92)), ${t.cardBg}`
-                      : `linear-gradient(to top right, rgba(220,226,240,0.92), rgba(245,247,252,0.88)), ${t.cardBg}`,
+                      ? `linear-gradient(to top right, rgba(10,12,18,0.14), rgba(28,33,44,0.10)), ${t.cardBg}`
+                      : `linear-gradient(to top right, rgba(160,185,220,0.22), rgba(240,246,255,0.10)), ${t.cardBg}`,
                     border: "none",
                     backdropFilter: "blur(28px) saturate(115%)",
                     WebkitBackdropFilter: "blur(28px) saturate(115%)",
