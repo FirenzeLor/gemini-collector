@@ -272,6 +272,7 @@ function App() {
   const [preparingExportData, setPreparingExportData] = useState(false);
   const [exportingAccountData, setExportingAccountData] = useState(false);
   const [exportingKelivo, setExportingKelivo] = useState(false);
+  const [showKelivoConfirm, setShowKelivoConfirm] = useState<"single" | "split" | null>(null);
   const [showExportConfirm, setShowExportConfirm] = useState(false);
   const [exportStats, setExportStats] = useState<AccountExportStats | null>(null);
   const [exportNotice, setExportNotice] = useState<{ title: string; lines: string[] } | null>(null);
@@ -786,57 +787,77 @@ function App() {
 
   async function handleExportToKelivo() {
     if (!currentAccount || exportingKelivo || exportingAccountData || preparingExportData || clearingAccountData) return;
-    const startMs = Date.now();
-    setExportingKelivo(true);
+    setPreparingExportData(true);
     try {
       const accountId = currentAccount.id;
-      const selectedOutput = await open({ directory: true, multiple: false, title: "选择导出目录" });
-      if (!selectedOutput) return;
-      const outputDir = typeof selectedOutput === "string" ? selectedOutput : selectedOutput[0];
-      if (!outputDir) return;
-      const ts = new Date().toISOString().replace(/[-:]/g, "").slice(0, 15);
-      const outputPath = `${outputDir}/kelivo_${accountId}_${ts}.zip`;
-      const stdout = await invoke<string>("export_account_kelivo", { accountId, outputPath });
-      try { await revealItemInDir(outputPath); } catch {}
-      setExportNotice({ title: "导出到 Kelivo 完成", lines: stdout.trim().split("\n").filter(Boolean) });
+      const stats = parseAccountExportStatsPayload(
+        await invoke<string>("get_account_export_stats", { accountId }),
+      );
+      if (!stats) throw new Error("读取导出统计失败");
+      setExportStats(stats);
+      setShowKelivoConfirm("single");
     } catch (e) {
-      setExportNotice({ title: "导出到 Kelivo 失败", lines: [e instanceof Error ? e.message : String(e)] });
+      const msg = e instanceof Error ? e.message : String(e);
+      setExportNotice({ title: "导出到 Kelivo 失败", lines: [msg] });
     } finally {
-      const elapsed = Date.now() - startMs;
-      if (elapsed < 450) await new Promise((r) => window.setTimeout(r, 450 - elapsed));
-      setExportingKelivo(false);
+      setPreparingExportData(false);
     }
   }
 
   async function handleExportToKelivoSplit() {
     if (!currentAccount || exportingKelivo || exportingAccountData || preparingExportData || clearingAccountData) return;
-    const startMs = Date.now();
+    setPreparingExportData(true);
+    try {
+      const accountId = currentAccount.id;
+      const stats = parseAccountExportStatsPayload(
+        await invoke<string>("get_account_export_stats", { accountId }),
+      );
+      if (!stats) throw new Error("读取导出统计失败");
+      setExportStats(stats);
+      setShowKelivoConfirm("split");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setExportNotice({ title: "导出到 Kelivo（分包）失败", lines: [msg] });
+    } finally {
+      setPreparingExportData(false);
+    }
+  }
+
+  async function confirmExportToKelivo() {
+    if (!currentAccount || !exportStats || !showKelivoConfirm || exportingKelivo || preparingExportData) {
+      setShowKelivoConfirm(null);
+      return;
+    }
+    const isSplit = showKelivoConfirm === "split";
+    setShowKelivoConfirm(null);
+    setExportStats(null);
+    const startedAt = Date.now();
     setExportingKelivo(true);
     try {
       const accountId = currentAccount.id;
-      const maxJson = window.prompt("chats.json 每包上限（如 10MB）", "10MB");
-      if (maxJson === null) return;
-      const maxUpload = window.prompt("upload/ 附件每包上限（如 750MB）", "750MB");
-      if (maxUpload === null) return;
       const selectedOutput = await open({ directory: true, multiple: false, title: "选择导出目录" });
       if (!selectedOutput) return;
-      const outputDir = typeof selectedOutput === "string" ? selectedOutput : selectedOutput[0];
-      if (!outputDir) return;
+      const outputDir = Array.isArray(selectedOutput) ? selectedOutput[0] : selectedOutput;
+      if (!outputDir || typeof outputDir !== "string") throw new Error("未选择有效导出目录");
       const ts = new Date().toISOString().replace(/[-:]/g, "").slice(0, 15);
       const outputPath = `${outputDir}/kelivo_${accountId}_${ts}.zip`;
-      const stdout = await invoke<string>("export_account_kelivo_split", {
-        accountId,
-        outputPath,
-        maxJson: maxJson.trim() || "10MB",
-        maxUpload: maxUpload.trim() || "750MB",
+      const stdout = isSplit
+        ? await invoke<string>("export_account_kelivo_split", { accountId, outputPath, maxJson: "10MB", maxUpload: "750MB" })
+        : await invoke<string>("export_account_kelivo", { accountId, outputPath });
+      try { await revealItemInDir(isSplit ? outputDir : outputPath); } catch {}
+      setExportNotice({
+        title: isSplit ? "导出到 Kelivo（分包）完成" : "导出到 Kelivo 完成",
+        lines: stdout.trim().split("\n").filter(Boolean),
       });
-      try { await revealItemInDir(outputDir); } catch {}
-      setExportNotice({ title: "导出到 Kelivo（分包）完成", lines: stdout.trim().split("\n").filter(Boolean) });
     } catch (e) {
-      setExportNotice({ title: "导出到 Kelivo（分包）失败", lines: [e instanceof Error ? e.message : String(e)] });
+      const msg = e instanceof Error ? e.message : String(e);
+      setExportNotice({
+        title: isSplit ? "导出到 Kelivo（分包）失败" : "导出到 Kelivo 失败",
+        lines: [msg],
+      });
     } finally {
-      const elapsed = Date.now() - startMs;
-      if (elapsed < 450) await new Promise((r) => window.setTimeout(r, 450 - elapsed));
+      const elapsed = Date.now() - startedAt;
+      if (elapsed < 450) await new Promise((resolve) => window.setTimeout(resolve, 450 - elapsed));
       setExportingKelivo(false);
     }
   }
@@ -1079,6 +1100,80 @@ function App() {
               </button>
               <button
                 onClick={() => { void confirmExportAccountData(); }}
+                style={{
+                  border: "none",
+                  background: "#0071e3",
+                  color: "#fff",
+                  borderRadius: 8,
+                  padding: "7px 12px",
+                  fontSize: 12,
+                  fontWeight: 600,
+                  cursor: "pointer",
+                }}
+              >
+                开始导出
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {showKelivoConfirm && exportStats && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 10000,
+            background: "rgba(0,0,0,0.32)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <div
+            style={{
+              width: 420,
+              maxWidth: "calc(100vw - 32px)",
+              borderRadius: 12,
+              background: clearDialogBg,
+              border: `1px solid ${clearDialogBorder}`,
+              boxShadow: theme.isDark ? "0 18px 40px rgba(0,0,0,0.45)" : "0 18px 40px rgba(0,0,0,0.2)",
+              padding: 16,
+            }}
+          >
+            <div style={{ fontSize: 15, fontWeight: 700, color: theme.text, marginBottom: 8 }}>
+              {showKelivoConfirm === "split" ? "导出到 Kelivo（分包）" : "导出到 Kelivo"}
+            </div>
+            <div style={{ fontSize: 13, color: theme.textSub, lineHeight: 1.55, marginBottom: 12 }}>
+              账号「{currentAccount.name || currentAccount.email || currentAccount.id}」将打包为 ZIP。
+            </div>
+            <div style={{ fontSize: 12, color: theme.textSub, lineHeight: 1.6, marginBottom: 14 }}>
+              <div>对话数: {exportStats.conversationCount}（详情文件 {exportStats.conversationFileCount}）</div>
+              <div>媒体文件: {exportStats.mediaFileCount}</div>
+              <div>文件总数: {exportStats.totalFileCount}</div>
+              <div>当前体积: {formatBytes(exportStats.totalBytes)}</div>
+              <div>预估压缩后: {formatBytes(exportStats.estimatedZipBytes)}</div>
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+              <button
+                onClick={() => {
+                  setShowKelivoConfirm(null);
+                  setExportStats(null);
+                }}
+                style={{
+                  border: `1px solid ${clearDialogBorder}`,
+                  background: "transparent",
+                  color: theme.text,
+                  borderRadius: 8,
+                  padding: "7px 12px",
+                  fontSize: 12,
+                  cursor: "pointer",
+                }}
+              >
+                取消
+              </button>
+              <button
+                onClick={() => { void confirmExportToKelivo(); }}
+                disabled={exportingKelivo}
                 style={{
                   border: "none",
                   background: "#0071e3",
