@@ -271,6 +271,7 @@ function App() {
   const [fullSyncing, setFullSyncing] = useState(false);
   const [preparingExportData, setPreparingExportData] = useState(false);
   const [exportingAccountData, setExportingAccountData] = useState(false);
+  const [exportingKelivo, setExportingKelivo] = useState(false);
   const [showExportConfirm, setShowExportConfirm] = useState(false);
   const [exportStats, setExportStats] = useState<AccountExportStats | null>(null);
   const [exportNotice, setExportNotice] = useState<{ title: string; lines: string[] } | null>(null);
@@ -783,6 +784,14 @@ function App() {
     }
   }
 
+  function handleExportToKelivo() {
+    // TODO: 实现导出到 Kelivo
+  }
+
+  function handleExportToKelivoSplit() {
+    // TODO: 实现导出到 Kelivo（分包）
+  }
+
   async function handleClearAccountData() {
     if (!currentAccount || clearingAccountData || exportingAccountData || preparingExportData) {
       return;
@@ -852,7 +861,7 @@ function App() {
   }
 
   const anySyncTaskRunning =
-    listSyncing || fullSyncing || syncingConversationIds.length > 0 || exportingAccountData || preparingExportData;
+    listSyncing || fullSyncing || syncingConversationIds.length > 0 || exportingAccountData || preparingExportData || exportingKelivo;
   const visibleConversationSummaries = useMemo(() => {
     const visibleItems = conversationSummaries.filter((c) => !isHiddenSummary(c));
     return sortConversationSummaries(visibleItems, conversationSortMode);
@@ -916,9 +925,12 @@ function App() {
           fullSyncing={fullSyncing}
           onSyncList={handleSyncList}
           onSyncFull={handleSyncAll}
-          exportingAccountData={exportingAccountData || preparingExportData}
-          disableExportAccountData={clearingAccountData || exportingAccountData || preparingExportData}
+          exportingAccountData={exportingAccountData || preparingExportData || exportingKelivo}
+          disableExportAccountData={clearingAccountData || exportingAccountData || preparingExportData || exportingKelivo}
           onExportAccountData={handleExportAccountData}
+          exportingKelivo={exportingKelivo}
+          onExportToKelivo={handleExportToKelivo}
+          onExportToKelivoSplit={handleExportToKelivoSplit}
           clearingAccountData={clearingAccountData}
           disableClearAccountData={listSyncing || fullSyncing || syncingConversationIds.length > 0 || exportingAccountData || preparingExportData}
           onClearAccountData={handleClearAccountData}

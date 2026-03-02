@@ -14,6 +14,7 @@ const PYTHON3_CANDIDATES: [&str; 3] = [
 // Dev-time script path derived from Cargo.toml location at compile time
 const SCRIPT_PATH_DEV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/gemini_export.py");
 const WORKER_SCRIPT_PATH_DEV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/gemini_worker.py");
+const KELIVO_SCRIPT_PATH_DEV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/gemini_to_kelivo.py");
 
 fn find_script(app: &tauri::AppHandle) -> PathBuf {
     let dev = PathBuf::from(SCRIPT_PATH_DEV);
@@ -36,6 +37,17 @@ fn find_worker_script(app: &tauri::AppHandle) -> PathBuf {
         .resource_dir()
         .unwrap_or_default()
         .join("gemini_worker.py")
+}
+
+fn find_kelivo_script(app: &tauri::AppHandle) -> PathBuf {
+    let dev = PathBuf::from(KELIVO_SCRIPT_PATH_DEV);
+    if dev.exists() {
+        return dev;
+    }
+    app.path()
+        .resource_dir()
+        .unwrap_or_default()
+        .join("gemini_to_kelivo.py")
 }
 
 static PYTHON_BIN: OnceLock<String> = OnceLock::new();
@@ -439,6 +451,89 @@ fn export_account_zip(
         "estimatedZipBytes": stats.estimated_zip_bytes,
     });
     serde_json::to_string(&result).map_err(|e| e.to_string())
+}
+
+/// 将账号数据导出为 Kelivo 格式 ZIP。
+/// output_path 是完整的输出 ZIP 路径（如 /Users/foo/Downloads/kelivo_xxx.zip）。
+#[tauri::command]
+async fn export_account_kelivo(
+    app: tauri::AppHandle,
+    account_id: String,
+    output_path: String,
+) -> Result<String, String> {
+    let script = find_kelivo_script(&app);
+    if !script.exists() {
+        return Err(format!("kelivo 脚本未找到: {}", script.display()));
+    }
+
+    let python = python_bin().to_string();
+    let script_str = script.to_str().unwrap_or("").to_string();
+    let script_dir = script
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
+
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        std::process::Command::new(&python)
+            .current_dir(&script_dir)
+            .arg(&script_str)
+            .arg(&account_id)
+            .arg(&output_path)
+            .output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+
+    if result.status.success() {
+        Ok(String::from_utf8_lossy(&result.stdout).to_string())
+    } else {
+        Err(String::from_utf8_lossy(&result.stderr).to_string())
+    }
+}
+
+/// 将账号数据导出为 Kelivo 格式（分包）ZIP。
+#[tauri::command]
+async fn export_account_kelivo_split(
+    app: tauri::AppHandle,
+    account_id: String,
+    output_path: String,
+    max_json: String,
+    max_upload: String,
+) -> Result<String, String> {
+    let script = find_kelivo_script(&app);
+    if !script.exists() {
+        return Err(format!("kelivo 脚本未找到: {}", script.display()));
+    }
+
+    let python = python_bin().to_string();
+    let script_str = script.to_str().unwrap_or("").to_string();
+    let script_dir = script
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
+
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        std::process::Command::new(&python)
+            .current_dir(&script_dir)
+            .arg(&script_str)
+            .arg(&account_id)
+            .arg(&output_path)
+            .arg("--max-json")
+            .arg(&max_json)
+            .arg("--max-upload")
+            .arg(&max_upload)
+            .output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+
+    if result.status.success() {
+        Ok(String::from_utf8_lossy(&result.stdout).to_string())
+    } else {
+        Err(String::from_utf8_lossy(&result.stderr).to_string())
+    }
 }
 
 #[tauri::command]
@@ -900,6 +995,8 @@ pub fn run() {
             enqueue_job,
             get_account_export_stats,
             export_account_zip,
+            export_account_kelivo,
+            export_account_kelivo_split,
             clear_account_data,
             load_conversation_summaries,
             get_account_media_dir,
