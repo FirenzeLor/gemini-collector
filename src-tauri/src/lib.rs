@@ -1,5 +1,6 @@
 mod worker_host;
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use chrono::Local;
@@ -14,7 +15,6 @@ const PYTHON3_CANDIDATES: [&str; 3] = [
 // Dev-time script path derived from Cargo.toml location at compile time
 const SCRIPT_PATH_DEV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/gemini_export.py");
 const WORKER_SCRIPT_PATH_DEV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/gemini_worker.py");
-const KELIVO_SCRIPT_PATH_DEV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/gemini_to_kelivo.py");
 
 fn find_script(app: &tauri::AppHandle) -> PathBuf {
     let dev = PathBuf::from(SCRIPT_PATH_DEV);
@@ -39,16 +39,6 @@ fn find_worker_script(app: &tauri::AppHandle) -> PathBuf {
         .join("gemini_worker.py")
 }
 
-fn find_kelivo_script(app: &tauri::AppHandle) -> PathBuf {
-    let dev = PathBuf::from(KELIVO_SCRIPT_PATH_DEV);
-    if dev.exists() {
-        return dev;
-    }
-    app.path()
-        .resource_dir()
-        .unwrap_or_default()
-        .join("gemini_to_kelivo.py")
-}
 
 static PYTHON_BIN: OnceLock<String> = OnceLock::new();
 
@@ -453,6 +443,404 @@ fn export_account_zip(
     serde_json::to_string(&result).map_err(|e| e.to_string())
 }
 
+// ── Kelivo 导出：纯 Rust 实现 ─────────────────────────────────────────────────
+
+/// 将 "5MB"、"500KB"、"1GB" 等解析为字节数。
+fn parse_size(s: &str) -> Result<u64, String> {
+    let upper = s.trim().to_uppercase();
+    for (suffix, mult) in &[("GB", 1u64 << 30), ("MB", 1u64 << 20), ("KB", 1u64 << 10), ("B", 1u64)] {
+        if upper.ends_with(suffix) {
+            let num_str = upper[..upper.len() - suffix.len()].trim();
+            let val: f64 = num_str.parse().map_err(|_| format!("无法解析大小: {}", s))?;
+            return Ok((val * (*mult as f64)).round() as u64);
+        }
+    }
+    s.trim().parse::<u64>().map_err(|_| format!("无法解析大小: {}", s))
+}
+
+/// 0→"a", 1→"b", …, 25→"z", 26→"aa", …
+fn idx_to_label(mut n: usize) -> String {
+    let mut label = String::new();
+    n += 1;
+    while n > 0 {
+        let r = (n - 1) % 26;
+        label.insert(0, (b'a' + r as u8) as char);
+        n = (n - 1) / 26;
+    }
+    label
+}
+
+fn build_kelivo_content(text: &str, attachments: &[serde_json::Value]) -> String {
+    let mut parts: Vec<String> = vec![text.to_string()];
+    for att in attachments {
+        let media_id = att.get("mediaId").and_then(|v| v.as_str()).unwrap_or("");
+        if media_id.is_empty() {
+            continue;
+        }
+        let mime = att.get("mimeType").and_then(|v| v.as_str()).unwrap_or("application/octet-stream");
+        if mime.starts_with("image/") {
+            parts.push(format!("[image:/upload/{}]", media_id));
+        } else {
+            parts.push(format!("[file:/upload/{mid}|{mid}|{mime}]", mid = media_id, mime = mime));
+        }
+    }
+    parts.join("\n")
+}
+
+struct KelivoItem {
+    #[allow(dead_code)]
+    conv_id: String,
+    kelivo_conv: serde_json::Value,
+    kelivo_msgs: Vec<serde_json::Value>,
+    media_ids: Vec<String>,
+    json_bytes: u64,
+    media_bytes: u64,
+}
+
+fn parse_kelivo_jsonl(path: &Path, media_dir: &Path, after_date: Option<&str>) -> Result<Option<KelivoItem>, String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let mut meta: Option<serde_json::Value> = None;
+    let mut messages: Vec<serde_json::Value> = Vec::new();
+
+    for line in raw.lines() {
+        let s = line.trim();
+        if s.is_empty() {
+            continue;
+        }
+        let obj: serde_json::Value = serde_json::from_str(s).map_err(|e| e.to_string())?;
+        match obj.get("type").and_then(|v| v.as_str()) {
+            Some("meta") => {
+                if meta.is_none() {
+                    meta = Some(obj);
+                }
+            }
+            Some("message") => messages.push(obj),
+            _ => {}
+        }
+    }
+
+    let meta = match meta {
+        Some(m) => m,
+        None => return Ok(None),
+    };
+
+    // 时间过滤
+    if let Some(after) = after_date {
+        let updated_at = meta.get("updatedAt").and_then(|v| v.as_str()).unwrap_or("");
+        if !updated_at.is_empty() && updated_at < after {
+            return Ok(None);
+        }
+    }
+
+    let conv_id = meta.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let title = meta.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let created_at = meta.get("createdAt").cloned().unwrap_or(serde_json::Value::Null);
+    let updated_at = meta.get("updatedAt").cloned().unwrap_or(serde_json::Value::Null);
+
+    // 转换消息
+    let mut kelivo_msgs: Vec<serde_json::Value> = Vec::new();
+    let mut message_ids: Vec<serde_json::Value> = Vec::new();
+    let mut media_ids: Vec<String> = Vec::new();
+
+    for msg in &messages {
+        let msg_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let role_raw = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+        let role = if role_raw == "model" { "assistant" } else { "user" };
+        let text = msg.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        let attachments = msg.get("attachments")
+            .and_then(|v| v.as_array())
+            .map(|a| a.as_slice())
+            .unwrap_or(&[]);
+        let content = build_kelivo_content(text, attachments);
+        let timestamp = msg.get("timestamp").cloned().unwrap_or(serde_json::Value::Null);
+
+        for att in attachments {
+            if let Some(mid) = att.get("mediaId").and_then(|v| v.as_str()) {
+                if !mid.is_empty() && !media_ids.contains(&mid.to_string()) {
+                    media_ids.push(mid.to_string());
+                }
+            }
+        }
+
+        message_ids.push(serde_json::Value::String(msg_id.clone()));
+        kelivo_msgs.push(serde_json::json!({
+            "id": msg_id,
+            "role": role,
+            "content": content,
+            "timestamp": timestamp,
+            "modelId": msg.get("model").cloned().unwrap_or(serde_json::Value::Null),
+            "providerId": "google",
+            "totalTokens": null,
+            "conversationId": conv_id,
+            "isStreaming": false,
+            "reasoningText": msg.get("thinking").cloned().unwrap_or(serde_json::Value::Null),
+            "reasoningStartAt": null,
+            "reasoningFinishedAt": null,
+            "translation": null,
+            "reasoningSegmentsJson": null,
+            "groupId": null,
+            "version": 0,
+        }));
+    }
+
+    let kelivo_conv = serde_json::json!({
+        "id": conv_id,
+        "title": title,
+        "createdAt": created_at,
+        "updatedAt": updated_at,
+        "messageIds": message_ids,
+        "isPinned": false,
+        "mcpServerIds": [],
+        "assistantId": null,
+        "truncateIndex": -1,
+        "versionSelections": {},
+        "summary": null,
+        "lastSummarizedMessageCount": 0,
+    });
+
+    // 估算 JSON 字节数（紧凑格式）
+    let conv_bytes = serde_json::to_string(&kelivo_conv).unwrap_or_default().len() as u64;
+    let msgs_bytes: u64 = kelivo_msgs.iter()
+        .map(|m| serde_json::to_string(m).unwrap_or_default().len() as u64)
+        .sum();
+    let json_bytes = conv_bytes + msgs_bytes;
+
+    // 媒体文件磁盘大小
+    let media_bytes: u64 = media_ids.iter()
+        .filter_map(|mid| {
+            let p = media_dir.join(mid);
+            p.metadata().ok().map(|m| m.len())
+        })
+        .sum();
+
+    Ok(Some(KelivoItem {
+        conv_id,
+        kelivo_conv,
+        kelivo_msgs,
+        media_ids,
+        json_bytes,
+        media_bytes,
+    }))
+}
+
+fn pack_bins(items: Vec<KelivoItem>, json_limit: Option<u64>, media_limit: Option<u64>) -> Vec<Vec<KelivoItem>> {
+    if json_limit.is_none() && media_limit.is_none() {
+        return vec![items];
+    }
+
+    // FFD：按归一化权重降序
+    let mut indexed: Vec<(usize, f64)> = items.iter().enumerate().map(|(i, item)| {
+        let jn = json_limit.map(|lim| item.json_bytes as f64 / lim as f64).unwrap_or(0.0);
+        let mn = media_limit.map(|lim| item.media_bytes as f64 / lim as f64).unwrap_or(0.0);
+        (i, jn.max(mn))
+    }).collect();
+    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    struct Bin {
+        json_used: u64,
+        media_used: u64,
+        indices: Vec<usize>,
+    }
+
+    let mut bins: Vec<Bin> = Vec::new();
+
+    for (idx, _) in indexed {
+        let jb = items[idx].json_bytes;
+        let mb = items[idx].media_bytes;
+        let exceeds = json_limit.map(|lim| jb > lim).unwrap_or(false)
+            || media_limit.map(|lim| mb > lim).unwrap_or(false);
+
+        if exceeds {
+            bins.push(Bin { json_used: jb, media_used: mb, indices: vec![idx] });
+            continue;
+        }
+
+        let mut placed = false;
+        for bin in &mut bins {
+            let json_ok = json_limit.map(|lim| bin.json_used + jb <= lim).unwrap_or(true);
+            let media_ok = media_limit.map(|lim| bin.media_used + mb <= lim).unwrap_or(true);
+            if json_ok && media_ok {
+                bin.indices.push(idx);
+                bin.json_used += jb;
+                bin.media_used += mb;
+                placed = true;
+                break;
+            }
+        }
+
+        if !placed {
+            bins.push(Bin { json_used: jb, media_used: mb, indices: vec![idx] });
+        }
+    }
+
+    // 将 items 按 bin 分组（消耗 items Vec）
+    let mut items_opt: Vec<Option<KelivoItem>> = items.into_iter().map(Some).collect();
+    bins.into_iter().map(|bin| {
+        bin.indices.into_iter().map(|i| items_opt[i].take().unwrap()).collect()
+    }).collect()
+}
+
+fn write_kelivo_zip(zip_path: &Path, bin_items: &[KelivoItem], media_dir: &Path) -> Result<(usize, usize, usize, usize), String> {
+    use zip::write::{ZipWriter, SimpleFileOptions};
+    use zip::CompressionMethod;
+
+    let all_convs: Vec<&serde_json::Value> = bin_items.iter().map(|it| &it.kelivo_conv).collect();
+    let all_msgs: Vec<&serde_json::Value> = bin_items.iter().flat_map(|it| it.kelivo_msgs.iter()).collect();
+    let mut all_mids: Vec<&str> = bin_items.iter().flat_map(|it| it.media_ids.iter().map(|s| s.as_str())).collect();
+    all_mids.sort_unstable();
+    all_mids.dedup();
+
+    let chats_obj = serde_json::json!({
+        "version": 1,
+        "conversations": all_convs,
+        "messages": all_msgs,
+        "toolEvents": {},
+        "geminiThoughtSigs": {},
+    });
+    let chats_json = serde_json::to_string(&chats_obj).map_err(|e| e.to_string())?;
+
+    if let Some(parent) = zip_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    let file = std::fs::File::create(zip_path).map_err(|e| e.to_string())?;
+    let mut zw = ZipWriter::new(file);
+    let opts = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .compression_level(Some(6));
+
+    zw.start_file("chats.json", opts).map_err(|e| e.to_string())?;
+    zw.write_all(chats_json.as_bytes()).map_err(|e| e.to_string())?;
+
+    let mut media_found = 0usize;
+    let mut media_missing = 0usize;
+    for mid in &all_mids {
+        let src = media_dir.join(mid);
+        if src.exists() {
+            let data = std::fs::read(&src).map_err(|e| e.to_string())?;
+            zw.start_file(format!("upload/{}", mid), opts).map_err(|e| e.to_string())?;
+            zw.write_all(&data).map_err(|e| e.to_string())?;
+            media_found += 1;
+        } else {
+            media_missing += 1;
+        }
+    }
+
+    zw.finish().map_err(|e| e.to_string())?;
+
+    Ok((all_convs.len(), all_msgs.len(), media_found, media_missing))
+}
+
+/// 核心 Kelivo 导出实现。
+fn kelivo_export_impl(
+    data_dir: &Path,
+    account_id: &str,
+    output_path: &Path,
+    json_limit: Option<u64>,
+    media_limit: Option<u64>,
+    after_date: Option<&str>,
+) -> Result<String, String> {
+    let account_dir = data_dir.join("accounts").join(account_id);
+    let conv_dir = account_dir.join("conversations");
+    let media_dir = account_dir.join("media");
+
+    if !conv_dir.exists() {
+        return Err(format!("对话目录不存在: {}", conv_dir.display()));
+    }
+
+    // 收集并排序 .jsonl 文件
+    let mut jsonl_files: Vec<PathBuf> = std::fs::read_dir(&conv_dir)
+        .map_err(|e| e.to_string())?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
+        .collect();
+    jsonl_files.sort();
+
+    let mut items: Vec<KelivoItem> = Vec::new();
+    let mut skipped = 0usize;
+
+    for jsonl_path in &jsonl_files {
+        match parse_kelivo_jsonl(jsonl_path, &media_dir, after_date) {
+            Ok(Some(item)) => items.push(item),
+            Ok(None) => skipped += 1,
+            Err(_) => skipped += 1,
+        }
+    }
+
+    let total_convs = items.len();
+    let total_msgs: usize = items.iter().map(|it| it.kelivo_msgs.len()).sum();
+
+    // 分包
+    let bins = pack_bins(items, json_limit, media_limit);
+    let multi = bins.len() > 1;
+
+    let stem = output_path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("kelivo_backup")
+        .to_string();
+    let suffix = output_path.extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("zip")
+        .to_string();
+    let output_dir = output_path.parent().unwrap_or(output_path);
+
+    let mut result_lines: Vec<String> = Vec::new();
+
+    for (idx, bin_items) in bins.iter().enumerate() {
+        let zip_path = if multi {
+            let label = idx_to_label(idx);
+            output_dir.join(format!("{}_{}{}",label, stem,
+                if suffix.is_empty() { String::new() } else { format!(".{}", suffix) }))
+        } else {
+            output_path.to_path_buf()
+        };
+
+        let (conv_count, msg_count, media_found, media_missing) =
+            write_kelivo_zip(&zip_path, bin_items, &media_dir)?;
+
+        let size_mb = std::fs::metadata(&zip_path)
+            .map(|m| m.len() as f64 / 1024.0 / 1024.0)
+            .unwrap_or(0.0);
+
+        let label_prefix = if multi { format!("[{}] ", idx_to_label(idx)) } else { String::new() };
+        result_lines.push(format!(
+            "  {}{}  {} 对话  {} 消息  媒体 {}✓/{}✗  {:.1}MB",
+            label_prefix,
+            zip_path.file_name().and_then(|s| s.to_str()).unwrap_or(""),
+            conv_count,
+            msg_count,
+            media_found,
+            media_missing,
+            size_mb,
+        ));
+    }
+
+    let summary = if multi {
+        format!(
+            "[信息] 成功转换: {} 对话，{} 条消息，跳过 {}\n{}\n[完成] 共 {} 个包，输出到 {}",
+            total_convs, total_msgs, skipped,
+            result_lines.join("\n"),
+            bins.len(),
+            output_dir.display(),
+        )
+    } else {
+        let zip_path = output_path;
+        let size_mb = std::fs::metadata(zip_path)
+            .map(|m| m.len() as f64 / 1024.0 / 1024.0)
+            .unwrap_or(0.0);
+        format!(
+            "[信息] 成功转换: {} 对话，{} 条消息，跳过 {}\n{}\n[完成] 输出: {}  ({:.1} MB)",
+            total_convs, total_msgs, skipped,
+            result_lines.join("\n"),
+            zip_path.display(),
+            size_mb,
+        )
+    };
+
+    Ok(summary)
+}
+
 /// 将账号数据导出为 Kelivo 格式 ZIP。
 /// output_path 是完整的输出 ZIP 路径（如 /Users/foo/Downloads/kelivo_xxx.zip）。
 #[tauri::command]
@@ -460,36 +848,24 @@ async fn export_account_kelivo(
     app: tauri::AppHandle,
     account_id: String,
     output_path: String,
+    after_date: Option<String>,
 ) -> Result<String, String> {
-    let script = find_kelivo_script(&app);
-    if !script.exists() {
-        return Err(format!("kelivo 脚本未找到: {}", script.display()));
-    }
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let output = PathBuf::from(&output_path);
+    let after = after_date.clone();
 
-    let python = python_bin().to_string();
-    let script_str = script.to_str().unwrap_or("").to_string();
-    let script_dir = script
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .to_path_buf();
-
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        std::process::Command::new(&python)
-            .current_dir(&script_dir)
-            .arg(&script_str)
-            .arg(&account_id)
-            .arg(&output_path)
-            .output()
+    tauri::async_runtime::spawn_blocking(move || {
+        kelivo_export_impl(
+            &data_dir,
+            &account_id,
+            &output,
+            None,
+            None,
+            after.as_deref(),
+        )
     })
     .await
     .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())?;
-
-    if result.status.success() {
-        Ok(String::from_utf8_lossy(&result.stdout).to_string())
-    } else {
-        Err(String::from_utf8_lossy(&result.stderr).to_string())
-    }
 }
 
 /// 将账号数据导出为 Kelivo 格式（分包）ZIP。
@@ -498,42 +874,35 @@ async fn export_account_kelivo_split(
     app: tauri::AppHandle,
     account_id: String,
     output_path: String,
-    max_json: String,
-    max_upload: String,
+    max_json: Option<String>,
+    max_upload: Option<String>,
+    after_date: Option<String>,
 ) -> Result<String, String> {
-    let script = find_kelivo_script(&app);
-    if !script.exists() {
-        return Err(format!("kelivo 脚本未找到: {}", script.display()));
-    }
+    let json_limit = match &max_json {
+        Some(s) if !s.trim().is_empty() => Some(parse_size(s)?),
+        _ => None,
+    };
+    let media_limit = match &max_upload {
+        Some(s) if !s.trim().is_empty() => Some(parse_size(s)?),
+        _ => None,
+    };
 
-    let python = python_bin().to_string();
-    let script_str = script.to_str().unwrap_or("").to_string();
-    let script_dir = script
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .to_path_buf();
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let output = PathBuf::from(&output_path);
+    let after = after_date.clone();
 
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        std::process::Command::new(&python)
-            .current_dir(&script_dir)
-            .arg(&script_str)
-            .arg(&account_id)
-            .arg(&output_path)
-            .arg("--max-json")
-            .arg(&max_json)
-            .arg("--max-upload")
-            .arg(&max_upload)
-            .output()
+    tauri::async_runtime::spawn_blocking(move || {
+        kelivo_export_impl(
+            &data_dir,
+            &account_id,
+            &output,
+            json_limit,
+            media_limit,
+            after.as_deref(),
+        )
     })
     .await
     .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())?;
-
-    if result.status.success() {
-        Ok(String::from_utf8_lossy(&result.stdout).to_string())
-    } else {
-        Err(String::from_utf8_lossy(&result.stderr).to_string())
-    }
 }
 
 #[tauri::command]
