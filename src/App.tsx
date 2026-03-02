@@ -784,12 +784,61 @@ function App() {
     }
   }
 
-  function handleExportToKelivo() {
-    // TODO: 实现导出到 Kelivo
+  async function handleExportToKelivo() {
+    if (!currentAccount || exportingKelivo || exportingAccountData || preparingExportData || clearingAccountData) return;
+    const startMs = Date.now();
+    setExportingKelivo(true);
+    try {
+      const accountId = currentAccount.id;
+      const selectedOutput = await open({ directory: true, multiple: false, title: "选择导出目录" });
+      if (!selectedOutput) return;
+      const outputDir = typeof selectedOutput === "string" ? selectedOutput : selectedOutput[0];
+      if (!outputDir) return;
+      const ts = new Date().toISOString().replace(/[-:]/g, "").slice(0, 15);
+      const outputPath = `${outputDir}/kelivo_${accountId}_${ts}.zip`;
+      const stdout = await invoke<string>("export_account_kelivo", { accountId, outputPath });
+      try { await revealItemInDir(outputPath); } catch {}
+      setExportNotice({ title: "导出到 Kelivo 完成", lines: stdout.trim().split("\n").filter(Boolean) });
+    } catch (e) {
+      setExportNotice({ title: "导出到 Kelivo 失败", lines: [e instanceof Error ? e.message : String(e)] });
+    } finally {
+      const elapsed = Date.now() - startMs;
+      if (elapsed < 450) await new Promise((r) => window.setTimeout(r, 450 - elapsed));
+      setExportingKelivo(false);
+    }
   }
 
-  function handleExportToKelivoSplit() {
-    // TODO: 实现导出到 Kelivo（分包）
+  async function handleExportToKelivoSplit() {
+    if (!currentAccount || exportingKelivo || exportingAccountData || preparingExportData || clearingAccountData) return;
+    const startMs = Date.now();
+    setExportingKelivo(true);
+    try {
+      const accountId = currentAccount.id;
+      const maxJson = window.prompt("chats.json 每包上限（如 10MB）", "10MB");
+      if (maxJson === null) return;
+      const maxUpload = window.prompt("upload/ 附件每包上限（如 750MB）", "750MB");
+      if (maxUpload === null) return;
+      const selectedOutput = await open({ directory: true, multiple: false, title: "选择导出目录" });
+      if (!selectedOutput) return;
+      const outputDir = typeof selectedOutput === "string" ? selectedOutput : selectedOutput[0];
+      if (!outputDir) return;
+      const ts = new Date().toISOString().replace(/[-:]/g, "").slice(0, 15);
+      const outputPath = `${outputDir}/kelivo_${accountId}_${ts}.zip`;
+      const stdout = await invoke<string>("export_account_kelivo_split", {
+        accountId,
+        outputPath,
+        maxJson: maxJson.trim() || "10MB",
+        maxUpload: maxUpload.trim() || "750MB",
+      });
+      try { await revealItemInDir(outputDir); } catch {}
+      setExportNotice({ title: "导出到 Kelivo（分包）完成", lines: stdout.trim().split("\n").filter(Boolean) });
+    } catch (e) {
+      setExportNotice({ title: "导出到 Kelivo（分包）失败", lines: [e instanceof Error ? e.message : String(e)] });
+    } finally {
+      const elapsed = Date.now() - startMs;
+      if (elapsed < 450) await new Promise((r) => window.setTimeout(r, 450 - elapsed));
+      setExportingKelivo(false);
+    }
   }
 
   async function handleClearAccountData() {

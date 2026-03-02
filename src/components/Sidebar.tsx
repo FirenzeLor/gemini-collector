@@ -534,7 +534,7 @@ function ExportMenuItem({
         whiteSpace: "nowrap",
       }}
     >
-      <div style={{ fontSize: 10.5, fontWeight: 700, color: t.textMuted, letterSpacing: 0.2 }}>{label}</div>
+      <div style={{ fontSize: 10.5, fontWeight: 700, color: "#000000", letterSpacing: 0.2 }}>{label}</div>
     </button>
   );
 }
