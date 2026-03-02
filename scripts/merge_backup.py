@@ -169,26 +169,84 @@ def load_source_conv(src: Path, fmt: str, conv_id: str):
         return msgs, title
 
 
-# ── 找需要前插的消息 ──────────────────────────────────────────────────────────
+# ── 并集合并工具 ──────────────────────────────────────────────────────────────
+
+# kind 显示标签
+KIND_LABELS = {
+    "older":       "补旧",
+    "newer":       "源超前",
+    "interleaved": "交错",
+    "no_overlap":  "无重叠",
+}
 
 
-def find_prepend(src_msgs: list, app_msgs: list):
+def find_union_additions(src_msgs: list, app_msgs: list):
     """
-    返回 (to_prepend, cutoff_turn_id)。
-    若无重叠或无需前插，返回 ([], None)。
+    返回 (additions, kind, stats)。
+    additions : src 中 app 没有的消息（按 turn_id 分组，保留全部 _u/_m）。
+    kind      : "source_subset" | "no_overlap" | "older" | "newer" | "interleaved"
+    stats     : {"common": int, "src_only": int, "app_only": int}
     """
     app_turn_ids = {base_turn_id(m["id"]) for m in app_msgs}
-    cut = next(
-        (i for i, m in enumerate(src_msgs) if base_turn_id(m["id"]) in app_turn_ids),
-        None,
-    )
-    if cut is None or cut == 0:
-        return [], None
-    # 回退到本 turn 的起始（避免落在 _m 中间）
-    cut_base = base_turn_id(src_msgs[cut]["id"])
-    while cut > 0 and base_turn_id(src_msgs[cut - 1]["id"]) == cut_base:
-        cut -= 1
-    return src_msgs[:cut], cut_base
+
+    src_turns_ordered: list = []
+    seen: set = set()
+    for m in src_msgs:
+        tid = base_turn_id(m["id"])
+        if tid not in seen:
+            seen.add(tid)
+            src_turns_ordered.append(tid)
+
+    src_turn_ids = set(src_turns_ordered)
+    common  = src_turn_ids & app_turn_ids
+    src_only = src_turn_ids - app_turn_ids
+
+    additions = [m for m in src_msgs if base_turn_id(m["id"]) in src_only]
+    stats = {
+        "common":   len(common),
+        "src_only": len(src_only),
+        "app_only": len(app_turn_ids - src_turn_ids),
+    }
+
+    if not src_only:
+        return additions, "source_subset", stats
+    if not common:
+        return additions, "no_overlap", stats
+
+    # src_only turn 相对于 common turn 的位置
+    first_common_idx   = min(i for i, t in enumerate(src_turns_ordered) if t in common)
+    last_common_idx    = max(i for i, t in enumerate(src_turns_ordered) if t in common)
+    first_src_only_idx = min(i for i, t in enumerate(src_turns_ordered) if t in src_only)
+    last_src_only_idx  = max(i for i, t in enumerate(src_turns_ordered) if t in src_only)
+
+    if last_src_only_idx < first_common_idx:
+        return additions, "older", stats
+    if first_src_only_idx > last_common_idx:
+        return additions, "newer", stats
+    return additions, "interleaved", stats
+
+
+def merge_by_timestamp(app_msgs: list, additions: list) -> list:
+    """将 additions 按时间戳插入 app_msgs，以 turn 为单位排序。"""
+    groups: dict = {}
+    order: list = []
+    for m in app_msgs + additions:
+        tid = base_turn_id(m["id"])
+        if tid not in groups:
+            groups[tid] = []
+            order.append(tid)
+        groups[tid].append(m)
+
+    def turn_ts(tid: str) -> str:
+        return next(
+            (m.get("timestamp", "") for m in groups[tid] if m.get("timestamp")), ""
+        ) or ""
+
+    sorted_tids = sorted(order, key=turn_ts)
+    result = []
+    for tid in sorted_tids:
+        result.extend(groups[tid])
+    return result
 
 
 # ── 媒体文件 ──────────────────────────────────────────────────────────────────
@@ -196,6 +254,23 @@ def find_prepend(src_msgs: list, app_msgs: list):
 
 def media_ids_of(msgs: list) -> set:
     return {a["mediaId"] for m in msgs for a in m.get("attachments", [])}
+
+
+def count_media_by_type(msgs: list) -> tuple:
+    """返回 (image_count, video_count)，按唯一 mediaId 统计。"""
+    image_ids: set = set()
+    video_ids: set = set()
+    for m in msgs:
+        for a in m.get("attachments", []):
+            mid = a.get("mediaId")
+            if not mid:
+                continue
+            mime = a.get("mimeType", "")
+            if mime.startswith("image/"):
+                image_ids.add(mid)
+            elif mime.startswith("video/"):
+                video_ids.add(mid)
+    return len(image_ids), len(video_ids)
 
 
 def new_media_list(media_ids: set, src: Path, app_media: Path) -> list:
@@ -276,44 +351,45 @@ def build_plan(account_id: str, app_data: Path, sources: list) -> dict:
                     break
             continue
 
-        # 两端都有 JSONL → 寻找可前插的旧 turn
+        # 两端都有 JSONL → 并集合并（src 有、app 无的 turn 全部补入）
         app_records = load_jsonl(app_jsonl)
         app_msgs = app_records[1:]  # 保留原始顺序，不重排
 
-        best = {"prepend": [], "cutoff": None, "src": None, "fmt": None}
+        best = {"additions": [], "kind": "source_subset", "stats": {}, "src": None, "fmt": None}
         for s, f in srcs:
             r = load_source_conv(s, f, conv_id)
             if not r:
                 continue
             src_msgs, _ = r
-            to_prepend, cutoff = find_prepend(src_msgs, app_msgs)
-            if len(to_prepend) > len(best["prepend"]):
-                best = {"prepend": to_prepend, "cutoff": cutoff, "src": s, "fmt": f}
+            additions, kind, stats = find_union_additions(src_msgs, app_msgs)
+            if len(additions) > len(best["additions"]):
+                best = {"additions": additions, "kind": kind, "stats": stats, "src": s, "fmt": f}
 
-        if not best["prepend"]:
+        if not best["additions"]:
             no_change += 1
             continue
 
-        pp = best["prepend"]
-        mids = media_ids_of(pp)
-        turns_added = len({base_turn_id(m["id"]) for m in pp})
+        adds = best["additions"]
+        mids = media_ids_of(adds)
+        turns_added = len({base_turn_id(m["id"]) for m in adds})
         changes.append(
             {
-                "type": "prepend",
+                "type": "merge",
+                "kind": best["kind"],
                 "conv_id": conv_id,
                 "title": idx_item.get("title", conv_id),
                 "src": best["src"],
                 "fmt": best["fmt"],
-                "to_prepend": pp,
-                "cutoff": best["cutoff"],
+                "additions": adds,
                 "app_meta": app_records[0],
                 "app_msgs": app_msgs,
                 "media_ids": mids,
                 "new_media": new_media_list(mids, best["src"], media_dir),
                 "idx_item": idx_item,
                 "before": len(app_msgs),
-                "after": len(app_msgs) + len(pp),
+                "after": len(app_msgs) + len(adds),
                 "turns_added": turns_added,
+                "stats": best["stats"],
             }
         )
 
@@ -334,7 +410,7 @@ def build_plan(account_id: str, app_data: Path, sources: list) -> dict:
 def print_report(plan: dict):
     changes = plan["changes"]
     skipped = plan["skipped"]
-    prepends = [c for c in changes if c["type"] == "prepend"]
+    merges  = [c for c in changes if c["type"] == "merge"]
     restores = [c for c in changes if c["type"] == "restore"]
     all_new_media = [m for c in changes for m in c["new_media"]]
 
@@ -343,6 +419,15 @@ def print_report(plan: dict):
         label = "[app备份]" if f == "app-native" else "[原始导出]"
         src_labels.append(f"{label} {Path(s).name}")
 
+    # 按 kind 统计合并数量
+    kind_counts: dict = {}
+    for c in merges:
+        kind_counts[c["kind"]] = kind_counts.get(c["kind"], 0) + 1
+    merge_summary = "  ".join(
+        f"{KIND_LABELS.get(k, k)}×{v}"
+        for k, v in kind_counts.items()
+    ) if kind_counts else "-"
+
     print("=" * 62)
     print("预合并报告")
     print("=" * 62)
@@ -350,9 +435,9 @@ def print_report(plan: dict):
     print(f"来源：{'  |  '.join(src_labels)}")
     print()
     print(f"跳过（仅源有，app无）：{len(skipped)} 条")
-    print(f"待前插（有旧 turn）：  {len(prepends)} 条")
+    print(f"待合并（有缺失 turn）：{len(merges)} 条  [{merge_summary}]")
     print(f"待恢复（JSONL 缺失）： {len(restores)} 条")
-    print(f"无变化：               {plan['no_change']} 条")
+    print(f"无变化（源⊆app）：    {plan['no_change']} 条")
     print()
 
     if changes:
@@ -360,15 +445,16 @@ def print_report(plan: dict):
         print(row % ("#", "类型", "对话标题", "补充turns", "消息数变化", "媒体"))
         print("-" * 84)
         for i, c in enumerate(changes, 1):
-            typ = "前插" if c["type"] == "prepend" else "恢复"
-            title = c["title"][:26]
-            if c["type"] == "prepend":
+            if c["type"] == "merge":
+                typ = KIND_LABELS.get(c["kind"], c["kind"])
                 turns_s = f"+{c['turns_added']} turns"
-                msgs_s = f"{c['before']} → {c['after']} 条"
-            else:
+                msgs_s  = f"{c['before']} → {c['after']} 条"
+            else:  # restore
+                typ = "恢复"
                 n = len({base_turn_id(m["id"]) for m in c["msgs"]})
                 turns_s = f"全部 {n} turns"
-                msgs_s = f"0 → {c['after']} 条"
+                msgs_s  = f"0 → {c['after']} 条"
+            title = c["title"][:26]
             if c["new_media"]:
                 sz = sum(m["size"] for m in c["new_media"])
                 media_s = f"+{len(c['new_media'])} 个 ({fmt_size(sz)})"
@@ -381,6 +467,17 @@ def print_report(plan: dict):
             print(f"媒体汇总：共新增 {len(all_new_media)} 个文件，约 {fmt_size(total_sz)}")
         else:
             print("媒体汇总：无新增媒体文件")
+        print()
+
+    # 异常合并警告（非"补旧"的合并需人工确认）
+    anomalous = [c for c in merges if c["kind"] != "older"]
+    if anomalous:
+        print(f"⚠  异常合并（需人工确认）：{len(anomalous)} 条")
+        for c in anomalous:
+            kind_s = KIND_LABELS.get(c["kind"], c["kind"])
+            s = c.get("stats", {})
+            print(f"  [{kind_s}]  {c['conv_id']}  {c['title'][:30]}")
+            print(f"         共同={s.get('common',0)}  仅源={s.get('src_only',0)}  仅app={s.get('app_only',0)}")
         print()
 
     if skipped:
@@ -430,24 +527,29 @@ def apply_plan(plan: dict):
             }
             write_jsonl_atomic(jsonl_path, [meta_line] + msgs)
             if conv_id in index_map:
+                img_cnt, vid_cnt = count_media_by_type(msgs)
                 index_map[conv_id]["messageCount"] = len(msgs)
                 index_map[conv_id]["hasMedia"] = bool(c["media_ids"])
+                index_map[conv_id]["imageCount"] = img_cnt
+                index_map[conv_id]["videoCount"] = vid_cnt
 
-        elif c["type"] == "prepend":
-            to_prepend = c["to_prepend"]
+        elif c["type"] == "merge":
             app_meta = c["app_meta"]
             app_msgs = c["app_msgs"]
-            all_msgs = to_prepend + app_msgs
+            all_msgs = merge_by_timestamp(app_msgs, c["additions"])
             # 只更新 createdAt（对话实际开始时间），其余字段不动
             ts_list = [m["timestamp"] for m in all_msgs if m.get("timestamp")]
             if ts_list:
                 app_meta["createdAt"] = min(ts_list)
             write_jsonl_atomic(jsonl_path, [app_meta] + all_msgs)
             if conv_id in index_map:
+                img_cnt, vid_cnt = count_media_by_type(all_msgs)
                 index_map[conv_id]["messageCount"] = len(all_msgs)
                 index_map[conv_id]["hasMedia"] = any(
                     m.get("attachments") for m in all_msgs
                 )
+                index_map[conv_id]["imageCount"] = img_cnt
+                index_map[conv_id]["videoCount"] = vid_cnt
 
         # 复制新媒体文件
         src_dir = Path(c["src"])
@@ -592,16 +694,51 @@ def _run_tests():
             ],
         )
 
+        # conv_no_overlap: app 有 T_X1，源有 T_Y1（完全不同的 turn）
+        NO_OVERLAP = "aaaa1111bbbb2222"
+        write_jsonl_atomic(
+            conv_dir / f"{NO_OVERLAP}.jsonl",
+            [
+                make_meta(NO_OVERLAP, ACCOUNT, "无重叠测试对话", "2026-01-01T00:00:00+00:00"),
+                make_msg("r_x1", "user",  "2026-01-01T00:00:00+00:00"),
+                make_msg("r_x1", "model", "2026-01-01T00:00:00+00:00"),
+            ],
+        )
+
+        # conv_src_fwd: app 有 T_F1，源有 T_F1/T_F2（源超前）
+        SRC_FWD = "cccc3333dddd4444"
+        write_jsonl_atomic(
+            conv_dir / f"{SRC_FWD}.jsonl",
+            [
+                make_meta(SRC_FWD, ACCOUNT, "源超前测试对话", "2026-01-01T00:00:00+00:00"),
+                make_msg("r_f1", "user",  "2026-01-01T00:00:00+00:00"),
+                make_msg("r_f1", "model", "2026-01-01T00:00:00+00:00"),
+            ],
+        )
+
+        # conv_interleaved: app 有 T_I1/T_I3，源有 T_I1/T_I2/T_I3（交错）
+        INTERLEAVED = "eeee5555ffff6666"
+        write_jsonl_atomic(
+            conv_dir / f"{INTERLEAVED}.jsonl",
+            [
+                make_meta(INTERLEAVED, ACCOUNT, "交错测试对话", "2026-01-01T00:00:00+00:00"),
+                make_msg("r_i1", "user",  "2026-01-01T00:00:00+00:00"),
+                make_msg("r_i1", "model", "2026-01-01T00:00:00+00:00"),
+                make_msg("r_i3", "user",  "2026-01-03T00:00:00+00:00"),
+                make_msg("r_i3", "model", "2026-01-03T00:00:00+00:00"),
+            ],
+        )
+
         # conv_skip: 不在 app 索引 → 跳过
         SKIP = "deadbeefcafe1234"
 
-        # conversations.json（包含 4 个对话，不含 SKIP）
+        # conversations.json（包含 7 个对话，不含 SKIP）
         (acc_dir / "conversations.json").write_text(
             json.dumps({
                 "version": 1,
                 "accountId": ACCOUNT,
                 "updatedAt": "2026-01-01T00:00:00+00:00",
-                "totalCount": 4,
+                "totalCount": 7,
                 "items": [
                     {"id": PREPEND_NATIVE, "title": "原生前插测试对话",
                      "lastMessage": "", "messageCount": 4, "hasMedia": False,
@@ -619,6 +756,18 @@ def _run_tests():
                      "lastMessage": "", "messageCount": 2, "hasMedia": False,
                      "updatedAt": "2026-01-01T00:00:00+00:00",
                      "syncedAt": "2026-01-01T00:00:00+00:00", "remoteHash": None},
+                    {"id": NO_OVERLAP, "title": "无重叠测试对话",
+                     "lastMessage": "", "messageCount": 2, "hasMedia": False,
+                     "updatedAt": "2026-01-01T00:00:00+00:00",
+                     "syncedAt": "2026-01-01T00:00:00+00:00", "remoteHash": None},
+                    {"id": SRC_FWD, "title": "源超前测试对话",
+                     "lastMessage": "", "messageCount": 2, "hasMedia": False,
+                     "updatedAt": "2026-01-01T00:00:00+00:00",
+                     "syncedAt": "2026-01-01T00:00:00+00:00", "remoteHash": None},
+                    {"id": INTERLEAVED, "title": "交错测试对话",
+                     "lastMessage": "", "messageCount": 4, "hasMedia": False,
+                     "updatedAt": "2026-01-03T00:00:00+00:00",
+                     "syncedAt": "2026-01-03T00:00:00+00:00", "remoteHash": None},
                 ],
             }),
             encoding="utf-8"
@@ -676,6 +825,42 @@ def _run_tests():
             ],
         )
 
+        # conv_no_overlap: 源完全不同的 turn（T_Y1 vs app 的 T_X1）
+        write_jsonl_atomic(
+            src_native_conv / f"{NO_OVERLAP}.jsonl",
+            [
+                make_meta(NO_OVERLAP, ACCOUNT, "无重叠测试对话", "2026-01-01T00:00:00+00:00"),
+                make_msg("r_y1", "user",  "2026-01-01T00:00:00+00:00"),
+                make_msg("r_y1", "model", "2026-01-01T00:00:00+00:00"),
+            ],
+        )
+
+        # conv_src_fwd: 源有 T_F1/T_F2，app 只有 T_F1
+        write_jsonl_atomic(
+            src_native_conv / f"{SRC_FWD}.jsonl",
+            [
+                make_meta(SRC_FWD, ACCOUNT, "源超前测试对话", "2026-01-01T00:00:00+00:00"),
+                make_msg("r_f1", "user",  "2026-01-01T00:00:00+00:00"),
+                make_msg("r_f1", "model", "2026-01-01T00:00:00+00:00"),
+                make_msg("r_f2", "user",  "2026-01-02T00:00:00+00:00"),
+                make_msg("r_f2", "model", "2026-01-02T00:00:00+00:00"),
+            ],
+        )
+
+        # conv_interleaved: 源有 T_I1/T_I2/T_I3，app 只有 T_I1/T_I3
+        write_jsonl_atomic(
+            src_native_conv / f"{INTERLEAVED}.jsonl",
+            [
+                make_meta(INTERLEAVED, ACCOUNT, "交错测试对话", "2026-01-01T00:00:00+00:00"),
+                make_msg("r_i1", "user",  "2026-01-01T00:00:00+00:00"),
+                make_msg("r_i1", "model", "2026-01-01T00:00:00+00:00"),
+                make_msg("r_i2", "user",  "2026-01-02T00:00:00+00:00"),
+                make_msg("r_i2", "model", "2026-01-02T00:00:00+00:00"),
+                make_msg("r_i3", "user",  "2026-01-03T00:00:00+00:00"),
+                make_msg("r_i3", "model", "2026-01-03T00:00:00+00:00"),
+            ],
+        )
+
         # ── 构建 raw-export 源 ────────────────────────────────────────────
         src_raw = tmp / "source_raw"
         src_raw.mkdir()
@@ -721,32 +906,52 @@ def _run_tests():
             check("无变化 == 1", plan["no_change"] == 1,
                   f"实际={plan['no_change']}")
 
-            prepends = [c for c in plan["changes"] if c["type"] == "prepend"]
+            merges   = [c for c in plan["changes"] if c["type"] == "merge"]
             restores = [c for c in plan["changes"] if c["type"] == "restore"]
-            check("前插数量 == 2", len(prepends) == 2, f"实际={len(prepends)}")
+            check("合并数量 == 5", len(merges) == 5, f"实际={len(merges)}")
             check("恢复数量 == 1", len(restores) == 1, f"实际={len(restores)}")
 
-            # 验证原生前插
-            pn = next((c for c in prepends if c["conv_id"] == PREPEND_NATIVE), None)
-            check("原生前插对话存在", pn is not None)
+            older_ms      = [c for c in merges if c["kind"] == "older"]
+            newer_ms      = [c for c in merges if c["kind"] == "newer"]
+            interleaved_ms = [c for c in merges if c["kind"] == "interleaved"]
+            no_overlap_ms  = [c for c in merges if c["kind"] == "no_overlap"]
+            check("older 合并 == 2",      len(older_ms) == 2,      f"实际={len(older_ms)}")
+            check("newer 合并 == 1",      len(newer_ms) == 1,      f"实际={len(newer_ms)}")
+            check("interleaved 合并 == 1", len(interleaved_ms) == 1, f"实际={len(interleaved_ms)}")
+            check("no_overlap 合并 == 1",  len(no_overlap_ms) == 1,  f"实际={len(no_overlap_ms)}")
+
+            # 验证原生 older 合并
+            pn = next((c for c in older_ms if c["conv_id"] == PREPEND_NATIVE), None)
+            check("原生 older 对话存在", pn is not None)
             if pn:
-                check("原生前插 turns_added == 1", pn["turns_added"] == 1,
+                check("原生 older turns_added == 1", pn["turns_added"] == 1,
                       f"实际={pn['turns_added']}")
-                check("原生前插 before=4 after=6",
+                check("原生 older before=4 after=6",
                       pn["before"] == 4 and pn["after"] == 6,
                       f"before={pn['before']} after={pn['after']}")
 
-            # 验证 raw 前插
-            pr = next((c for c in prepends if c["conv_id"] == PREPEND_RAW), None)
-            check("Raw前插对话存在", pr is not None)
+            # 验证 raw older 合并
+            pr = next((c for c in older_ms if c["conv_id"] == PREPEND_RAW), None)
+            check("Raw older 对话存在", pr is not None)
             if pr:
-                check("Raw前插 turns_added == 1", pr["turns_added"] == 1,
+                check("Raw older turns_added == 1", pr["turns_added"] == 1,
                       f"实际={pr['turns_added']}")
-                check("Raw前插 before=2 after=4",
+                check("Raw older before=2 after=4",
                       pr["before"] == 2 and pr["after"] == 4,
                       f"before={pr['before']} after={pr['after']}")
-                check("Raw前插有媒体文件",
+                check("Raw older 有媒体文件",
                       len(pr["new_media"]) == 1 and pr["new_media"][0]["id"] == FAKE_MEDIA_ID)
+
+            # 验证异常合并 kind
+            check("no_overlap conv_id 正确",
+                  no_overlap_ms[0]["conv_id"] == NO_OVERLAP if no_overlap_ms else False)
+            check("newer conv_id 正确",
+                  newer_ms[0]["conv_id"] == SRC_FWD if newer_ms else False)
+            check("interleaved conv_id 正确",
+                  interleaved_ms[0]["conv_id"] == INTERLEAVED if interleaved_ms else False)
+            check("interleaved turns_added == 1",
+                  interleaved_ms[0]["turns_added"] == 1 if interleaved_ms else False,
+                  f"实际={interleaved_ms[0]['turns_added'] if interleaved_ms else 'N/A'}")
 
             # 验证恢复
             rs = restores[0]
@@ -758,28 +963,26 @@ def _run_tests():
             apply_plan(plan)
 
             print("\n--- 写入验证 ---")
-            # 验证原生前插写入
+            # 验证原生 older 写入
             recs = load_jsonl(conv_dir / f"{PREPEND_NATIVE}.jsonl")
             msgs_written = recs[1:]
-            check("原生前插：文件消息数 == 6", len(msgs_written) == 6,
+            check("原生 older：文件消息数 == 6", len(msgs_written) == 6,
                   f"实际={len(msgs_written)}")
-            check("原生前插：第1条是 r_t1_u", msgs_written[0]["id"] == "r_t1_u",
+            check("原生 older：第1条是 r_t1_u", msgs_written[0]["id"] == "r_t1_u",
                   msgs_written[0]["id"])
-            # 只有 createdAt 应更新为最老 turn 时间，其余字段不动
-            check("原生前插：createdAt 更新为最老 turn",
+            check("原生 older：createdAt 更新为最老 turn",
                   recs[0]["createdAt"] == "2026-01-01T00:00:00+00:00",
                   recs[0]["createdAt"])
-            check("原生前插：其余 meta 字段不变",
-                  recs[0]["updatedAt"] == "2026-01-02T00:00:00+00:00"
-                  and recs[0]["remoteHash"] is None,
-                  str({k: v for k, v in recs[0].items() if k != "createdAt"}))
+            check("原生 older：updatedAt 不变",
+                  recs[0]["updatedAt"] == "2026-01-02T00:00:00+00:00",
+                  recs[0].get("updatedAt"))
 
-            # 验证 raw 前插写入
+            # 验证 raw older 写入
             recs_r = load_jsonl(conv_dir / f"{PREPEND_RAW}.jsonl")
             msgs_r = recs_r[1:]
-            check("Raw前插：文件消息数 == 4", len(msgs_r) == 4, f"实际={len(msgs_r)}")
-            check("Raw前插：第1条是 r_r1_u", msgs_r[0]["id"] == "r_r1_u", msgs_r[0]["id"])
-            check("Raw前插：媒体已复制", (media_dir / FAKE_MEDIA_ID).exists())
+            check("Raw older：文件消息数 == 4", len(msgs_r) == 4, f"实际={len(msgs_r)}")
+            check("Raw older：第1条是 r_r1_u", msgs_r[0]["id"] == "r_r1_u", msgs_r[0]["id"])
+            check("Raw older：媒体已复制", (media_dir / FAKE_MEDIA_ID).exists())
 
             # 验证恢复写入
             recs_s = load_jsonl(conv_dir / f"{RESTORE}.jsonl")
@@ -791,10 +994,28 @@ def _run_tests():
             check("无变化：消息数仍为 2", len(recs_n) - 1 == 2,
                   f"实际={len(recs_n) - 1}")
 
+            # 验证 newer 写入（T_F1 + T_F2，T_F2 追加在后）
+            recs_f = load_jsonl(conv_dir / f"{SRC_FWD}.jsonl")
+            msgs_f = recs_f[1:]
+            check("newer：消息数 == 4", len(msgs_f) == 4, f"实际={len(msgs_f)}")
+            check("newer：最后是 r_f2_m", msgs_f[-1]["id"] == "r_f2_m", msgs_f[-1]["id"])
+
+            # 验证 interleaved 写入（T_I1/T_I2/T_I3，T_I2 插入中间）
+            recs_i = load_jsonl(conv_dir / f"{INTERLEAVED}.jsonl")
+            msgs_i = recs_i[1:]
+            check("interleaved：消息数 == 6", len(msgs_i) == 6, f"实际={len(msgs_i)}")
+            check("interleaved：中间是 r_i2_u", msgs_i[2]["id"] == "r_i2_u", msgs_i[2]["id"])
+
+            # 验证 no_overlap 写入（T_X1 + T_Y1，时间戳相同，app turn 在前）
+            recs_x = load_jsonl(conv_dir / f"{NO_OVERLAP}.jsonl")
+            msgs_x = recs_x[1:]
+            check("no_overlap：消息数 == 4", len(msgs_x) == 4, f"实际={len(msgs_x)}")
+            check("no_overlap：r_x1_u 在前", msgs_x[0]["id"] == "r_x1_u", msgs_x[0]["id"])
+
             # 验证 meta.json conversationCount
             meta_data = json.loads((acc_dir / "meta.json").read_text(encoding="utf-8"))
-            check("meta.json conversationCount == 4",
-                  meta_data["conversationCount"] == 4,
+            check("meta.json conversationCount == 7",
+                  meta_data["conversationCount"] == 7,
                   f"实际={meta_data['conversationCount']}")
 
         except Exception:

@@ -5,7 +5,7 @@ import { useTheme } from "../theme";
 
 interface SidebarProps {
   conversations: ConversationSummary[];
-  conversationSortMode?: "updated_desc" | "size_desc";
+  conversationSortMode?: "updated_desc" | "size_desc" | "media_desc";
   onToggleConversationSort?: () => void;
   selectedId: string | null;
   onSelect: (id: string) => void;
@@ -58,6 +58,18 @@ export function Sidebar({
   const [showSwitcher, setShowSwitcher] = useState(false);
   const syncingSet = new Set(syncingConversationIds);
   const otherAccounts = accounts.filter((a) => a.id !== currentAccount.id);
+  const conversationSortTitle =
+    conversationSortMode === "size_desc"
+      ? "当前按数量倒序（消息条数），点击切换为按媒体数量倒序"
+      : conversationSortMode === "media_desc"
+        ? "当前按媒体数量倒序，点击切换为按更新时间新到旧"
+        : "当前按更新时间新到旧，点击切换为按数量倒序（消息条数）";
+  const conversationSortLabel =
+    conversationSortMode === "size_desc"
+      ? "数量↓"
+      : conversationSortMode === "media_desc"
+        ? "媒体↓"
+        : "时间↓";
 
   useEffect(() => {
     if (disableAccountSwitch && showSwitcher) {
@@ -131,11 +143,7 @@ export function Sidebar({
                 e.stopPropagation();
                 onToggleConversationSort?.();
               }}
-              title={
-                conversationSortMode === "size_desc"
-                  ? "当前按大小倒序（消息条数），点击切换为按更新时间新到旧"
-                  : "当前按更新时间新到旧，点击切换为按大小倒序（消息条数）"
-              }
+              title={conversationSortTitle}
               style={{
                 height: 22,
                 borderRadius: 6,
@@ -160,7 +168,7 @@ export function Sidebar({
                 (e.currentTarget as HTMLElement).style.background = "transparent";
               }}
             >
-              {conversationSortMode === "size_desc" ? "大小↓" : "时间↓"}
+              {conversationSortLabel}
             </button>
             <button
               onClick={(e) => {
