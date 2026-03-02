@@ -146,10 +146,13 @@ export function Sidebar({
                   style={{
                     position: "absolute",
                     top: "calc(100% + 4px)",
-                    right: 0,
+                    right: "50%",
+                    transform: "translateX(50%)",
                     minWidth: 180,
                     borderRadius: 12,
-                    background: t.cardBg,
+                    background: t.isDark
+                      ? `linear-gradient(to top right, rgba(20,24,36,0.96), rgba(40,46,64,0.92)), ${t.cardBg}`
+                      : `linear-gradient(to top right, rgba(220,226,240,0.92), rgba(245,247,252,0.88)), ${t.cardBg}`,
                     border: "none",
                     backdropFilter: "blur(28px) saturate(115%)",
                     WebkitBackdropFilter: "blur(28px) saturate(115%)",
@@ -526,7 +529,7 @@ function ExportMenuItem({
       style={{
         display: "block",
         width: "100%",
-        padding: "9px 16px",
+        padding: "9px 12px",
         border: "none",
         background: hovered ? (isDark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.07)") : "transparent",
         cursor: disabled ? "default" : "pointer",
