@@ -145,18 +145,15 @@ export function Sidebar({
                 <div
                   style={{
                     position: "absolute",
-                    top: "100%",
+                    top: "calc(100% + 4px)",
                     right: 0,
-                    marginTop: 4,
-                    width: "max-content",
-                    borderRadius: 10,
-                    background: t.cardBg,
-                    border: "none",
-                    boxShadow: t.isDark ? "0 8px 22px rgba(3,8,18,0.5)" : "0 8px 22px rgba(80,104,146,0.18)",
-                    backdropFilter: "blur(28px) saturate(115%)",
-                    WebkitBackdropFilter: "blur(28px) saturate(115%)",
-                    zIndex: 9000,
-                    overflow: "hidden",
+                    minWidth: 180,
+                    borderRadius: 12,
+                    background: t.isDark ? "#2c2c2e" : "#ffffff",
+                    border: `1px solid ${t.isDark ? "rgba(255,255,255,0.1)" : "rgba(0,0,0,0.08)"}`,
+                    boxShadow: "0 8px 32px rgba(0,0,0,0.18), 0 2px 8px rgba(0,0,0,0.08)",
+                    padding: "4px 0",
+                    zIndex: 1000,
                     animation: "exportMenuIn 0.12s ease-out",
                   }}
                   onMouseEnter={() => setShowExportMenu(true)}
@@ -185,6 +182,7 @@ export function Sidebar({
                       label={item.label}
                       onClick={item.onClick}
                       disabled={item.disabled}
+                      isDark={t.isDark}
                       t={t}
                     />
                   ))}
@@ -508,11 +506,13 @@ function ExportMenuItem({
   label,
   onClick,
   disabled,
+  isDark,
   t,
 }: {
   label: string;
   onClick: () => void;
   disabled: boolean;
+  isDark: boolean;
   t: ReturnType<typeof useTheme>;
 }) {
   const [hovered, setHovered] = useState(false);
@@ -524,17 +524,22 @@ function ExportMenuItem({
       style={{
         display: "block",
         width: "100%",
-        padding: "5px 10px",
+        padding: "0 4px",
         border: "none",
-        background: hovered ? t.btnHoverBg : "transparent",
+        background: "transparent",
         cursor: disabled ? "default" : "pointer",
-        textAlign: "left",
         opacity: disabled ? 0.5 : 1,
-        transition: "background 0.1s",
-        whiteSpace: "nowrap",
+        textAlign: "left",
       }}
     >
-      <div style={{ fontSize: 10.5, fontWeight: 500, color: "#000000" }}>{label}</div>
+      <div style={{
+        padding: "9px 12px",
+        borderRadius: 6,
+        background: hovered ? (isDark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.07)") : "transparent",
+        transition: "background 0.1s",
+      }}>
+        <div style={{ fontSize: 13, fontWeight: 500, color: isDark ? "#ffffff" : "#000000", whiteSpace: "nowrap" }}>{label}</div>
+      </div>
     </button>
   );
 }
