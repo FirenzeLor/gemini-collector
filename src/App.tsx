@@ -11,7 +11,7 @@ import { Account, Conversation, ConversationSummary } from "./data/types";
 import { ThemeContext, lightTheme, darkTheme } from "./theme";
 
 type Screen = "account-picker" | "chat";
-type ConversationSortMode = "updated_desc" | "size_desc";
+type ConversationSortMode = "updated_desc" | "size_desc" | "media_desc";
 const AUTO_SYNC_RETRY_MS = 60 * 1000;
 const AUTO_SYNC_STALE_MS = 24 * 60 * 60 * 1000;
 const AUTO_SYNC_TRACK_MAX = 500;
@@ -210,6 +210,12 @@ function summarySizeSortValue(summary: ConversationSummary): number {
   return Math.max(0, summary.messageCount);
 }
 
+function summaryMediaSortValue(summary: ConversationSummary): number {
+  const imageCount = Math.max(0, toSafeNumber(summary.imageCount, 0));
+  const videoCount = Math.max(0, toSafeNumber(summary.videoCount, 0));
+  return imageCount + videoCount;
+}
+
 function sortConversationSummaries(
   items: ConversationSummary[],
   mode: ConversationSortMode,
@@ -217,13 +223,20 @@ function sortConversationSummaries(
   return [...items].sort((a, b) => {
     const updatedDiff = summaryUpdatedSortValue(b) - summaryUpdatedSortValue(a);
     const sizeDiff = summarySizeSortValue(b) - summarySizeSortValue(a);
+    const mediaDiff = summaryMediaSortValue(b) - summaryMediaSortValue(a);
 
     if (mode === "size_desc") {
+      if (sizeDiff !== 0) return sizeDiff;
+      if (mediaDiff !== 0) return mediaDiff;
+      if (updatedDiff !== 0) return updatedDiff;
+    } else if (mode === "media_desc") {
+      if (mediaDiff !== 0) return mediaDiff;
       if (sizeDiff !== 0) return sizeDiff;
       if (updatedDiff !== 0) return updatedDiff;
     } else {
       if (updatedDiff !== 0) return updatedDiff;
       if (sizeDiff !== 0) return sizeDiff;
+      if (mediaDiff !== 0) return mediaDiff;
     }
 
     return a.id.localeCompare(b.id);
@@ -890,7 +903,11 @@ function App() {
           conversations={visibleConversationSummaries}
           conversationSortMode={conversationSortMode}
           onToggleConversationSort={() =>
-            setConversationSortMode((prev) => (prev === "updated_desc" ? "size_desc" : "updated_desc"))
+            setConversationSortMode((prev) => {
+              if (prev === "updated_desc") return "size_desc";
+              if (prev === "size_desc") return "media_desc";
+              return "updated_desc";
+            })
           }
           selectedId={selectedId}
           onSelect={setSelectedId}
