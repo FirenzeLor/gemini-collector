@@ -733,7 +733,6 @@ function AttachmentStrip({
   );
   const [collapseTwinImages, setCollapseTwinImages] = useState(false);
   const mediaAttachments = collapseTwinImages ? [mediaAttachmentsBase[0]] : mediaAttachmentsBase;
-  const fileAttachments = renderableAttachments.filter((a) => getKind(a.mimeType) === "file");
 
   React.useEffect(() => {
     let cancelled = false;
@@ -813,23 +812,6 @@ function AttachmentStrip({
         </div>
       )}
 
-      {/* File attachments */}
-      {fileAttachments.length > 0 && (
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, justifyContent: alignRight ? "flex-end" : "flex-start", marginBottom: 6 }}>
-          {fileAttachments.map((att, i) => (
-            <div
-              key={i}
-              style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 10px", borderRadius: 10, background: "rgba(0,0,0,0.1)", maxWidth: 200 }}
-            >
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-                <polyline points="14 2 14 8 20 8" />
-              </svg>
-              <span style={{ fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{att.mediaId}</span>
-            </div>
-          ))}
-        </div>
-      )}
 
       {/* Lightbox */}
       {lightboxIdx !== null && (
@@ -1136,6 +1118,31 @@ function MessageBubble({
             <>
               <span style={{ opacity: 0.4 }}>·</span>
               <span style={{ color: t.textSub }}>{message.model || "未知模型"}</span>
+              {message.attachments.length > 0 && (() => {
+                const first = message.attachments[0];
+                let mediaType: string;
+                if (first.mimeType.startsWith("video/")) mediaType = "video";
+                else if (first.mimeType.startsWith("audio/")) mediaType = "audio";
+                else if (first.mimeType.startsWith("image/")) mediaType = "image";
+                else mediaType = "file";
+                const badgeText = message.attachments.length > 1
+                  ? `${mediaType} ×${message.attachments.length}`
+                  : mediaType;
+                return (
+                  <span style={{
+                    fontSize: 10,
+                    fontWeight: 500,
+                    color: t.textMuted,
+                    background: t.hover,
+                    borderRadius: 4,
+                    padding: "1px 5px",
+                    marginLeft: 5,
+                    letterSpacing: 0.2,
+                  }}>
+                    {badgeText}
+                  </span>
+                );
+              })()}
             </>
           )}
         </div>
