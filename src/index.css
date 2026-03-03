@@ -131,6 +131,19 @@
   margin: 0.8em 0;
 }
 
+/* KaTeX math formula styles */
+.prose-ai .katex-display {
+  display: block;
+  overflow-x: auto;
+  margin: 1.2em 0;
+  padding: 0.6em 0;
+  text-align: center;
+  width: 100%;
+}
+.prose-ai li .katex-display {
+  margin: 0.8em 0;
+}
+
 /* Dark mode prose overrides */
 .prose-dark { color: #e8e8ed; }
 .prose-dark code { background: rgba(255,255,255,0.1); color: #e8e8ed; }
