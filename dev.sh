@@ -1,7 +1,7 @@
 #!/bin/bash
 # Restart local tauri dev app safely without leaving stale processes.
 
-APP_NAME="gemini-mac-app"
+APP_NAME="gemini-collector"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_CARGO_MANIFEST="$SCRIPT_DIR/src-tauri/Cargo.toml"
 APP_DEBUG_PATH="$HOME/.cargo/targets/$(basename "$SCRIPT_DIR")/debug/$APP_NAME"
