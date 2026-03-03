@@ -653,45 +653,50 @@ export function ChatView({ conversation, mediaDir, mediaVersion = 0 }: ChatViewP
           {parseWarning}
         </div>
       )}
-      {conversation.messages.length === 0 ? (
-        <div style={{ textAlign: "center", color: t.textMuted, fontSize: 13, marginTop: 60 }}>暂无消息记录</div>
-      ) : (
-        // position:relative so the absolutely-positioned timeline bar can anchor to it
-        <div style={{ flex: 1, position: "relative", overflow: "hidden" }}>
-          <Virtuoso
-            ref={virtuosoRef}
-            scrollerRef={(ref) => {
-              if (ref instanceof HTMLElement) {
-                ref.setAttribute("data-tl-scroller", "");
-                setScrollerEl(ref);
-              } else {
-                setScrollerEl(null);
+      {(() => {
+        const visibleMessages = conversation.messages.filter(
+          msg => !msg.text.includes("action_card_content")
+        );
+        return visibleMessages.length === 0 ? (
+          <div style={{ textAlign: "center", color: t.textMuted, fontSize: 13, marginTop: 60 }}>暂无消息记录</div>
+        ) : (
+          // position:relative so the absolutely-positioned timeline bar can anchor to it
+          <div style={{ flex: 1, position: "relative", overflow: "hidden" }}>
+            <Virtuoso
+              ref={virtuosoRef}
+              scrollerRef={(ref) => {
+                if (ref instanceof HTMLElement) {
+                  ref.setAttribute("data-tl-scroller", "");
+                  setScrollerEl(ref);
+                } else {
+                  setScrollerEl(null);
+                }
+              }}
+              rangeChanged={setVisibleRange}
+              key={`${conversation.id}:${conversation.updatedAt}:${mediaVersion}`}
+              data={visibleMessages}
+              followOutput="smooth"
+              initialTopMostItemIndex={visibleMessages.length - 1}
+              itemContent={(_, msg) => (
+                <MessageBubble
+                  message={msg}
+                  mediaDir={mediaDir}
+                  cacheKey={`${conversation.id}:${conversation.updatedAt}:${mediaVersion}`}
+                />
+              )}
+              style={{ position: "absolute", inset: 0 }}
+            />
+            <ConversationTimeline
+              messages={visibleMessages}
+              scrollerEl={scrollerEl}
+              visibleRange={visibleRange}
+              onJumpTo={(idx) =>
+                virtuosoRef.current?.scrollToIndex({ index: idx, behavior: "smooth", align: "start" })
               }
-            }}
-            rangeChanged={setVisibleRange}
-            key={`${conversation.id}:${conversation.updatedAt}:${mediaVersion}`}
-            data={conversation.messages}
-            followOutput="smooth"
-            initialTopMostItemIndex={conversation.messages.length - 1}
-            itemContent={(_, msg) => (
-              <MessageBubble
-                message={msg}
-                mediaDir={mediaDir}
-                cacheKey={`${conversation.id}:${conversation.updatedAt}:${mediaVersion}`}
-              />
-            )}
-            style={{ position: "absolute", inset: 0 }}
-          />
-          <ConversationTimeline
-            messages={conversation.messages}
-            scrollerEl={scrollerEl}
-            visibleRange={visibleRange}
-            onJumpTo={(idx) =>
-              virtuosoRef.current?.scrollToIndex({ index: idx, behavior: "smooth", align: "start" })
-            }
-          />
-        </div>
-      )}
+            />
+          </div>
+        );
+      })()}
     </div>
   );
 }
