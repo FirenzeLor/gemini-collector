@@ -1273,7 +1273,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gemini-mac-app"
+name = "gemini-collector"
 version = "0.1.0"
 dependencies = [
  "chrono",

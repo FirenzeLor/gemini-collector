@@ -5,7 +5,7 @@ PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPTS_DIR="$PROJECT_DIR/scripts"
 VENDOR_DIR="$SCRIPTS_DIR/_vendor"
 BUNDLE_DIR="$PROJECT_DIR/src-tauri/target/release/bundle"
-APP_NAME="gemini-mac-app"
+APP_NAME="gemini-collector"
 APP_PATH="$BUNDLE_DIR/macos/$APP_NAME.app"
 RESOURCES_DIR="$APP_PATH/Contents/Resources"
 

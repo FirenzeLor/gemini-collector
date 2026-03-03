@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    gemini_mac_app_lib::run()
+    gemini_collector_lib::run()
 }
