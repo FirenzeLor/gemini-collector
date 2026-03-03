@@ -947,7 +947,7 @@ function App() {
       </div>
       {showExportModal && exportStats && (
         <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }}>
-          <div style={{ width: 460, borderRadius: 14, background: theme.sidebarBg, backdropFilter: "blur(32px) saturate(120%)", WebkitBackdropFilter: "blur(32px) saturate(120%)", border: `1px solid ${theme.border}`, padding: 22 }}>
+          <div style={{ width: 460, borderRadius: 14, background: theme.isDark ? "#1c1f25" : "#ffffff", border: `1px solid ${theme.border}`, padding: 22 }}>
             {/* 标题 */}
             <div style={{ fontSize: 15, fontWeight: 700, color: theme.text }}>导出账号数据</div>
             {/* 双列 */}
