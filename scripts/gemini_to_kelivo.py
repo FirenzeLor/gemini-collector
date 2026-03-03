@@ -27,6 +27,19 @@ from pathlib import Path
 CST = timezone(timedelta(hours=8))
 
 
+def mask_email(email):
+    """返回脱敏后的邮箱，仅保留本地部分前3位，其余替换为 ***。"""
+    if not isinstance(email, str) or not email:
+        return email or ""
+    at_pos = email.find("@")
+    if at_pos <= 0:
+        return email[:3] + "***" if len(email) > 3 else email
+    local = email[:at_pos]
+    domain = email[at_pos:]
+    visible = local[:3]
+    return visible + "***" + domain
+
+
 def to_cst(utc_str) -> str:
     """将 UTC 时间加 8 小时得到北京时间数值，以 +00:00 标签输出。
     Kelivo 内部按 UTC 展示，用此方式让它显示正确的北京时间。"""
@@ -258,7 +271,7 @@ def convert_account(account_id: str, output_path: Path,
     conv_dir  = data_dir / "conversations"
     media_dir = data_dir / "media"
 
-    print(f"[信息] 账号: {acct_info['email']}")
+    print(f"[信息] 账号: {mask_email(acct_info['email'])}")
     jsonl_files = sorted(conv_dir.glob("*.jsonl"))
     if exclude:
         jsonl_files = [p for p in jsonl_files if p.stem not in exclude]

@@ -275,6 +275,8 @@ function App() {
   const [exportTimeRange, setExportTimeRange] = useState<"all" | "3d" | "7d" | "30d">("all");
   const [exportFormat, setExportFormat] = useState<"zip" | "kelivo" | "kelivo-split">("zip");
   const [exportStats, setExportStats] = useState<AccountExportStats | null>(null);
+  const [exportRangeBytesCache, setExportRangeBytesCache] = useState<Map<string, number>>(new Map());
+  const [exportRangeBytesLoading, setExportRangeBytesLoading] = useState(false);
   const [exportNotice, setExportNotice] = useState<{ title: string; lines: string[] } | null>(null);
   const [clearingAccountData, setClearingAccountData] = useState(false);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
@@ -615,6 +617,14 @@ function App() {
     };
   }, [currentAccount?.id, selectedId]);
 
+  // 当导出弹窗打开或时间范围切换时，异步加载对应范围的媒体体积
+  useEffect(() => {
+    if (showExportModal) {
+      void loadExportRangeBytes(exportTimeRange);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showExportModal, exportTimeRange]);
+
   function handleSelectAccount(account: Account) {
     setCurrentAccount(account);
     setScreen("chat");
@@ -710,6 +720,8 @@ function App() {
       setExportStats(stats);
       setExportTimeRange("all");
       setExportFormat("zip");
+      // 用 exportStats.totalBytes 预填 "all" 的缓存，避免重复请求
+      setExportRangeBytesCache(new Map([["all", stats.totalBytes]]));
       setShowExportModal(true);
     } catch (e) {
       setExportNotice({ title: "读取统计失败", lines: [e instanceof Error ? e.message : String(e)] });
@@ -718,10 +730,34 @@ function App() {
     }
   }
 
+  async function loadExportRangeBytes(range: "all" | "3d" | "7d" | "30d") {
+    if (!currentAccount) return;
+    if (exportRangeBytesCache.has(range)) return;
+    setExportRangeBytesLoading(true);
+    try {
+      const afterDate = range === "all" ? undefined
+        : new Date(Date.now() - (range === "3d" ? 3 : range === "7d" ? 7 : 30) * 86400_000).toISOString();
+      const json = await invoke<string>("get_account_range_bytes", {
+        accountId: currentAccount.id,
+        afterDate: afterDate ?? null,
+      });
+      const parsed: unknown = JSON.parse(json);
+      const totalBytes = (parsed && typeof parsed === "object" && "totalBytes" in parsed)
+        ? Number((parsed as Record<string, unknown>).totalBytes)
+        : 0;
+      setExportRangeBytesCache((prev) => new Map(prev).set(range, totalBytes));
+    } catch {
+      // 加载失败时静默忽略，不影响弹窗正常使用
+    } finally {
+      setExportRangeBytesLoading(false);
+    }
+  }
+
   async function confirmExport() {
     if (!currentAccount || !exportStats || exportingAccountData || preparingExportData) return;
     setShowExportModal(false);
     setExportStats(null);
+    setExportRangeBytesCache(new Map());
     const startedAt = Date.now();
     setExportingAccountData(true);
     try {
@@ -1002,6 +1038,10 @@ function App() {
               const displayMediaCount = filteredSummaries
                 ? filteredSummaries.reduce((sum, c) => sum + (c.imageCount ?? 0) + (c.videoCount ?? 0), 0)
                 : exportStats.mediaFileCount;
+              const cachedBytes = exportRangeBytesCache.get(exportTimeRange);
+              const bytesText = cachedBytes !== undefined
+                ? formatBytes(cachedBytes)
+                : exportRangeBytesLoading ? "加载中…" : "—";
               return (
                 <div style={{ marginTop: 12, padding: "10px 12px", background: theme.hover, borderRadius: 8, fontSize: 12, color: theme.textSub, lineHeight: 1.8 }}>
                   <div>对话数: <span style={{ color: theme.text, fontWeight: 500 }}>{displayConvCount}</span></div>
@@ -1009,19 +1049,16 @@ function App() {
                   {filteredSummaries === null && (
                     <>
                       <div>文件总数: <span style={{ color: theme.text, fontWeight: 500 }}>{exportStats.totalFileCount}</span></div>
-                      <div>当前体积: <span style={{ color: theme.text, fontWeight: 500 }}>{formatBytes(exportStats.totalBytes)}</span></div>
                       <div>预估压缩后: <span style={{ color: theme.text, fontWeight: 500 }}>{formatBytes(exportStats.estimatedZipBytes)}</span></div>
                     </>
                   )}
-                  {filteredSummaries !== null && (
-                    <div style={{ color: theme.textMuted, fontSize: 11, marginTop: 4 }}>体积信息仅在"全部"模式下显示</div>
-                  )}
+                  <div>媒体体积: <span style={{ color: theme.text, fontWeight: 500 }}>{bytesText}</span></div>
                 </div>
               );
             })()}
             {/* 按钮行 */}
             <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 14 }}>
-              <button onClick={() => { setShowExportModal(false); setExportStats(null); }} style={{ padding: "7px 16px", borderRadius: 8, border: "none", background: theme.btnHoverBg, color: theme.text, fontSize: 13, cursor: "pointer" }}>取消</button>
+              <button onClick={() => { setShowExportModal(false); setExportStats(null); setExportRangeBytesCache(new Map()); }} style={{ padding: "7px 16px", borderRadius: 8, border: "none", background: theme.btnHoverBg, color: theme.text, fontSize: 13, cursor: "pointer" }}>取消</button>
               <button onClick={() => { void confirmExport(); }} disabled={exportingAccountData} style={{ padding: "7px 16px", borderRadius: 8, border: "none", background: "#0071e3", color: "#fff", fontSize: 13, fontWeight: 600, cursor: exportingAccountData ? "default" : "pointer", opacity: exportingAccountData ? 0.6 : 1 }}>开始导出</button>
             </div>
           </div>
