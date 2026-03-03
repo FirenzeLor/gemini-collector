@@ -835,6 +835,21 @@ function App() {
     }
   }
 
+  async function handleDeleteConversation(convId: string) {
+    if (!currentAccount) return;
+    const accountId = currentAccount.id;
+    try {
+      await invoke("delete_conversation", { accountId, conversationId: convId });
+      if (selectedId === convId) {
+        setSelectedId(null);
+        setSelectedConversation(null);
+      }
+      setConversationSummaries(prev => prev.filter(c => c.id !== convId));
+    } catch (e) {
+      console.error("删除对话失败:", e);
+    }
+  }
+
   const anySyncTaskRunning =
     listSyncing || fullSyncing || syncingConversationIds.length > 0 || exportingAccountData || preparingExportData;
   const visibleConversationSummaries = useMemo(() => {
@@ -912,6 +927,7 @@ function App() {
           disableConversationSync={listSyncing || fullSyncing || clearingAccountData}
           onSyncConversation={handleSyncConversation}
           syncingConversationIds={syncingConversationIds}
+          onDeleteConversation={handleDeleteConversation}
         />
         <div
           style={{
