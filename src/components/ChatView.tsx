@@ -1,6 +1,9 @@
 import React, { useMemo, useState, useRef, useEffect } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
+import "katex/dist/katex.min.css";
 import { Virtuoso, VirtuosoHandle } from "react-virtuoso";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -653,45 +656,58 @@ export function ChatView({ conversation, mediaDir, mediaVersion = 0 }: ChatViewP
           {parseWarning}
         </div>
       )}
-      {conversation.messages.length === 0 ? (
-        <div style={{ textAlign: "center", color: t.textMuted, fontSize: 13, marginTop: 60 }}>暂无消息记录</div>
-      ) : (
-        // position:relative so the absolutely-positioned timeline bar can anchor to it
-        <div style={{ flex: 1, position: "relative", overflow: "hidden" }}>
-          <Virtuoso
-            ref={virtuosoRef}
-            scrollerRef={(ref) => {
-              if (ref instanceof HTMLElement) {
-                ref.setAttribute("data-tl-scroller", "");
-                setScrollerEl(ref);
-              } else {
-                setScrollerEl(null);
-              }
-            }}
-            rangeChanged={setVisibleRange}
-            key={`${conversation.id}:${conversation.updatedAt}:${mediaVersion}`}
-            data={conversation.messages}
-            followOutput="smooth"
-            initialTopMostItemIndex={conversation.messages.length - 1}
-            itemContent={(_, msg) => (
-              <MessageBubble
-                message={msg}
-                mediaDir={mediaDir}
-                cacheKey={`${conversation.id}:${conversation.updatedAt}:${mediaVersion}`}
-              />
-            )}
-            style={{ position: "absolute", inset: 0 }}
-          />
-          <ConversationTimeline
-            messages={conversation.messages}
-            scrollerEl={scrollerEl}
-            visibleRange={visibleRange}
-            onJumpTo={(idx) =>
-              virtuosoRef.current?.scrollToIndex({ index: idx, behavior: "smooth", align: "start" })
+      {(() => {
+        const toRemove = new Set<number>();
+        conversation.messages.forEach((msg, i) => {
+          if (msg.text.includes("action_card_content")) {
+            toRemove.add(i);
+            for (let j = i - 1; j >= 0; j--) {
+              if (conversation.messages[j].role === "user") { toRemove.add(j); break; }
+              if (conversation.messages[j].role === "model") break;
             }
-          />
-        </div>
-      )}
+          }
+        });
+        const visibleMessages = conversation.messages.filter((_, i) => !toRemove.has(i));
+        return visibleMessages.length === 0 ? (
+          <div style={{ textAlign: "center", color: t.textMuted, fontSize: 13, marginTop: 60 }}>暂无消息记录</div>
+        ) : (
+          // position:relative so the absolutely-positioned timeline bar can anchor to it
+          <div style={{ flex: 1, position: "relative", overflow: "hidden" }}>
+            <Virtuoso
+              ref={virtuosoRef}
+              scrollerRef={(ref) => {
+                if (ref instanceof HTMLElement) {
+                  ref.setAttribute("data-tl-scroller", "");
+                  setScrollerEl(ref);
+                } else {
+                  setScrollerEl(null);
+                }
+              }}
+              rangeChanged={setVisibleRange}
+              key={`${conversation.id}:${conversation.updatedAt}:${mediaVersion}`}
+              data={visibleMessages}
+              followOutput="smooth"
+              initialTopMostItemIndex={visibleMessages.length - 1}
+              itemContent={(_, msg) => (
+                <MessageBubble
+                  message={msg}
+                  mediaDir={mediaDir}
+                  cacheKey={`${conversation.id}:${conversation.updatedAt}:${mediaVersion}`}
+                />
+              )}
+              style={{ position: "absolute", inset: 0 }}
+            />
+            <ConversationTimeline
+              messages={visibleMessages}
+              scrollerEl={scrollerEl}
+              visibleRange={visibleRange}
+              onJumpTo={(idx) =>
+                virtuosoRef.current?.scrollToIndex({ index: idx, behavior: "smooth", align: "start" })
+              }
+            />
+          </div>
+        );
+      })()}
     </div>
   );
 }
@@ -720,7 +736,6 @@ function AttachmentStrip({
   );
   const [collapseTwinImages, setCollapseTwinImages] = useState(false);
   const mediaAttachments = collapseTwinImages ? [mediaAttachmentsBase[0]] : mediaAttachmentsBase;
-  const fileAttachments = renderableAttachments.filter((a) => getKind(a.mimeType) === "file");
 
   React.useEffect(() => {
     let cancelled = false;
@@ -800,23 +815,6 @@ function AttachmentStrip({
         </div>
       )}
 
-      {/* File attachments */}
-      {fileAttachments.length > 0 && (
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, justifyContent: alignRight ? "flex-end" : "flex-start", marginBottom: 6 }}>
-          {fileAttachments.map((att, i) => (
-            <div
-              key={i}
-              style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 10px", borderRadius: 10, background: "rgba(0,0,0,0.1)", maxWidth: 200 }}
-            >
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-                <polyline points="14 2 14 8 20 8" />
-              </svg>
-              <span style={{ fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{att.mediaId}</span>
-            </div>
-          ))}
-        </div>
-      )}
 
       {/* Lightbox */}
       {lightboxIdx !== null && (
@@ -1071,7 +1069,8 @@ function MessageBubble({
             ) : (
               <div className={`prose-ai${t.isDark ? " prose-dark" : ""}`}>
                 <ReactMarkdown
-                  remarkPlugins={[remarkGfm]}
+                  remarkPlugins={[remarkGfm, remarkMath]}
+                  rehypePlugins={[rehypeKatex]}
                   components={{
                     a: ({ href, children, ...props }) => (
                       <a
@@ -1123,6 +1122,47 @@ function MessageBubble({
             <>
               <span style={{ opacity: 0.4 }}>·</span>
               <span style={{ color: t.textSub }}>{message.model || "未知模型"}</span>
+              {message.attachments.length > 0 && (() => {
+                const atts = message.attachments;
+                // 音乐文件：Gemini 对音乐同时输出一个 video/* (封面合并版) 和一个 audio/*，
+                // 实际代表同一首音乐，计为 audio ×1。
+                const hasVideo = atts.some((a) => a.mimeType.startsWith("video/"));
+                const hasAudio = atts.some((a) => a.mimeType.startsWith("audio/"));
+                const isMusicPair = atts.length === 2 && hasVideo && hasAudio;
+                let displayCount: number;
+                let mediaType: string;
+                if (isMusicPair) {
+                  mediaType = "audio";
+                  displayCount = 1;
+                } else {
+                  const first = atts[0];
+                  if (first.mimeType.startsWith("video/")) mediaType = "video";
+                  else if (first.mimeType.startsWith("audio/")) mediaType = "audio";
+                  else if (first.mimeType.startsWith("image/")) mediaType = "image";
+                  else mediaType = "file";
+                  displayCount = atts.length;
+                }
+                const countText = displayCount > 1 ? `${mediaType} ×${displayCount}` : mediaType;
+                // 累加附件体积（来自 Rust 注入的 size 字段，单位 bytes）
+                const totalBytes = atts.reduce((sum, a) => sum + (a.size ?? 0), 0);
+                const sizeText = totalBytes > 0
+                  ? ` · ${(totalBytes / 1048576).toFixed(1)} MB`
+                  : "";
+                return (
+                  <span style={{
+                    fontSize: 10,
+                    fontWeight: 500,
+                    color: t.textMuted,
+                    background: t.hover,
+                    borderRadius: 4,
+                    padding: "1px 5px",
+                    marginLeft: 5,
+                    letterSpacing: 0.2,
+                  }}>
+                    {countText}{sizeText}
+                  </span>
+                );
+              })()}
             </>
           )}
         </div>

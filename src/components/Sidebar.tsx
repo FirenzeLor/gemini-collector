@@ -15,11 +15,7 @@ interface SidebarProps {
   onSyncList: () => void;
   onSyncFull: () => void;
   exportingAccountData?: boolean;
-  disableExportAccountData?: boolean;
-  onExportAccountData?: () => void;
-  exportingKelivo?: boolean;
-  onExportToKelivo?: () => void;
-  onExportToKelivoSplit?: () => void;
+  onOpenExportModal?: () => void;
   clearingAccountData: boolean;
   disableClearAccountData?: boolean;
   onClearAccountData: () => void;
@@ -30,6 +26,7 @@ interface SidebarProps {
   disableConversationSync?: boolean;
   onSyncConversation?: (id: string) => Promise<void> | void;
   syncingConversationIds?: string[];
+  onDeleteConversation?: (convId: string) => void;
 }
 
 function formatConvTime(iso: string): string {
@@ -51,16 +48,16 @@ export function Sidebar({
   conversations, selectedId, onSelect, collapsed,
   conversationSortMode = "updated_desc", onToggleConversationSort,
   listSyncing, fullSyncing, onSyncList, onSyncFull, clearingAccountData, onClearAccountData,
-  exportingAccountData = false, disableExportAccountData = false, onExportAccountData,
-  exportingKelivo = false, onExportToKelivo, onExportToKelivoSplit,
+  exportingAccountData = false, onOpenExportModal,
   disableClearAccountData = false,
   currentAccount, accounts, onSwitchAccount,
   disableAccountSwitch = false, disableConversationSync = false,
   onSyncConversation, syncingConversationIds = [],
+  onDeleteConversation,
 }: SidebarProps) {
   const t = useTheme();
   const [showSwitcher, setShowSwitcher] = useState(false);
-  const [showExportMenu, setShowExportMenu] = useState(false);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; convId: string } | null>(null);
   const syncingSet = new Set(syncingConversationIds);
   const otherAccounts = accounts.filter((a) => a.id !== currentAccount.id);
   const conversationSortTitle =
@@ -90,7 +87,9 @@ export function Sidebar({
   }
 
   return (
-    <div style={{
+    <div
+      onClick={() => setContextMenu(null)}
+      style={{
       width: collapsed ? 0 : 260,
       minWidth: collapsed ? 0 : 260,
       transition: "width 0.25s cubic-bezier(0.4,0,0.2,1), min-width 0.25s cubic-bezier(0.4,0,0.2,1)",
@@ -112,85 +111,36 @@ export function Sidebar({
             对话历史
           </span>
           <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-            {/* 导出按钮（带悬停下拉） */}
-            <div
-              style={{ position: "relative" }}
-              onMouseEnter={() => {
-                if (!exportingAccountData && !disableExportAccountData && !exportingKelivo) setShowExportMenu(true);
+            {/* 导出按钮 */}
+            <button
+              title="导出当前账号数据"
+              onClick={(e) => {
+                e.stopPropagation();
+                onOpenExportModal?.();
               }}
-              onMouseLeave={() => setShowExportMenu(false)}
+              style={{
+                width: 22,
+                height: 22,
+                borderRadius: 6,
+                border: "none",
+                background: "transparent",
+                cursor: exportingAccountData ? "default" : "pointer",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                flexShrink: 0,
+                opacity: exportingAccountData ? 0.62 : 1,
+                transition: "background 0.12s",
+              }}
+              onMouseEnter={(e) => {
+                if (!exportingAccountData) (e.currentTarget as HTMLElement).style.background = t.btnHoverBg;
+              }}
+              onMouseLeave={(e) => {
+                (e.currentTarget as HTMLElement).style.background = "transparent";
+              }}
             >
-              <button
-                title="导出当前账号数据"
-                style={{
-                  width: 22,
-                  height: 22,
-                  borderRadius: 6,
-                  border: "none",
-                  background: showExportMenu ? t.btnHoverBg : "transparent",
-                  cursor: (exportingAccountData || disableExportAccountData || exportingKelivo) ? "default" : "pointer",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  flexShrink: 0,
-                  opacity: (exportingAccountData || disableExportAccountData || exportingKelivo) ? 0.62 : 1,
-                  transition: "background 0.12s",
-                }}
-              >
-                <ExportIcon spinning={exportingAccountData || exportingKelivo} color={(exportingAccountData || exportingKelivo) ? "#0071e3" : t.textMuted} />
-              </button>
-
-              {/* 下拉菜单 */}
-              {showExportMenu && !disableExportAccountData && !exportingKelivo && (
-                <div
-                  style={{
-                    position: "absolute",
-                    top: "100%",
-                    right: 0,
-                    marginTop: 4,
-                    width: "max-content",
-                    borderRadius: 10,
-                    background: t.cardBg,
-                    border: "none",
-                    boxShadow: t.isDark ? "0 8px 22px rgba(3,8,18,0.5)" : "0 8px 22px rgba(80,104,146,0.18)",
-                    backdropFilter: "blur(28px) saturate(115%)",
-                    WebkitBackdropFilter: "blur(28px) saturate(115%)",
-                    zIndex: 9000,
-                    overflow: "hidden",
-                    animation: "exportMenuIn 0.12s ease-out",
-                  }}
-                  onMouseEnter={() => setShowExportMenu(true)}
-                  onMouseLeave={() => setShowExportMenu(false)}
-                >
-                  <style>{`@keyframes exportMenuIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}`}</style>
-                  {[
-                    {
-                      label: "直接导出",
-                      onClick: () => { setShowExportMenu(false); onExportAccountData?.(); },
-                      disabled: exportingAccountData,
-                    },
-                    {
-                      label: "导出到 Kelivo",
-                      onClick: () => { setShowExportMenu(false); onExportToKelivo?.(); },
-                      disabled: exportingKelivo,
-                    },
-                    {
-                      label: "导出到 Kelivo（分包）",
-                      onClick: () => { setShowExportMenu(false); onExportToKelivoSplit?.(); },
-                      disabled: exportingKelivo,
-                    },
-                  ].map((item, idx) => (
-                    <ExportMenuItem
-                      key={idx}
-                      label={item.label}
-                      onClick={item.onClick}
-                      disabled={item.disabled}
-                      t={t}
-                    />
-                  ))}
-                </div>
-              )}
-            </div>
+              <ExportIcon spinning={exportingAccountData} color={exportingAccountData ? "#0071e3" : t.textMuted} />
+            </button>
             <button
               onClick={(e) => {
                 e.stopPropagation();
@@ -274,6 +224,10 @@ export function Sidebar({
                   onClick={() => onSelect(conv.id)}
                   syncing={syncingSet.has(conv.id)}
                   onSync={() => handleSyncConv(conv.id)}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    setContextMenu({ x: e.clientX, y: e.clientY, convId: conv.id });
+                  }}
                 />
               )}
             />
@@ -411,16 +365,54 @@ export function Sidebar({
           </button>
         </div>
       </div>
+      {contextMenu && (
+        <div
+          style={{
+            position: "fixed",
+            top: contextMenu.y,
+            left: contextMenu.x,
+            zIndex: 3000,
+            background: t.isDark ? "#1c1f25" : "#ffffff",
+            borderRadius: 8,
+            border: `1px solid ${t.divider}`,
+            padding: "4px 0",
+            minWidth: 140,
+            boxShadow: "0 4px 16px rgba(0,0,0,0.18)",
+          }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <button
+            onClick={() => {
+              onDeleteConversation?.(contextMenu.convId);
+              setContextMenu(null);
+            }}
+            style={{
+              display: "block",
+              width: "100%",
+              padding: "8px 14px",
+              border: "none",
+              background: "transparent",
+              color: "#ef4444",
+              fontSize: 13,
+              textAlign: "left",
+              cursor: "pointer",
+            }}
+          >
+            删除此对话
+          </button>
+        </div>
+      )}
     </div>
   );
 }
 
-function ConversationItem({ conversation, selected, onClick, syncing, onSync }: {
+function ConversationItem({ conversation, selected, onClick, syncing, onSync, onContextMenu }: {
   conversation: ConversationSummary;
   selected: boolean;
   onClick: () => void;
   syncing: boolean;
   onSync: () => void;
+  onContextMenu?: (e: React.MouseEvent<HTMLDivElement>) => void;
 }) {
   const t = useTheme();
   const [copied, setCopied] = useState(false);
@@ -442,6 +434,7 @@ function ConversationItem({ conversation, selected, onClick, syncing, onSync }: 
   return (
     <div
       onClick={onClick}
+      onContextMenu={onContextMenu}
       style={{ display: "flex", alignItems: "center", width: "calc(100% - 12px)", padding: "8px 12px", borderRadius: 8, margin: "1px 6px", background: selected ? t.selectedBg : "transparent", transition: "background 0.12s", cursor: "pointer", gap: 4 }}
       onMouseEnter={(e) => { if (!selected) (e.currentTarget as HTMLElement).style.background = t.hover; }}
       onMouseLeave={(e) => { if (!selected) (e.currentTarget as HTMLElement).style.background = "transparent"; }}
@@ -504,40 +497,6 @@ function PendingDot() {
   );
 }
 
-function ExportMenuItem({
-  label,
-  onClick,
-  disabled,
-  t,
-}: {
-  label: string;
-  onClick: () => void;
-  disabled: boolean;
-  t: ReturnType<typeof useTheme>;
-}) {
-  const [hovered, setHovered] = useState(false);
-  return (
-    <button
-      onClick={disabled ? undefined : onClick}
-      onMouseEnter={() => !disabled && setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-      style={{
-        display: "block",
-        width: "100%",
-        padding: "5px 10px",
-        border: "none",
-        background: hovered ? t.btnHoverBg : "transparent",
-        cursor: disabled ? "default" : "pointer",
-        textAlign: "left",
-        opacity: disabled ? 0.5 : 1,
-        transition: "background 0.1s",
-        whiteSpace: "nowrap",
-      }}
-    >
-      <div style={{ fontSize: 10.5, fontWeight: 700, color: t.textMuted, letterSpacing: 0.2 }}>{label}</div>
-    </button>
-  );
-}
 
 function ExportIcon({ spinning, color }: { spinning: boolean; color: string }) {
   return (
