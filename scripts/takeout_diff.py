@@ -23,7 +23,7 @@ from pathlib import Path
 # ── 常量 ──────────────────────────────────────────────────────────────────────
 
 APP_DATA_DEFAULT = (
-    Path.home() / "Library" / "Application Support" / "com.gemini-collector.app"
+    Path.home() / "Library" / "Application Support" / "com.gemini-collector"
 )
 TAKEOUT_DEFAULT = (
     Path.home()

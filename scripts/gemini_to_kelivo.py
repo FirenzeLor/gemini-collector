@@ -54,7 +54,7 @@ def to_cst(utc_str) -> str:
         return utc_str
 
 # ── App 数据目录 ──────────────────────────────────────────────────────────────
-APP_DATA = Path.home() / "Library" / "Application Support" / "com.gemini-collector.app"
+APP_DATA = Path.home() / "Library" / "Application Support" / "com.gemini-collector"
 
 
 # ── 工具函数 ──────────────────────────────────────────────────────────────────

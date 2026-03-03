@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 APP_DATA_DEFAULT = (
-    Path.home() / "Library" / "Application Support" / "com.gemini-collector.app"
+    Path.home() / "Library" / "Application Support" / "com.gemini-collector"
 )
 
 # ── 格式检测 ──────────────────────────────────────────────────────────────────
