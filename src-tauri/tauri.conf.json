@@ -33,14 +33,15 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "resources": [
-      "../scripts/gemini_export.py",
-      "../scripts/gemini_worker.py",
-      {
-        "src": "../scripts/_vendor/**/*",
-        "dest": "_vendor/"
-      }
-    ],
+    "resources": {
+      "../scripts/gemini_export.py": "./",
+      "../scripts/gemini_worker.py": "./",
+      "../scripts/gemini_protocol.py": "./",
+      "../scripts/gemini_cookies.py": "./",
+      "../scripts/gemini_turn_parser.py": "./",
+      "../scripts/gemini_media.py": "./",
+      "../scripts/gemini_storage.py": "./"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
