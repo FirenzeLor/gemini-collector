@@ -3,6 +3,7 @@
 export interface Attachment {
   mediaId: string;   // filename with extension in media/ dir
   mimeType: string;
+  size?: number;     // file size in bytes, injected by Rust at load time
   previewMediaId?: string; // optional preview image for video
   downloadFailed?: boolean;
   downloadError?: string;

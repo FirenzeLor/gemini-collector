@@ -363,6 +363,104 @@ fn zip_account_dir(account_dir: &Path, zip_path: &Path) -> Result<(), String> {
     }
 }
 
+/// 扫描指定账号、指定时间范围内的 JSONL 文件，累加其中所有 attachment 对应的
+/// media 文件大小，返回 `{"totalBytes": N}` JSON 字符串。
+/// after_date 为 ISO 8601 字符串（可选），不传则统计全部。
+#[tauri::command]
+fn get_account_range_bytes(
+    app: tauri::AppHandle,
+    account_id: Option<String>,
+    #[allow(non_snake_case)] accountId: Option<String>,
+    after_date: Option<String>,
+    #[allow(non_snake_case)] afterDate: Option<String>,
+) -> Result<String, String> {
+    let account_id = resolve_account_id_arg(account_id, accountId)?;
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let account_dir = data_dir.join("accounts").join(&account_id);
+    if !account_dir.exists() {
+        return Err(format!("账号目录不存在: {}", account_id));
+    }
+    let conversations_dir = account_dir.join("conversations");
+    let media_dir = account_dir.join("media");
+
+    // after_date 过滤阈值
+    let after = after_date
+        .or(afterDate)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    if !conversations_dir.exists() {
+        let result = serde_json::json!({ "totalBytes": 0u64 });
+        return serde_json::to_string(&result).map_err(|e| e.to_string());
+    }
+
+    let mut total_bytes: u64 = 0;
+
+    for entry in std::fs::read_dir(&conversations_dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+            continue;
+        }
+
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        // 先扫描 meta 行获取 updatedAt，如有 after_date 则过滤
+        let mut updated_at: Option<String> = None;
+        let mut media_ids: Vec<String> = Vec::new();
+
+        for line in raw.lines() {
+            let s = line.trim();
+            if s.is_empty() { continue; }
+            let obj: serde_json::Value = match serde_json::from_str(s) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            match obj.get("type").and_then(|v| v.as_str()) {
+                Some("meta") => {
+                    if updated_at.is_none() {
+                        updated_at = obj.get("updatedAt").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    }
+                }
+                Some("message") => {
+                    if let Some(atts) = obj.get("attachments").and_then(|v| v.as_array()) {
+                        for att in atts {
+                            if let Some(mid) = att.get("mediaId").and_then(|v| v.as_str()) {
+                                if !mid.is_empty() {
+                                    media_ids.push(mid.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // 时间范围过滤：updatedAt < after_date 则跳过
+        if let Some(ref after_str) = after {
+            let conv_updated = updated_at.as_deref().unwrap_or("");
+            if !conv_updated.is_empty() && conv_updated < after_str.as_str() {
+                continue;
+            }
+        }
+
+        // 累加该会话所有 media 文件大小
+        for mid in &media_ids {
+            let file_path = media_dir.join(mid);
+            if let Ok(meta_fs) = std::fs::metadata(&file_path) {
+                total_bytes += meta_fs.len();
+            }
+        }
+    }
+
+    let result = serde_json::json!({ "totalBytes": total_bytes });
+    serde_json::to_string(&result).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn get_account_export_stats(
     app: tauri::AppHandle,
@@ -1346,6 +1444,30 @@ fn load_conversation_detail(
         None
     };
 
+    // 为每个 attachment 注入 size 字段（从 media 目录查找文件大小）
+    let media_dir = data_dir
+        .join("accounts")
+        .join(&account_id)
+        .join("media");
+    for msg in messages.iter_mut() {
+        if let Some(atts) = msg.get_mut("attachments").and_then(|v| v.as_array_mut()) {
+            for att in atts.iter_mut() {
+                if let Some(obj) = att.as_object_mut() {
+                    if !obj.contains_key("size") {
+                        if let Some(media_id) = obj.get("mediaId").and_then(|v| v.as_str()) {
+                            if !media_id.is_empty() {
+                                let file_path = media_dir.join(media_id);
+                                if let Ok(meta_fs) = std::fs::metadata(&file_path) {
+                                    obj.insert("size".to_string(), serde_json::Value::Number(meta_fs.len().into()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let meta_val = meta.unwrap_or_else(|| serde_json::json!({}));
     let title = meta_val
         .get("title")
@@ -1415,6 +1537,7 @@ pub fn run() {
             run_accounts_import,
             enqueue_job,
             get_account_export_stats,
+            get_account_range_bytes,
             export_account_zip,
             export_account_kelivo,
             export_account_kelivo_split,

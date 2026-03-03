@@ -562,8 +562,11 @@ class GeminiWorker:
                 done_progress = result.get("progress") if isinstance(result, dict) else None
                 self._emit_job_state(job, "done", progress=done_progress)
             except Exception as exc:
+                sess_cls = self._session_expired_error_cls
                 if self._is_backoff_limit_error(exc):
                     self._log("job_loop", f"任务因全局退避兜底提前结束: {exc}")
+                elif sess_cls and isinstance(exc, sess_cls):
+                    self._log("job_loop", f"任务失败（session 重试耗尽）: {exc}")
                 else:
                     traceback.print_exc(file=sys.stderr)
                 self._emit_job_state(job, "failed", error=self._to_error(exc))

@@ -47,6 +47,7 @@ from gemini_protocol import (
     _summary_to_epoch_seconds, email_to_account_id, normalize_chat_id,
     _diagnose_auth_page, _extract_chat_latest_update, _request_backoff_seconds,
     parse_batchexecute_response, has_batchexecute_session_error,
+    mask_email,
 )
 from gemini_cookies import (
     GOOGLE_MEDIA_COOKIE_NAMES,
@@ -1009,7 +1010,7 @@ class GeminiExporter:
         media_dir.mkdir(parents=True, exist_ok=True)
         self._set_request_state_scope(account_dir)
 
-        print(f"[*] 账号: {account_info['email'] or account_id}")
+        print(f"[*] 账号: {mask_email(account_info['email']) or account_id}")
         print(f"[*] 仅同步列表到: {account_dir.absolute()}")
 
         existing_order, existing_index = _load_conversations_index(account_dir)
@@ -1252,7 +1253,7 @@ class GeminiExporter:
             "media_failed": 0,
         }
 
-        print(f"[*] 账号: {account_info['email'] or account_id}")
+        print(f"[*] 账号: {mask_email(account_info['email']) or account_id}")
         print(f"[*] 同步单会话: {conv_id}")
 
         retry_stats = self._retry_failed_media_for_conversation(
