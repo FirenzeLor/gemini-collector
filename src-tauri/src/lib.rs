@@ -561,11 +561,23 @@ fn parse_kelivo_jsonl(path: &Path, media_dir: &Path, after_date: Option<&str>) -
     let mut message_ids: Vec<serde_json::Value> = Vec::new();
     let mut media_ids: Vec<String> = Vec::new();
 
-    for msg in &messages {
+    // 预先标记需要过滤的索引：含 action_card_content 的消息及其前一条 user 消息
+    let mut to_remove: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (i, msg) in messages.iter().enumerate() {
         let text = msg.get("text").and_then(|v| v.as_str()).unwrap_or("");
         if text.contains("action_card_content") {
-            continue;
+            to_remove.insert(i);
+            for j in (0..i).rev() {
+                let role = messages[j].get("role").and_then(|v| v.as_str()).unwrap_or("");
+                if role == "user" { to_remove.insert(j); break; }
+                if role == "model" { break; }
+            }
         }
+    }
+
+    for (i, msg) in messages.iter().enumerate() {
+        if to_remove.contains(&i) { continue; }
+        let text = msg.get("text").and_then(|v| v.as_str()).unwrap_or("");
         let msg_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let role_raw = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
         let role = if role_raw == "model" { "assistant" } else { "user" };

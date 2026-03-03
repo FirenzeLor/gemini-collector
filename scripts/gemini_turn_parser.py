@@ -79,7 +79,7 @@ def _is_media_descriptor(item):
         return False
 
     type_val = item[1]
-    if type_val not in (1, 2):
+    if type_val not in (1, 2, 4):
         return False
 
     has_url = False
@@ -93,6 +93,97 @@ def _is_media_descriptor(item):
     has_name = len(item) > 2 and isinstance(item[2], str) and "." in item[2]
     has_mime = len(item) > 11 and isinstance(item[11], str) and "/" in item[11]
     return has_name or has_mime
+
+
+def _extract_generated_media(ai_data):
+    """从候选数据的 [12] 提取 AI 生成的音乐/视频媒体。
+    返回 (files, music_meta, gen_meta)。
+    """
+    import json as _json
+    files = []
+    music_meta = None
+    gen_meta = None
+
+    if not isinstance(ai_data, list):
+        return files, music_meta, gen_meta
+
+    try:
+        block12 = ai_data[12]
+        if not isinstance(block12, list) or not block12:
+            return files, music_meta, gen_meta
+
+        last_idx = -1
+        for idx in range(len(block12) - 1, -1, -1):
+            if block12[idx] is not None:
+                last_idx = idx
+                break
+        if last_idx < 0:
+            return files, music_meta, gen_meta
+
+        block = block12[last_idx]
+        if not isinstance(block, list) or not block:
+            return files, music_meta, gen_meta
+
+        # 检测音乐块: block[6] 存在且含 "music_gen"
+        is_music = (
+            len(block) > 6
+            and isinstance(block[6], list)
+            and "music_gen" in _json.dumps(block[6:])
+        )
+
+        if is_music:
+            for slot_idx in (0, 1):
+                if len(block) > slot_idx and isinstance(block[slot_idx], list):
+                    slot = block[slot_idx]
+                    media_item = slot[1] if len(slot) > 1 and isinstance(slot[1], list) else None
+                    if media_item:
+                        files.append(_parse_media_item(media_item, "assistant"))
+
+            if len(block) > 2 and isinstance(block[2], list):
+                meta = block[2]
+                music_meta = {
+                    "title": meta[0] if len(meta) > 0 and isinstance(meta[0], str) else None,
+                    "album": meta[2] if len(meta) > 2 and isinstance(meta[2], str) else None,
+                    "genre": meta[4] if len(meta) > 4 and isinstance(meta[4], str) else None,
+                    "moods": meta[5] if len(meta) > 5 and isinstance(meta[5], list) else [],
+                }
+
+            if len(block) > 3 and isinstance(block[3], list) and len(block[3]) > 3:
+                caption = block[3][3]
+                if isinstance(caption, str):
+                    if music_meta is None:
+                        music_meta = {}
+                    music_meta["caption"] = caption
+
+            return files, music_meta, gen_meta
+
+        # 检测视频生成块
+        try:
+            inner = block[0]
+            if isinstance(inner, list) and inner:
+                group = inner[0]
+                if isinstance(group, list) and len(group) >= 2:
+                    media_items = group[0]
+                    gen_info = group[1] if len(group) > 1 else None
+
+                    if isinstance(media_items, list):
+                        for m in media_items:
+                            if isinstance(m, list) and len(m) > 1:
+                                files.append(_parse_media_item(m, "assistant"))
+
+                    if isinstance(gen_info, list) and gen_info:
+                        prompt = gen_info[0] if isinstance(gen_info[0], str) else None
+                        model = None
+                        if len(gen_info) > 2 and isinstance(gen_info[2], list) and len(gen_info[2]) > 2:
+                            model = gen_info[2][2] if isinstance(gen_info[2][2], str) else None
+                        gen_meta = {"model": model, "prompt": prompt}
+        except (IndexError, TypeError):
+            pass
+
+    except (IndexError, TypeError):
+        pass
+
+    return files, music_meta, gen_meta
 
 
 def _collect_media_descriptors(node, out):
@@ -195,7 +286,7 @@ def parse_turn(turn):
         "timestamp": None,
         "timestamp_iso": None,
         "user": {"text": "", "files": []},
-        "assistant": {"text": "", "thinking": "", "model": "", "files": []},
+        "assistant": {"text": "", "thinking": "", "model": "", "files": [], "music_meta": None, "gen_meta": None},
     }
 
     try:
@@ -289,6 +380,21 @@ def parse_turn(turn):
             has_attachments=bool(result["assistant"]["files"]),
         )
 
+        # AI 生成的音乐/视频（from ai_data[12] 深层结构）
+        if isinstance(ai_data, list):
+            gen_files, music_meta, gen_meta = _extract_generated_media(ai_data)
+            if gen_files:
+                # 去重后合并
+                existing_urls = {f.get("url") for f in result["assistant"]["files"]}
+                for gf in gen_files:
+                    if gf.get("url") not in existing_urls:
+                        result["assistant"]["files"].append(gf)
+                        existing_urls.add(gf.get("url"))
+            if music_meta:
+                result["assistant"]["music_meta"] = music_meta
+            if gen_meta:
+                result["assistant"]["gen_meta"] = gen_meta
+
     except (IndexError, TypeError):
         pass
 
@@ -304,6 +410,8 @@ def _parse_media_item(item, role):
         "mime": None,
         "url": None,
         "thumbnail_url": None,
+        "duration": None,
+        "resolution": None,
     }
 
     try:
@@ -327,9 +435,35 @@ def _parse_media_item(item, role):
                     media["thumbnail_url"] = urls[0]
             if not media["url"] and len(item) > 3 and isinstance(item[3], str):
                 media["url"] = item[3]
+        elif type_val == 4:
+            media["type"] = "audio"
+            if len(item) > 7 and isinstance(item[7], list):
+                urls = item[7]
+                if len(urls) > 1 and isinstance(urls[1], str):
+                    media["url"] = urls[1]
+                elif urls and isinstance(urls[0], str):
+                    media["url"] = urls[0]
+                if urls and isinstance(urls[0], str):
+                    media["thumbnail_url"] = urls[0]
+            if not media["url"] and len(item) > 3 and isinstance(item[3], str):
+                media["url"] = item[3]
         else:
             if len(item) > 3 and isinstance(item[3], str):
                 media["url"] = item[3]
+
+        # 时长: item[14] 如 [[30, 772244000]] → 30.77 秒
+        if len(item) > 14 and isinstance(item[14], list) and item[14]:
+            dur = item[14][0] if isinstance(item[14][0], list) else item[14]
+            if isinstance(dur, list) and len(dur) >= 1 and isinstance(dur[0], int):
+                secs = dur[0]
+                nanos = dur[1] if len(dur) > 1 and isinstance(dur[1], int) else 0
+                media["duration"] = round(secs + nanos / 1e9, 2)
+
+        # 分辨率: item[17] 如 [[8], 1280, 720]
+        if len(item) > 17 and isinstance(item[17], list) and len(item[17]) >= 3:
+            w, h = item[17][1], item[17][2]
+            if isinstance(w, int) and isinstance(h, int):
+                media["resolution"] = {"width": w, "height": h}
 
     except (IndexError, TypeError):
         pass

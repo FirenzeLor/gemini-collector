@@ -871,10 +871,15 @@ class GeminiExporter:
                         fname = global_seen_urls[url]
                         media_id = fname
                     else:
-                        ext = "mp4" if f.get("type") == "video" else "jpg"
+                        if f.get("type") == "video":
+                            ext = "mp4"
+                        elif f.get("type") == "audio":
+                            ext = "mp3"
+                        else:
+                            ext = "jpg"
                         raw_name = f.get("filename") or ""
                         raw_suffix = Path(raw_name).suffix.lower()
-                        if raw_suffix in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".mp4", ".mov", ".webm", ".mkv"}:
+                        if raw_suffix in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".mp4", ".mov", ".webm", ".mkv", ".mp3", ".m4a", ".wav", ".aac", ".flac", ".ogg"}:
                             ext = raw_suffix.lstrip(".")
 
                         while True:
@@ -1599,7 +1604,7 @@ class GeminiExporter:
                 ]
                 has_media = any(r.get("attachments") for r in all_msg_rows)
                 has_failed_data = _rows_has_failed_data(all_msg_rows)
-                image_count, video_count = _count_media_types_from_rows(all_msg_rows)
+                image_count, video_count, _audio_count = _count_media_types_from_rows(all_msg_rows)
                 last_text = ""
                 for r in reversed(all_msg_rows):
                     if r.get("text"):
@@ -1697,7 +1702,7 @@ class GeminiExporter:
             ]
             has_media = any(r.get("attachments") for r in msg_rows)
             has_failed_data = _rows_has_failed_data(msg_rows)
-            image_count, video_count = _count_media_types_from_rows(msg_rows)
+            image_count, video_count, _audio_count = _count_media_types_from_rows(msg_rows)
             last_text = ""
             for r in reversed(msg_rows):
                 if r.get("text"):

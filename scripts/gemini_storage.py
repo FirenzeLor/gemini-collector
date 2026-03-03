@@ -392,6 +392,7 @@ def _count_message_rows_new(jsonl_file):
 def _count_media_types_from_rows(rows):
     image_count = 0
     video_count = 0
+    audio_count = 0
     for row in rows:
         if not isinstance(row, dict) or row.get("type") != "message":
             continue
@@ -409,7 +410,9 @@ def _count_media_types_from_rows(rows):
                 image_count += 1
             elif mime_lower.startswith("video/"):
                 video_count += 1
-    return image_count, video_count
+            elif mime_lower.startswith("audio/"):
+                audio_count += 1
+    return image_count, video_count, audio_count
 
 
 def _rows_has_failed_data(rows):
@@ -539,6 +542,10 @@ def _turns_to_jsonl_rows(parsed_turns, conv_id, account_id, title, chat_info):
         thinking = asst.get("thinking", "")
         if thinking:
             model_row["thinking"] = thinking
+        if asst.get("music_meta"):
+            model_row["musicMeta"] = asst["music_meta"]
+        if asst.get("gen_meta"):
+            model_row["genMeta"] = asst["gen_meta"]
         rows.append(model_row)
 
     return rows
