@@ -23,6 +23,11 @@ import subprocess
 from pathlib import Path
 from urllib.parse import urlencode, quote, urlparse, parse_qsl, urlunparse, urljoin
 
+# Prepend bundled vendor directory (populated at DMG build time)
+_vendor_dir = Path(__file__).parent / "_vendor"
+if _vendor_dir.exists() and str(_vendor_dir) not in sys.path:
+    sys.path.insert(0, str(_vendor_dir))
+
 try:
     import httpx
 except ImportError:
