@@ -34,5 +34,8 @@ scripts/_vendor/
 # Rust build output
 src-tauri/target/
 
+# Release artifacts
+release/
+
 # Claude Code local config
 .claude/

@@ -17,7 +17,7 @@ import json
 from pathlib import Path
 
 ACCOUNT_ID = "example_account_id"
-APP_DATA = Path.home() / "Library" / "Application Support" / "com.gemini-collector.app"
+APP_DATA = Path.home() / "Library" / "Application Support" / "com.gemini-collector"
 
 
 def load_jsonl(path: Path) -> list:

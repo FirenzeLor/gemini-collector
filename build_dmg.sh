@@ -5,6 +5,7 @@ PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPTS_DIR="$PROJECT_DIR/scripts"
 VENDOR_DIR="$SCRIPTS_DIR/_vendor"
 BUNDLE_DIR="$PROJECT_DIR/src-tauri/target/release/bundle"
+RELEASE_DIR="$PROJECT_DIR/release"
 APP_NAME="gemini-collector"
 APP_PATH="$BUNDLE_DIR/macos/$APP_NAME.app"
 RESOURCES_DIR="$APP_PATH/Contents/Resources"
@@ -20,6 +21,14 @@ find_python() {
     echo "python3"
 }
 PYTHON="$(find_python)"
+
+cleanup() {
+    echo "[clean] 清理编译中间产物..."
+    rm -rf "$VENDOR_DIR"
+    rm -rf "$PROJECT_DIR/dist"
+    rm -rf "$BUNDLE_DIR"
+    echo "[clean] 完成"
+}
 
 echo "=== Gemini Collector DMG 构建 ==="
 echo "Python: $PYTHON ($($PYTHON --version))"
@@ -68,7 +77,7 @@ echo "[2/5] 构建前端..."
 npm run build --silent
 echo "      完成"
 
-# ── 3. Tauri 构建 .app（跳过 DMG，后面手动制作）────────────────────────────
+# ── 3. Tauri 构建 .app ───────────────────────────────────────────────────────
 echo "[3/5] 构建 Tauri .app..."
 npx tauri build --bundles app 2>&1 | grep -E "^   (Compiling|Finished|Bundling|error)" || true
 echo "      完成: $APP_PATH"
@@ -76,9 +85,7 @@ echo "      完成: $APP_PATH"
 # ── 4. 注入 _vendor 到 .app/Contents/Resources ───────────────────────────────
 echo "[4/5] 注入 _vendor 到 app bundle..."
 cp -r "$VENDOR_DIR" "$RESOURCES_DIR/_vendor"
-echo "      完成 ($(du -sh "$RESOURCES_DIR/_vendor" | cut -f1))"
 
-# 验证关键包是否在正确位置
 for pkg in httpx browser_cookie3 anyio; do
     if [ -d "$RESOURCES_DIR/_vendor/$pkg" ]; then
         echo "      ✓ $pkg"
@@ -87,23 +94,21 @@ for pkg in httpx browser_cookie3 anyio; do
     fi
 done
 
-# ── 5. 制作 DMG ──────────────────────────────────────────────────────────────
+# ── 5. 制作 DMG → release/ ───────────────────────────────────────────────────
 echo "[5/5] 制作 DMG..."
-mkdir -p "$BUNDLE_DIR/dmg"
+mkdir -p "$RELEASE_DIR"
 
-PRODUCT_NAME="$APP_NAME"
 VERSION="$(plutil -p "$APP_PATH/Contents/Info.plist" | grep CFBundleShortVersionString | awk -F'"' '{print $4}')"
 ARCH="$(uname -m)"
-DMG_NAME="${PRODUCT_NAME}_${VERSION}_${ARCH}.dmg"
-DMG_PATH="$BUNDLE_DIR/dmg/$DMG_NAME"
+DMG_NAME="${APP_NAME}_${VERSION}_${ARCH}.dmg"
+DMG_PATH="$RELEASE_DIR/$DMG_NAME"
 
-# 使用 hdiutil 制作带 Applications 快捷方式的 DMG
 TMP_DMG_DIR="$(mktemp -d)"
 cp -r "$APP_PATH" "$TMP_DMG_DIR/"
 ln -s /Applications "$TMP_DMG_DIR/Applications"
 
 hdiutil create \
-    -volname "$PRODUCT_NAME" \
+    -volname "$APP_NAME" \
     -srcfolder "$TMP_DMG_DIR" \
     -ov \
     -format UDZO \
@@ -111,7 +116,10 @@ hdiutil create \
 
 rm -rf "$TMP_DMG_DIR"
 
+# ── 清理中间产物 ──────────────────────────────────────────────────────────────
+cleanup
+
 echo
 echo "=== 构建完成 ==="
 ls -lh "$DMG_PATH"
-echo "DMG 路径: $DMG_PATH"
+echo "输出: $DMG_PATH"
