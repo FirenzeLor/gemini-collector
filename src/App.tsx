@@ -990,13 +990,35 @@ function App() {
               </div>
             </div>
             {/* 统计区 */}
-            <div style={{ marginTop: 12, padding: "10px 12px", background: theme.hover, borderRadius: 8, fontSize: 12, color: theme.textSub, lineHeight: 1.8 }}>
-              <div>对话数: <span style={{ color: theme.text, fontWeight: 500 }}>{exportStats.conversationCount}</span>（详情文件 <span style={{ color: theme.text, fontWeight: 500 }}>{exportStats.conversationFileCount}</span>）</div>
-              <div>媒体文件: <span style={{ color: theme.text, fontWeight: 500 }}>{exportStats.mediaFileCount}</span></div>
-              <div>文件总数: <span style={{ color: theme.text, fontWeight: 500 }}>{exportStats.totalFileCount}</span></div>
-              <div>当前体积: <span style={{ color: theme.text, fontWeight: 500 }}>{formatBytes(exportStats.totalBytes)}</span></div>
-              <div>预估压缩后: <span style={{ color: theme.text, fontWeight: 500 }}>{formatBytes(exportStats.estimatedZipBytes)}</span></div>
-            </div>
+            {(() => {
+              const filteredSummaries = exportTimeRange === "all"
+                ? null
+                : (() => {
+                    const days = exportTimeRange === "3d" ? 3 : exportTimeRange === "7d" ? 7 : 30;
+                    const afterDate = new Date(Date.now() - days * 86400_000).toISOString();
+                    return conversationSummaries.filter(c => c.updatedAt >= afterDate);
+                  })();
+              const displayConvCount = filteredSummaries ? filteredSummaries.length : exportStats.conversationCount;
+              const displayMediaCount = filteredSummaries
+                ? filteredSummaries.reduce((sum, c) => sum + (c.imageCount ?? 0) + (c.videoCount ?? 0), 0)
+                : exportStats.mediaFileCount;
+              return (
+                <div style={{ marginTop: 12, padding: "10px 12px", background: theme.hover, borderRadius: 8, fontSize: 12, color: theme.textSub, lineHeight: 1.8 }}>
+                  <div>对话数: <span style={{ color: theme.text, fontWeight: 500 }}>{displayConvCount}</span></div>
+                  <div>媒体文件（估算）: <span style={{ color: theme.text, fontWeight: 500 }}>{displayMediaCount}</span></div>
+                  {filteredSummaries === null && (
+                    <>
+                      <div>文件总数: <span style={{ color: theme.text, fontWeight: 500 }}>{exportStats.totalFileCount}</span></div>
+                      <div>当前体积: <span style={{ color: theme.text, fontWeight: 500 }}>{formatBytes(exportStats.totalBytes)}</span></div>
+                      <div>预估压缩后: <span style={{ color: theme.text, fontWeight: 500 }}>{formatBytes(exportStats.estimatedZipBytes)}</span></div>
+                    </>
+                  )}
+                  {filteredSummaries !== null && (
+                    <div style={{ color: theme.textMuted, fontSize: 11, marginTop: 4 }}>体积信息仅在"全部"模式下显示</div>
+                  )}
+                </div>
+              );
+            })()}
             {/* 按钮行 */}
             <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 14 }}>
               <button onClick={() => { setShowExportModal(false); setExportStats(null); }} style={{ padding: "7px 16px", borderRadius: 8, border: "none", background: theme.btnHoverBg, color: theme.text, fontSize: 13, cursor: "pointer" }}>取消</button>
