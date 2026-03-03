@@ -20,8 +20,38 @@ import argparse
 import json
 import sys
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
+
+# ── 时区常量 ──────────────────────────────────────────────────────────────────
+CST = timezone(timedelta(hours=8))
+
+
+def mask_email(email):
+    """返回脱敏后的邮箱，仅保留本地部分前3位，其余替换为 ***。"""
+    if not isinstance(email, str) or not email:
+        return email or ""
+    at_pos = email.find("@")
+    if at_pos <= 0:
+        return email[:3] + "***" if len(email) > 3 else email
+    local = email[:at_pos]
+    domain = email[at_pos:]
+    visible = local[:3]
+    return visible + "***" + domain
+
+
+def to_cst(utc_str) -> str:
+    """将 UTC 时间加 8 小时得到北京时间数值，以 +00:00 标签输出。
+    Kelivo 内部按 UTC 展示，用此方式让它显示正确的北京时间。"""
+    if not isinstance(utc_str, str) or not utc_str:
+        return utc_str
+    try:
+        from datetime import datetime
+        dt = datetime.fromisoformat(utc_str.replace("Z", "+00:00"))
+        cst_dt = dt.astimezone(CST)
+        return cst_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    except Exception:
+        return utc_str
 
 # ── App 数据目录 ──────────────────────────────────────────────────────────────
 APP_DATA = Path.home() / "Library" / "Application Support" / "com.gemini-collector.app"
@@ -94,7 +124,7 @@ def convert_message(msg: dict, conv_id: str) -> dict:
         "id": msg["id"],
         "role": role,
         "content": content,
-        "timestamp": msg.get("timestamp"),
+        "timestamp": to_cst(msg.get("timestamp")),
         "modelId": msg.get("model"),
         "providerId": "google",
         "totalTokens": None,
@@ -126,8 +156,8 @@ def convert_conversation(meta: dict, messages: list):
     kelivo_conv = {
         "id": conv_id,
         "title": meta.get("title", ""),
-        "createdAt": meta.get("createdAt"),
-        "updatedAt": meta.get("updatedAt"),
+        "createdAt": to_cst(meta.get("createdAt")),
+        "updatedAt": to_cst(meta.get("updatedAt")),
         "messageIds": message_ids,
         "isPinned": False,
         "mcpServerIds": [],
@@ -241,7 +271,7 @@ def convert_account(account_id: str, output_path: Path,
     conv_dir  = data_dir / "conversations"
     media_dir = data_dir / "media"
 
-    print(f"[信息] 账号: {acct_info['email']}")
+    print(f"[信息] 账号: {mask_email(acct_info['email'])}")
     jsonl_files = sorted(conv_dir.glob("*.jsonl"))
     if exclude:
         jsonl_files = [p for p in jsonl_files if p.stem not in exclude]

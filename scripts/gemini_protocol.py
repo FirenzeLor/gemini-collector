@@ -104,6 +104,19 @@ def email_to_account_id(email):
     return re.sub(r"[^a-z0-9]", "_", normalized)
 
 
+def mask_email(email):
+    """返回脱敏后的邮箱，仅保留本地部分前3位，其余替换为 ***。"""
+    if not isinstance(email, str) or not email:
+        return email or ""
+    at_pos = email.find("@")
+    if at_pos <= 0:
+        return email[:3] + "***" if len(email) > 3 else email
+    local = email[:at_pos]
+    domain = email[at_pos:]
+    visible = local[:3]
+    return visible + "***" + domain
+
+
 def normalize_chat_id(chat_id):
     """将外部传入的对话 ID 规范化为 c_xxx 形式。"""
     if not isinstance(chat_id, str):

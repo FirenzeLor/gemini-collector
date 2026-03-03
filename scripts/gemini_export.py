@@ -47,6 +47,7 @@ from gemini_protocol import (
     _summary_to_epoch_seconds, email_to_account_id, normalize_chat_id,
     _diagnose_auth_page, _extract_chat_latest_update, _request_backoff_seconds,
     parse_batchexecute_response, has_batchexecute_session_error,
+    mask_email,
 )
 from gemini_cookies import (
     GOOGLE_MEDIA_COOKIE_NAMES,
@@ -871,10 +872,15 @@ class GeminiExporter:
                         fname = global_seen_urls[url]
                         media_id = fname
                     else:
-                        ext = "mp4" if f.get("type") == "video" else "jpg"
+                        if f.get("type") == "video":
+                            ext = "mp4"
+                        elif f.get("type") == "audio":
+                            ext = "mp3"
+                        else:
+                            ext = "jpg"
                         raw_name = f.get("filename") or ""
                         raw_suffix = Path(raw_name).suffix.lower()
-                        if raw_suffix in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".mp4", ".mov", ".webm", ".mkv"}:
+                        if raw_suffix in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".mp4", ".mov", ".webm", ".mkv", ".mp3", ".m4a", ".wav", ".aac", ".flac", ".ogg"}:
                             ext = raw_suffix.lstrip(".")
 
                         while True:
@@ -1004,7 +1010,7 @@ class GeminiExporter:
         media_dir.mkdir(parents=True, exist_ok=True)
         self._set_request_state_scope(account_dir)
 
-        print(f"[*] 账号: {account_info['email'] or account_id}")
+        print(f"[*] 账号: {mask_email(account_info['email']) or account_id}")
         print(f"[*] 仅同步列表到: {account_dir.absolute()}")
 
         existing_order, existing_index = _load_conversations_index(account_dir)
@@ -1247,7 +1253,7 @@ class GeminiExporter:
             "media_failed": 0,
         }
 
-        print(f"[*] 账号: {account_info['email'] or account_id}")
+        print(f"[*] 账号: {mask_email(account_info['email']) or account_id}")
         print(f"[*] 同步单会话: {conv_id}")
 
         retry_stats = self._retry_failed_media_for_conversation(
@@ -1599,7 +1605,7 @@ class GeminiExporter:
                 ]
                 has_media = any(r.get("attachments") for r in all_msg_rows)
                 has_failed_data = _rows_has_failed_data(all_msg_rows)
-                image_count, video_count = _count_media_types_from_rows(all_msg_rows)
+                image_count, video_count, _audio_count = _count_media_types_from_rows(all_msg_rows)
                 last_text = ""
                 for r in reversed(all_msg_rows):
                     if r.get("text"):
@@ -1697,7 +1703,7 @@ class GeminiExporter:
             ]
             has_media = any(r.get("attachments") for r in msg_rows)
             has_failed_data = _rows_has_failed_data(msg_rows)
-            image_count, video_count = _count_media_types_from_rows(msg_rows)
+            image_count, video_count, _audio_count = _count_media_types_from_rows(msg_rows)
             last_text = ""
             for r in reversed(msg_rows):
                 if r.get("text"):

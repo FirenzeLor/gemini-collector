@@ -8,7 +8,7 @@ import json
 import sys
 from pathlib import Path
 
-from gemini_protocol import normalize_chat_id, email_to_account_id
+from gemini_protocol import normalize_chat_id, email_to_account_id, _coerce_epoch_seconds, _summary_to_epoch_seconds, mask_email
 from gemini_cookies import get_cookies_from_local_browser, discover_email_authuser_mapping
 from gemini_storage import (
     _load_conversations_index,
@@ -23,6 +23,8 @@ from gemini_storage import (
     _normalize_conversation_status, _status_for_remote_summary,
     _build_lost_summary, _build_summary_from_chat_listing,
     CONVERSATION_STATUS_NORMAL, CONVERSATION_STATUS_LOST,
+    _dedupe_raw_turns_by_id,
+    _update_jsonl_media_failure_flags,
 )
 from gemini_media import _ensure_video_previews_from_turns
 from gemini_turn_parser import parse_turn, normalize_turn_media_first_seen
@@ -61,7 +63,7 @@ def export_all(exporter, output_dir=None, chat_ids=None):
     exporter._set_request_state_scope(account_dir)
     existing_order, existing_index = _load_conversations_index(account_dir)
 
-    print(f"[*] 账号: {account_info['email'] or account_id}")
+    print(f"[*] 账号: {mask_email(account_info['email']) or account_id}")
     print(f"[*] 输出目录: {account_dir.absolute()}")
 
     # 3. 获取聊天列表
@@ -164,7 +166,7 @@ def export_all(exporter, output_dir=None, chat_ids=None):
             ]
             has_media = any(r.get("attachments") for r in msg_rows)
             has_failed_data = _rows_has_failed_data(msg_rows)
-            image_count, video_count = _count_media_types_from_rows(msg_rows)
+            image_count, video_count, _audio_count = _count_media_types_from_rows(msg_rows)
             last_text = ""
             for r in reversed(msg_rows):
                 if r.get("text"):
@@ -250,7 +252,7 @@ def export_all(exporter, output_dir=None, chat_ids=None):
     # 6. 输出统计
     print(f"\n{'=' * 50}")
     print(f"导出完成!")
-    print(f"  账号: {account_info['email'] or account_id}")
+    print(f"  账号: {mask_email(account_info['email']) or account_id}")
     print(f"  成功: {stats['success']}/{total}")
     print(f"  失败: {stats['failed']}/{total}")
     print(f"  媒体下载: {stats['media_downloaded']}")
@@ -285,7 +287,7 @@ def export_incremental(exporter, output_dir=None):
     media_dir.mkdir(parents=True, exist_ok=True)
     exporter._set_request_state_scope(account_dir)
 
-    print(f"[*] 账号: {account_info['email'] or account_id}")
+    print(f"[*] 账号: {mask_email(account_info['email']) or account_id}")
 
     global_seen_urls = _load_media_manifest_new(account_dir)
     global_used_names = set(global_seen_urls.values())
@@ -461,7 +463,7 @@ def export_incremental(exporter, output_dir=None):
         ]
         has_media = any(r.get("attachments") for r in all_msg_rows)
         has_failed_data = _rows_has_failed_data(all_msg_rows)
-        image_count, video_count = _count_media_types_from_rows(all_msg_rows)
+        image_count, video_count, _audio_count = _count_media_types_from_rows(all_msg_rows)
         last_text = ""
         for r in reversed(all_msg_rows):
             if r.get("text"):
@@ -540,7 +542,7 @@ def export_incremental(exporter, output_dir=None):
 
     print(f"\n{'=' * 50}")
     print("增量导出完成")
-    print(f"  账号: {account_info['email'] or account_id}")
+    print(f"  账号: {mask_email(account_info['email']) or account_id}")
     print(f"  检查会话: {stats['checked']}")
     print(f"  更新会话: {stats['updated']}")
     print(f"  停止位置: {stop_chat}")

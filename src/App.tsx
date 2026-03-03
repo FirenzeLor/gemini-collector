@@ -271,9 +271,12 @@ function App() {
   const [fullSyncing, setFullSyncing] = useState(false);
   const [preparingExportData, setPreparingExportData] = useState(false);
   const [exportingAccountData, setExportingAccountData] = useState(false);
-  const [exportingKelivo, setExportingKelivo] = useState(false);
-  const [showExportConfirm, setShowExportConfirm] = useState(false);
+  const [showExportModal, setShowExportModal] = useState(false);
+  const [exportTimeRange, setExportTimeRange] = useState<"all" | "3d" | "7d" | "30d">("all");
+  const [exportFormat, setExportFormat] = useState<"zip" | "kelivo" | "kelivo-split">("zip");
   const [exportStats, setExportStats] = useState<AccountExportStats | null>(null);
+  const [exportRangeBytesCache, setExportRangeBytesCache] = useState<Map<string, number>>(new Map());
+  const [exportRangeBytesLoading, setExportRangeBytesLoading] = useState(false);
   const [exportNotice, setExportNotice] = useState<{ title: string; lines: string[] } | null>(null);
   const [clearingAccountData, setClearingAccountData] = useState(false);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
@@ -614,6 +617,14 @@ function App() {
     };
   }, [currentAccount?.id, selectedId]);
 
+  // 当导出弹窗打开或时间范围切换时，异步加载对应范围的媒体体积
+  useEffect(() => {
+    if (showExportModal) {
+      void loadExportRangeBytes(exportTimeRange);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showExportModal, exportTimeRange]);
+
   function handleSelectAccount(account: Account) {
     setCurrentAccount(account);
     setScreen("chat");
@@ -698,98 +709,98 @@ function App() {
     await syncConversation(conversationId);
   }
 
-  async function handleExportAccountData() {
+  async function handleOpenExportModal() {
     if (!currentAccount || exportingAccountData || preparingExportData || clearingAccountData) return;
     setPreparingExportData(true);
     try {
-      const accountId = currentAccount.id;
       const stats = parseAccountExportStatsPayload(
-        await invoke<string>("get_account_export_stats", { accountId }),
+        await invoke<string>("get_account_export_stats", { accountId: currentAccount.id })
       );
-      if (!stats) {
-        throw new Error("读取导出统计失败");
-      }
+      if (!stats) throw new Error("读取导出统计失败");
       setExportStats(stats);
-      setShowExportConfirm(true);
+      setExportTimeRange("all");
+      setExportFormat("zip");
+      // 用 exportStats.totalBytes 预填 "all" 的缓存，避免重复请求
+      setExportRangeBytesCache(new Map([["all", stats.totalBytes]]));
+      setShowExportModal(true);
     } catch (e) {
-      console.error("导出账号数据失败:", e);
-      const msg = e instanceof Error ? e.message : String(e);
-      setExportNotice({
-        title: "导出账号数据失败",
-        lines: [msg],
-      });
+      setExportNotice({ title: "读取统计失败", lines: [e instanceof Error ? e.message : String(e)] });
     } finally {
       setPreparingExportData(false);
     }
   }
 
-  async function confirmExportAccountData() {
-    if (!currentAccount || !exportStats || exportingAccountData || preparingExportData) {
-      setShowExportConfirm(false);
-      return;
+  async function loadExportRangeBytes(range: "all" | "3d" | "7d" | "30d") {
+    if (!currentAccount) return;
+    if (exportRangeBytesCache.has(range)) return;
+    setExportRangeBytesLoading(true);
+    try {
+      const afterDate = range === "all" ? undefined
+        : new Date(Date.now() - (range === "3d" ? 3 : range === "7d" ? 7 : 30) * 86400_000).toISOString();
+      const json = await invoke<string>("get_account_range_bytes", {
+        accountId: currentAccount.id,
+        afterDate: afterDate ?? null,
+      });
+      const parsed: unknown = JSON.parse(json);
+      const totalBytes = (parsed && typeof parsed === "object" && "totalBytes" in parsed)
+        ? Number((parsed as Record<string, unknown>).totalBytes)
+        : 0;
+      setExportRangeBytesCache((prev) => new Map(prev).set(range, totalBytes));
+    } catch {
+      // 加载失败时静默忽略，不影响弹窗正常使用
+    } finally {
+      setExportRangeBytesLoading(false);
     }
+  }
 
-    setShowExportConfirm(false);
+  async function confirmExport() {
+    if (!currentAccount || !exportStats || exportingAccountData || preparingExportData) return;
+    setShowExportModal(false);
     setExportStats(null);
+    setExportRangeBytesCache(new Map());
     const startedAt = Date.now();
     setExportingAccountData(true);
     try {
       const accountId = currentAccount.id;
-      const selectedOutput = await open({
-        directory: true,
-        multiple: false,
-        title: "选择导出目录",
-      });
-      if (!selectedOutput) {
-        return;
-      }
-      const outputDir = Array.isArray(selectedOutput) ? selectedOutput[0] : selectedOutput;
-      if (!outputDir || typeof outputDir !== "string") {
-        throw new Error("未选择有效导出目录");
-      }
+      const afterDate = exportTimeRange === "all" ? undefined
+        : new Date(Date.now() - (exportTimeRange === "3d" ? 3 : exportTimeRange === "7d" ? 7 : 30) * 86400_000).toISOString();
 
-      const result = parseAccountExportResultPayload(
-        await invoke<string>("export_account_zip", { accountId, outputDir }),
-      );
-      if (!result) {
-        throw new Error("导出失败：返回结果异常");
+      if (exportFormat === "zip") {
+        const selectedOutput = await open({ directory: true, multiple: false, title: "选择导出目录" });
+        if (!selectedOutput) return;
+        const outputDir = Array.isArray(selectedOutput) ? selectedOutput[0] : selectedOutput;
+        if (!outputDir || typeof outputDir !== "string") throw new Error("未选择有效导出目录");
+        const result = parseAccountExportResultPayload(
+          await invoke<string>("export_account_zip", { accountId, outputDir })
+        );
+        if (!result) throw new Error("导出失败：返回结果异常");
+        try { await revealItemInDir(result.zipPath); } catch {}
+        setExportNotice({ title: "导出完成", lines: [`文件: ${result.fileName}`, `大小: ${formatBytes(result.zipSizeBytes)}`, `路径: ${result.zipPath}`] });
+      } else {
+        const selectedOutput = await open({ directory: true, multiple: false, title: "选择导出目录" });
+        if (!selectedOutput) return;
+        const outputDir = Array.isArray(selectedOutput) ? selectedOutput[0] : selectedOutput;
+        if (!outputDir || typeof outputDir !== "string") throw new Error("未选择有效导出目录");
+        const ts = new Date().toISOString().replace(/[-:]/g, "").slice(0, 15);
+        const outputPath = `${outputDir}/kelivo_${accountId}_${ts}.zip`;
+        const isSplit = exportFormat === "kelivo-split";
+        const stdout = isSplit
+          ? await invoke<string>("export_account_kelivo_split", { accountId, outputPath, maxJson: "10MB", maxUpload: "750MB", afterDate })
+          : await invoke<string>("export_account_kelivo", { accountId, outputPath, afterDate });
+        try { await revealItemInDir(isSplit ? outputDir : outputPath); } catch {}
+        setExportNotice({
+          title: isSplit ? "导出到 Kelivo（分包）完成" : "导出到 Kelivo 完成",
+          lines: stdout.trim().split("\n").filter(Boolean),
+        });
       }
-      try {
-        await revealItemInDir(result.zipPath);
-      } catch (revealErr) {
-        console.error("定位导出文件失败:", revealErr);
-      }
-
-      setExportNotice({
-        title: "导出完成",
-        lines: [
-          `文件: ${result.fileName}`,
-          `大小: ${formatBytes(result.zipSizeBytes)}`,
-          `路径: ${result.zipPath}`,
-        ],
-      });
     } catch (e) {
-      console.error("导出账号数据失败:", e);
       const msg = e instanceof Error ? e.message : String(e);
-      setExportNotice({
-        title: "导出账号数据失败",
-        lines: [msg],
-      });
+      setExportNotice({ title: "导出失败", lines: [msg] });
     } finally {
       const elapsed = Date.now() - startedAt;
-      if (elapsed < 450) {
-        await new Promise((resolve) => window.setTimeout(resolve, 450 - elapsed));
-      }
+      if (elapsed < 450) await new Promise(r => window.setTimeout(r, 450 - elapsed));
       setExportingAccountData(false);
     }
-  }
-
-  function handleExportToKelivo() {
-    // TODO: 实现导出到 Kelivo
-  }
-
-  function handleExportToKelivoSplit() {
-    // TODO: 实现导出到 Kelivo（分包）
   }
 
   async function handleClearAccountData() {
@@ -860,8 +871,23 @@ function App() {
     }
   }
 
+  async function handleDeleteConversation(convId: string) {
+    if (!currentAccount) return;
+    const accountId = currentAccount.id;
+    try {
+      await invoke("delete_conversation", { accountId, conversationId: convId });
+      if (selectedId === convId) {
+        setSelectedId(null);
+        setSelectedConversation(null);
+      }
+      setConversationSummaries(prev => prev.filter(c => c.id !== convId));
+    } catch (e) {
+      console.error("删除对话失败:", e);
+    }
+  }
+
   const anySyncTaskRunning =
-    listSyncing || fullSyncing || syncingConversationIds.length > 0 || exportingAccountData || preparingExportData || exportingKelivo;
+    listSyncing || fullSyncing || syncingConversationIds.length > 0 || exportingAccountData || preparingExportData;
   const visibleConversationSummaries = useMemo(() => {
     const visibleItems = conversationSummaries.filter((c) => !isHiddenSummary(c));
     return sortConversationSummaries(visibleItems, conversationSortMode);
@@ -925,12 +951,8 @@ function App() {
           fullSyncing={fullSyncing}
           onSyncList={handleSyncList}
           onSyncFull={handleSyncAll}
-          exportingAccountData={exportingAccountData || preparingExportData || exportingKelivo}
-          disableExportAccountData={clearingAccountData || exportingAccountData || preparingExportData || exportingKelivo}
-          onExportAccountData={handleExportAccountData}
-          exportingKelivo={exportingKelivo}
-          onExportToKelivo={handleExportToKelivo}
-          onExportToKelivoSplit={handleExportToKelivoSplit}
+          exportingAccountData={exportingAccountData || preparingExportData}
+          onOpenExportModal={handleOpenExportModal}
           clearingAccountData={clearingAccountData}
           disableClearAccountData={listSyncing || fullSyncing || syncingConversationIds.length > 0 || exportingAccountData || preparingExportData}
           onClearAccountData={handleClearAccountData}
@@ -941,6 +963,7 @@ function App() {
           disableConversationSync={listSyncing || fullSyncing || clearingAccountData}
           onSyncConversation={handleSyncConversation}
           syncingConversationIds={syncingConversationIds}
+          onDeleteConversation={handleDeleteConversation}
         />
         <div
           style={{
@@ -974,75 +997,69 @@ function App() {
           <ChatView conversation={selectedConversation} mediaDir={mediaDir} mediaVersion={mediaVersion} />
         </div>
       </div>
-      {showExportConfirm && exportStats && (
-        <div
-          style={{
-            position: "fixed",
-            inset: 0,
-            zIndex: 10000,
-            background: "rgba(0,0,0,0.32)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-          }}
-        >
-          <div
-            style={{
-              width: 420,
-              maxWidth: "calc(100vw - 32px)",
-              borderRadius: 12,
-              background: clearDialogBg,
-              border: `1px solid ${clearDialogBorder}`,
-              boxShadow: theme.isDark ? "0 18px 40px rgba(0,0,0,0.45)" : "0 18px 40px rgba(0,0,0,0.2)",
-              padding: 16,
-            }}
-          >
-            <div style={{ fontSize: 15, fontWeight: 700, color: theme.text, marginBottom: 8 }}>
-              导出当前账号数据
+      {showExportModal && exportStats && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }}>
+          <div style={{ width: 460, borderRadius: 14, background: theme.isDark ? "#1c1f25" : "#ffffff", border: `1px solid ${theme.border}`, padding: 22 }}>
+            {/* 标题 */}
+            <div style={{ fontSize: 15, fontWeight: 700, color: theme.text }}>导出账号数据</div>
+            {/* 双列 */}
+            <div style={{ display: "flex", gap: 12, marginTop: 14 }}>
+              {/* 左列：时间范围 */}
+              <div style={{ flex: 1, background: theme.hover, borderRadius: 8, padding: 12 }}>
+                <div style={{ fontSize: 11, fontWeight: 600, color: theme.textMuted, marginBottom: 10, letterSpacing: 0.5 }}>时间范围</div>
+                {([ ["all","全部"], ["3d","3 天"], ["7d","7 天"], ["30d","一个月"] ] as const).map(([val, label]) => (
+                  <div key={val} onClick={() => setExportTimeRange(val)} style={{ display: "flex", alignItems: "center", gap: 10, padding: "4px 0", cursor: "pointer" }}>
+                    <div style={{ width: 10, height: 10, borderRadius: 5, background: exportTimeRange === val ? "#0071e3" : "transparent", border: exportTimeRange === val ? "none" : `1.5px solid ${theme.textMuted}`, flexShrink: 0 }} />
+                    <span style={{ fontSize: 13, color: theme.text }}>{label}</span>
+                  </div>
+                ))}
+              </div>
+              {/* 右列：导出格式 */}
+              <div style={{ flex: 1, background: theme.hover, borderRadius: 8, padding: 12 }}>
+                <div style={{ fontSize: 11, fontWeight: 600, color: theme.textMuted, marginBottom: 10, letterSpacing: 0.5 }}>导出格式</div>
+                {([ ["zip","原始"], ["kelivo","Kelivo"], ["kelivo-split","Kelivo（分包）"] ] as const).map(([val, label]) => (
+                  <div key={val} onClick={() => setExportFormat(val)} style={{ display: "flex", alignItems: "center", gap: 10, padding: "4px 0", cursor: "pointer" }}>
+                    <div style={{ width: 10, height: 10, borderRadius: 5, background: exportFormat === val ? "#0071e3" : "transparent", border: exportFormat === val ? "none" : `1.5px solid ${theme.textMuted}`, flexShrink: 0 }} />
+                    <span style={{ fontSize: 13, color: theme.text }}>{label}</span>
+                  </div>
+                ))}
+              </div>
             </div>
-            <div style={{ fontSize: 13, color: theme.textSub, lineHeight: 1.55, marginBottom: 12 }}>
-              账号「{currentAccount.name || currentAccount.email || currentAccount.id}」将打包为 ZIP。
-            </div>
-            <div style={{ fontSize: 12, color: theme.textSub, lineHeight: 1.6, marginBottom: 14 }}>
-              <div>对话数: {exportStats.conversationCount}（详情文件 {exportStats.conversationFileCount}）</div>
-              <div>媒体文件: {exportStats.mediaFileCount}</div>
-              <div>文件总数: {exportStats.totalFileCount}</div>
-              <div>当前体积: {formatBytes(exportStats.totalBytes)}</div>
-              <div>预估压缩后: {formatBytes(exportStats.estimatedZipBytes)}</div>
-            </div>
-            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
-              <button
-                onClick={() => {
-                  setShowExportConfirm(false);
-                  setExportStats(null);
-                }}
-                style={{
-                  border: `1px solid ${clearDialogBorder}`,
-                  background: "transparent",
-                  color: theme.text,
-                  borderRadius: 8,
-                  padding: "7px 12px",
-                  fontSize: 12,
-                  cursor: "pointer",
-                }}
-              >
-                取消
-              </button>
-              <button
-                onClick={() => { void confirmExportAccountData(); }}
-                style={{
-                  border: "none",
-                  background: "#0071e3",
-                  color: "#fff",
-                  borderRadius: 8,
-                  padding: "7px 12px",
-                  fontSize: 12,
-                  fontWeight: 600,
-                  cursor: "pointer",
-                }}
-              >
-                开始导出
-              </button>
+            {/* 统计区 */}
+            {(() => {
+              const filteredSummaries = exportTimeRange === "all"
+                ? null
+                : (() => {
+                    const days = exportTimeRange === "3d" ? 3 : exportTimeRange === "7d" ? 7 : 30;
+                    const afterDate = new Date(Date.now() - days * 86400_000).toISOString();
+                    return conversationSummaries.filter(c => c.updatedAt >= afterDate);
+                  })();
+              const displayConvCount = filteredSummaries ? filteredSummaries.length : exportStats.conversationCount;
+              const displayMediaCount = filteredSummaries
+                ? filteredSummaries.reduce((sum, c) => sum + (c.imageCount ?? 0) + (c.videoCount ?? 0), 0)
+                : exportStats.mediaFileCount;
+              const cachedBytes = exportRangeBytesCache.get(exportTimeRange);
+              const bytesText = cachedBytes !== undefined
+                ? formatBytes(cachedBytes)
+                : exportRangeBytesLoading ? "加载中…" : "—";
+              return (
+                <div style={{ marginTop: 12, padding: "10px 12px", background: theme.hover, borderRadius: 8, fontSize: 12, color: theme.textSub, lineHeight: 1.8 }}>
+                  <div>对话数: <span style={{ color: theme.text, fontWeight: 500 }}>{displayConvCount}</span></div>
+                  <div>媒体文件（估算）: <span style={{ color: theme.text, fontWeight: 500 }}>{displayMediaCount}</span></div>
+                  {filteredSummaries === null && (
+                    <>
+                      <div>文件总数: <span style={{ color: theme.text, fontWeight: 500 }}>{exportStats.totalFileCount}</span></div>
+                      <div>预估压缩后: <span style={{ color: theme.text, fontWeight: 500 }}>{formatBytes(exportStats.estimatedZipBytes)}</span></div>
+                    </>
+                  )}
+                  <div>媒体体积: <span style={{ color: theme.text, fontWeight: 500 }}>{bytesText}</span></div>
+                </div>
+              );
+            })()}
+            {/* 按钮行 */}
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 14 }}>
+              <button onClick={() => { setShowExportModal(false); setExportStats(null); setExportRangeBytesCache(new Map()); }} style={{ padding: "7px 16px", borderRadius: 8, border: "none", background: theme.btnHoverBg, color: theme.text, fontSize: 13, cursor: "pointer" }}>取消</button>
+              <button onClick={() => { void confirmExport(); }} disabled={exportingAccountData} style={{ padding: "7px 16px", borderRadius: 8, border: "none", background: "#0071e3", color: "#fff", fontSize: 13, fontWeight: 600, cursor: exportingAccountData ? "default" : "pointer", opacity: exportingAccountData ? 0.6 : 1 }}>开始导出</button>
             </div>
           </div>
         </div>
@@ -1160,6 +1177,47 @@ function App() {
             </div>
           </div>
         </div>
+      )}
+      {(exportingAccountData || preparingExportData) && (
+        <>
+          <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+          <div
+            style={{
+              position: "fixed",
+              inset: 0,
+              zIndex: 2000,
+              background: "rgba(0,0,0,0.45)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
+          >
+            <div
+              style={{
+                borderRadius: 14,
+                padding: "28px 36px",
+                background: theme.isDark ? "#1c1f25" : "#fff",
+                display: "flex",
+                flexDirection: "column",
+                alignItems: "center",
+              }}
+            >
+              <div
+                style={{
+                  width: 32,
+                  height: 32,
+                  border: "3px solid rgba(0,113,227,0.2)",
+                  borderTop: "3px solid #0071e3",
+                  borderRadius: "50%",
+                  animation: "spin 0.8s linear infinite",
+                }}
+              />
+              <div style={{ marginTop: 14, fontSize: 14, color: theme.text }}>
+                {preparingExportData ? "正在读取数据…" : "导出中，请勿关闭…"}
+              </div>
+            </div>
+          </div>
+        </>
       )}
     </ThemeContext.Provider>
   );
