@@ -3,7 +3,7 @@ mod worker_host;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use chrono::Local;
+use chrono::{DateTime, FixedOffset, Local};
 use tauri::Manager;
 use worker_host::EnqueueJobRequest;
 
@@ -445,6 +445,24 @@ fn export_account_zip(
 
 // ── Kelivo 导出：纯 Rust 实现 ─────────────────────────────────────────────────
 
+/// 将 UTC ISO 8601 字符串转换为东八区（+08:00）的 RFC3339 字符串。
+/// 解析失败则原样返回。
+fn to_cst(utc_str: &str) -> String {
+    let cst = FixedOffset::east_opt(8 * 3600).unwrap();
+    if let Ok(dt) = DateTime::parse_from_rfc3339(utc_str) {
+        return dt.with_timezone(&cst).to_rfc3339();
+    }
+    utc_str.to_string()
+}
+
+/// 将 serde_json::Value（字符串或 null）中的时间戳转换为东八区。
+fn to_cst_value(v: &serde_json::Value) -> serde_json::Value {
+    match v.as_str() {
+        Some(s) => serde_json::Value::String(to_cst(s)),
+        None => v.clone(),
+    }
+}
+
 /// 将 "5MB"、"500KB"、"1GB" 等解析为字节数。
 fn parse_size(s: &str) -> Result<u64, String> {
     let upper = s.trim().to_uppercase();
@@ -534,8 +552,8 @@ fn parse_kelivo_jsonl(path: &Path, media_dir: &Path, after_date: Option<&str>) -
 
     let conv_id = meta.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let title = meta.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let created_at = meta.get("createdAt").cloned().unwrap_or(serde_json::Value::Null);
-    let updated_at = meta.get("updatedAt").cloned().unwrap_or(serde_json::Value::Null);
+    let created_at = to_cst_value(&meta.get("createdAt").cloned().unwrap_or(serde_json::Value::Null));
+    let updated_at = to_cst_value(&meta.get("updatedAt").cloned().unwrap_or(serde_json::Value::Null));
 
     // 转换消息
     let mut kelivo_msgs: Vec<serde_json::Value> = Vec::new();
@@ -552,7 +570,7 @@ fn parse_kelivo_jsonl(path: &Path, media_dir: &Path, after_date: Option<&str>) -
             .map(|a| a.as_slice())
             .unwrap_or(&[]);
         let content = build_kelivo_content(text, attachments);
-        let timestamp = msg.get("timestamp").cloned().unwrap_or(serde_json::Value::Null);
+        let timestamp = to_cst_value(&msg.get("timestamp").cloned().unwrap_or(serde_json::Value::Null));
 
         for att in attachments {
             if let Some(mid) = att.get("mediaId").and_then(|v| v.as_str()) {
