@@ -15,11 +15,7 @@ interface SidebarProps {
   onSyncList: () => void;
   onSyncFull: () => void;
   exportingAccountData?: boolean;
-  disableExportAccountData?: boolean;
-  onExportAccountData?: () => void;
-  exportingKelivo?: boolean;
-  onExportToKelivo?: () => void;
-  onExportToKelivoSplit?: () => void;
+  onOpenExportModal?: () => void;
   clearingAccountData: boolean;
   disableClearAccountData?: boolean;
   onClearAccountData: () => void;
@@ -51,8 +47,7 @@ export function Sidebar({
   conversations, selectedId, onSelect, collapsed,
   conversationSortMode = "updated_desc", onToggleConversationSort,
   listSyncing, fullSyncing, onSyncList, onSyncFull, clearingAccountData, onClearAccountData,
-  exportingAccountData = false, disableExportAccountData = false, onExportAccountData,
-  exportingKelivo = false, onExportToKelivo, onExportToKelivoSplit,
+  exportingAccountData = false, onOpenExportModal,
   disableClearAccountData = false,
   currentAccount, accounts, onSwitchAccount,
   disableAccountSwitch = false, disableConversationSync = false,
@@ -60,7 +55,6 @@ export function Sidebar({
 }: SidebarProps) {
   const t = useTheme();
   const [showSwitcher, setShowSwitcher] = useState(false);
-  const [showExportMenu, setShowExportMenu] = useState(false);
   const syncingSet = new Set(syncingConversationIds);
   const otherAccounts = accounts.filter((a) => a.id !== currentAccount.id);
   const conversationSortTitle =
@@ -112,88 +106,36 @@ export function Sidebar({
             对话历史
           </span>
           <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-            {/* 导出按钮（带悬停下拉） */}
-            <div
-              style={{ position: "relative" }}
-              onMouseEnter={() => {
-                if (!exportingAccountData && !disableExportAccountData && !exportingKelivo) setShowExportMenu(true);
+            {/* 导出按钮 */}
+            <button
+              title="导出当前账号数据"
+              onClick={(e) => {
+                e.stopPropagation();
+                onOpenExportModal?.();
               }}
-              onMouseLeave={() => setShowExportMenu(false)}
+              style={{
+                width: 22,
+                height: 22,
+                borderRadius: 6,
+                border: "none",
+                background: "transparent",
+                cursor: exportingAccountData ? "default" : "pointer",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                flexShrink: 0,
+                opacity: exportingAccountData ? 0.62 : 1,
+                transition: "background 0.12s",
+              }}
+              onMouseEnter={(e) => {
+                if (!exportingAccountData) (e.currentTarget as HTMLElement).style.background = t.btnHoverBg;
+              }}
+              onMouseLeave={(e) => {
+                (e.currentTarget as HTMLElement).style.background = "transparent";
+              }}
             >
-              <button
-                title="导出当前账号数据"
-                style={{
-                  width: 22,
-                  height: 22,
-                  borderRadius: 6,
-                  border: "none",
-                  background: showExportMenu ? t.btnHoverBg : "transparent",
-                  cursor: (exportingAccountData || disableExportAccountData || exportingKelivo) ? "default" : "pointer",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  flexShrink: 0,
-                  opacity: (exportingAccountData || disableExportAccountData || exportingKelivo) ? 0.62 : 1,
-                  transition: "background 0.12s",
-                }}
-              >
-                <ExportIcon spinning={exportingAccountData || exportingKelivo} color={(exportingAccountData || exportingKelivo) ? "#0071e3" : t.textMuted} />
-              </button>
-
-              {/* 下拉菜单 */}
-              {showExportMenu && !disableExportAccountData && !exportingKelivo && (
-                <div
-                  style={{
-                    position: "absolute",
-                    top: "calc(100% + 4px)",
-                    right: "50%",
-                    transform: "translateX(50%)",
-                    minWidth: 180,
-                    borderRadius: 12,
-                    background: t.isDark
-                      ? `linear-gradient(to top right, rgba(10,12,18,0.14), rgba(28,33,44,0.10)), ${t.cardBg}`
-                      : `linear-gradient(to top right, rgba(160,185,220,0.22), rgba(240,246,255,0.10)), ${t.cardBg}`,
-                    border: "none",
-                    backdropFilter: "blur(28px) saturate(115%)",
-                    WebkitBackdropFilter: "blur(28px) saturate(115%)",
-                    boxShadow: "none",
-                    padding: "4px 0",
-                    zIndex: 1000,
-                    animation: "exportMenuIn 0.12s ease-out",
-                  }}
-                  onMouseEnter={() => setShowExportMenu(true)}
-                  onMouseLeave={() => setShowExportMenu(false)}
-                >
-                  <style>{`@keyframes exportMenuIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}`}</style>
-                  {[
-                    {
-                      label: "直接导出",
-                      onClick: () => { setShowExportMenu(false); onExportAccountData?.(); },
-                      disabled: exportingAccountData,
-                    },
-                    {
-                      label: "导出到 Kelivo",
-                      onClick: () => { setShowExportMenu(false); onExportToKelivo?.(); },
-                      disabled: exportingKelivo,
-                    },
-                    {
-                      label: "导出到 Kelivo（分包）",
-                      onClick: () => { setShowExportMenu(false); onExportToKelivoSplit?.(); },
-                      disabled: exportingKelivo,
-                    },
-                  ].map((item, idx) => (
-                    <ExportMenuItem
-                      key={idx}
-                      label={item.label}
-                      onClick={item.onClick}
-                      disabled={item.disabled}
-                      isDark={t.isDark}
-                      t={t}
-                    />
-                  ))}
-                </div>
-              )}
-            </div>
+              <ExportIcon spinning={exportingAccountData} color={exportingAccountData ? "#0071e3" : t.textMuted} />
+            </button>
             <button
               onClick={(e) => {
                 e.stopPropagation();
@@ -507,41 +449,6 @@ function PendingDot() {
   );
 }
 
-function ExportMenuItem({
-  label,
-  onClick,
-  disabled,
-  isDark,
-  t,
-}: {
-  label: string;
-  onClick: () => void;
-  disabled: boolean;
-  isDark: boolean;
-  t: ReturnType<typeof useTheme>;
-}) {
-  const [hovered, setHovered] = useState(false);
-  return (
-    <button
-      onClick={disabled ? undefined : onClick}
-      onMouseEnter={() => !disabled && setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-      style={{
-        display: "block",
-        width: "100%",
-        padding: "9px 12px",
-        border: "none",
-        background: hovered ? (isDark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.07)") : "transparent",
-        cursor: disabled ? "default" : "pointer",
-        textAlign: "left",
-        opacity: disabled ? 0.5 : 1,
-        transition: "background 0.1s",
-      }}
-    >
-      <div style={{ fontSize: 13, fontWeight: 500, color: isDark ? "#ffffff" : "#000000", whiteSpace: "nowrap" }}>{label}</div>
-    </button>
-  );
-}
 
 function ExportIcon({ spinning, color }: { spinning: boolean; color: string }) {
   return (
