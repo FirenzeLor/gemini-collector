@@ -22,6 +22,9 @@ dist-ssr
 *.sln
 *.sw?
 
+# Documentation (local only)
+docs/
+
 # Test data & sensitive user data
 test_data/
 src/data/*.json
