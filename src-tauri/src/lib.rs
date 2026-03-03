@@ -445,12 +445,13 @@ fn export_account_zip(
 
 // ── Kelivo 导出：纯 Rust 实现 ─────────────────────────────────────────────────
 
-/// 将 UTC ISO 8601 字符串转换为东八区（+08:00）的 RFC3339 字符串。
-/// 解析失败则原样返回。
+/// 将 UTC 时间加 8 小时得到北京时间数值，以 +00:00 标签输出。
+/// Kelivo 内部按 UTC 展示，用此方式让它显示正确的北京时间。
 fn to_cst(utc_str: &str) -> String {
     let cst = FixedOffset::east_opt(8 * 3600).unwrap();
     if let Ok(dt) = DateTime::parse_from_rfc3339(utc_str) {
-        return dt.with_timezone(&cst).to_rfc3339();
+        let cst_dt = dt.with_timezone(&cst);
+        return format!("{}+00:00", cst_dt.format("%Y-%m-%dT%H:%M:%S"));
     }
     utc_str.to_string()
 }
@@ -561,10 +562,13 @@ fn parse_kelivo_jsonl(path: &Path, media_dir: &Path, after_date: Option<&str>) -
     let mut media_ids: Vec<String> = Vec::new();
 
     for msg in &messages {
+        let text = msg.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        if text.contains("action_card_content") {
+            continue;
+        }
         let msg_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let role_raw = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
         let role = if role_raw == "model" { "assistant" } else { "user" };
-        let text = msg.get("text").and_then(|v| v.as_str()).unwrap_or("");
         let attachments = msg.get("attachments")
             .and_then(|v| v.as_array())
             .map(|a| a.as_slice())
