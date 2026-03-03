@@ -26,6 +26,7 @@ interface SidebarProps {
   disableConversationSync?: boolean;
   onSyncConversation?: (id: string) => Promise<void> | void;
   syncingConversationIds?: string[];
+  onDeleteConversation?: (convId: string) => void;
 }
 
 function formatConvTime(iso: string): string {
@@ -52,9 +53,11 @@ export function Sidebar({
   currentAccount, accounts, onSwitchAccount,
   disableAccountSwitch = false, disableConversationSync = false,
   onSyncConversation, syncingConversationIds = [],
+  onDeleteConversation,
 }: SidebarProps) {
   const t = useTheme();
   const [showSwitcher, setShowSwitcher] = useState(false);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; convId: string } | null>(null);
   const syncingSet = new Set(syncingConversationIds);
   const otherAccounts = accounts.filter((a) => a.id !== currentAccount.id);
   const conversationSortTitle =
@@ -84,7 +87,9 @@ export function Sidebar({
   }
 
   return (
-    <div style={{
+    <div
+      onClick={() => setContextMenu(null)}
+      style={{
       width: collapsed ? 0 : 260,
       minWidth: collapsed ? 0 : 260,
       transition: "width 0.25s cubic-bezier(0.4,0,0.2,1), min-width 0.25s cubic-bezier(0.4,0,0.2,1)",
@@ -219,6 +224,10 @@ export function Sidebar({
                   onClick={() => onSelect(conv.id)}
                   syncing={syncingSet.has(conv.id)}
                   onSync={() => handleSyncConv(conv.id)}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    setContextMenu({ x: e.clientX, y: e.clientY, convId: conv.id });
+                  }}
                 />
               )}
             />
@@ -356,16 +365,54 @@ export function Sidebar({
           </button>
         </div>
       </div>
+      {contextMenu && (
+        <div
+          style={{
+            position: "fixed",
+            top: contextMenu.y,
+            left: contextMenu.x,
+            zIndex: 3000,
+            background: t.isDark ? "#1c1f25" : "#ffffff",
+            borderRadius: 8,
+            border: `1px solid ${t.divider}`,
+            padding: "4px 0",
+            minWidth: 140,
+            boxShadow: "0 4px 16px rgba(0,0,0,0.18)",
+          }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <button
+            onClick={() => {
+              onDeleteConversation?.(contextMenu.convId);
+              setContextMenu(null);
+            }}
+            style={{
+              display: "block",
+              width: "100%",
+              padding: "8px 14px",
+              border: "none",
+              background: "transparent",
+              color: "#ef4444",
+              fontSize: 13,
+              textAlign: "left",
+              cursor: "pointer",
+            }}
+          >
+            删除此对话
+          </button>
+        </div>
+      )}
     </div>
   );
 }
 
-function ConversationItem({ conversation, selected, onClick, syncing, onSync }: {
+function ConversationItem({ conversation, selected, onClick, syncing, onSync, onContextMenu }: {
   conversation: ConversationSummary;
   selected: boolean;
   onClick: () => void;
   syncing: boolean;
   onSync: () => void;
+  onContextMenu?: (e: React.MouseEvent<HTMLDivElement>) => void;
 }) {
   const t = useTheme();
   const [copied, setCopied] = useState(false);
@@ -387,6 +434,7 @@ function ConversationItem({ conversation, selected, onClick, syncing, onSync }: 
   return (
     <div
       onClick={onClick}
+      onContextMenu={onContextMenu}
       style={{ display: "flex", alignItems: "center", width: "calc(100% - 12px)", padding: "8px 12px", borderRadius: 8, margin: "1px 6px", background: selected ? t.selectedBg : "transparent", transition: "background 0.12s", cursor: "pointer", gap: 4 }}
       onMouseEnter={(e) => { if (!selected) (e.currentTarget as HTMLElement).style.background = t.hover; }}
       onMouseLeave={(e) => { if (!selected) (e.currentTarget as HTMLElement).style.background = "transparent"; }}

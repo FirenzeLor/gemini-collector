@@ -928,6 +928,24 @@ async fn export_account_kelivo_split(
 }
 
 #[tauri::command]
+fn delete_conversation(
+    app: tauri::AppHandle,
+    account_id: String,
+    conversation_id: String,
+) -> Result<(), String> {
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let conv_file = data_dir
+        .join("accounts")
+        .join(&account_id)
+        .join("conversations")
+        .join(format!("{}.jsonl", conversation_id));
+    if conv_file.exists() {
+        std::fs::remove_file(&conv_file).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn clear_account_data(
     app: tauri::AppHandle,
     account_id: Option<String>,
@@ -1389,6 +1407,7 @@ pub fn run() {
             export_account_kelivo,
             export_account_kelivo_split,
             clear_account_data,
+            delete_conversation,
             load_conversation_summaries,
             get_account_media_dir,
             load_conversation_detail
