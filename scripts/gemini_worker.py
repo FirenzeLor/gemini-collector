@@ -246,18 +246,24 @@ class GeminiWorker:
         self,
         account_id: str,
         fn: Callable[[Any], Any],
+        max_session_retries: int = 3,
     ) -> Any:
-        """执行 fn(exporter)，遇到 SessionExpiredError 时刷新 session 后重试一次。"""
+        """执行 fn(exporter)，遇到 SessionExpiredError 时刷新 session 后重试，最多重试 max_session_retries 次。"""
         exporter = self._get_exporter(account_id)
-        try:
-            return fn(exporter)
-        except Exception as exc:
-            sess_cls = self._session_expired_error_cls
-            if sess_cls is None or not isinstance(exc, sess_cls):
-                raise
-            self._log("reinit", f"触发原因: {exc}")
-            exporter = self._refresh_exporter_session(account_id)
-            return fn(exporter)
+        last_exc: Optional[Exception] = None
+        for attempt in range(max_session_retries + 1):
+            try:
+                return fn(exporter)
+            except Exception as exc:
+                sess_cls = self._session_expired_error_cls
+                if sess_cls is None or not isinstance(exc, sess_cls):
+                    raise
+                last_exc = exc
+                if attempt >= max_session_retries:
+                    break
+                self._log("reinit", f"第 {attempt + 1} 次触发，正在重建 session: {exc}")
+                exporter = self._refresh_exporter_session(account_id)
+        raise last_exc  # type: ignore[misc]
 
     def _log(self, phase: str, message: str) -> None:
         print(f"[worker:{phase}] {message}", file=sys.stderr, flush=True)
