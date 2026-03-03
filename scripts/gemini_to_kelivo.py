@@ -20,8 +20,22 @@ import argparse
 import json
 import sys
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
+
+# ── 时区常量 ──────────────────────────────────────────────────────────────────
+CST = timezone(timedelta(hours=8))
+
+
+def to_cst(utc_str) -> str:
+    """将 UTC ISO8601 时间字符串转为东八区（+08:00）。None/非字符串原样返回。"""
+    if not isinstance(utc_str, str) or not utc_str:
+        return utc_str
+    try:
+        dt = datetime.fromisoformat(utc_str.replace("Z", "+00:00"))
+        return dt.astimezone(CST).isoformat()
+    except Exception:
+        return utc_str
 
 # ── App 数据目录 ──────────────────────────────────────────────────────────────
 APP_DATA = Path.home() / "Library" / "Application Support" / "com.gemini-collector.app"
@@ -94,7 +108,7 @@ def convert_message(msg: dict, conv_id: str) -> dict:
         "id": msg["id"],
         "role": role,
         "content": content,
-        "timestamp": msg.get("timestamp"),
+        "timestamp": to_cst(msg.get("timestamp")),
         "modelId": msg.get("model"),
         "providerId": "google",
         "totalTokens": None,
@@ -126,8 +140,8 @@ def convert_conversation(meta: dict, messages: list):
     kelivo_conv = {
         "id": conv_id,
         "title": meta.get("title", ""),
-        "createdAt": meta.get("createdAt"),
-        "updatedAt": meta.get("updatedAt"),
+        "createdAt": to_cst(meta.get("createdAt")),
+        "updatedAt": to_cst(meta.get("updatedAt")),
         "messageIds": message_ids,
         "isPinned": False,
         "mcpServerIds": [],
