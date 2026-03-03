@@ -28,12 +28,15 @@ CST = timezone(timedelta(hours=8))
 
 
 def to_cst(utc_str) -> str:
-    """将 UTC ISO8601 时间字符串转为东八区（+08:00）。None/非字符串原样返回。"""
+    """将 UTC 时间加 8 小时得到北京时间数值，以 +00:00 标签输出。
+    Kelivo 内部按 UTC 展示，用此方式让它显示正确的北京时间。"""
     if not isinstance(utc_str, str) or not utc_str:
         return utc_str
     try:
+        from datetime import datetime
         dt = datetime.fromisoformat(utc_str.replace("Z", "+00:00"))
-        return dt.astimezone(CST).isoformat()
+        cst_dt = dt.astimezone(CST)
+        return cst_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
     except Exception:
         return utc_str
 
