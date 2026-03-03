@@ -654,9 +654,17 @@ export function ChatView({ conversation, mediaDir, mediaVersion = 0 }: ChatViewP
         </div>
       )}
       {(() => {
-        const visibleMessages = conversation.messages.filter(
-          msg => !msg.text.includes("action_card_content")
-        );
+        const toRemove = new Set<number>();
+        conversation.messages.forEach((msg, i) => {
+          if (msg.text.includes("action_card_content")) {
+            toRemove.add(i);
+            for (let j = i - 1; j >= 0; j--) {
+              if (conversation.messages[j].role === "user") { toRemove.add(j); break; }
+              if (conversation.messages[j].role === "model") break;
+            }
+          }
+        });
+        const visibleMessages = conversation.messages.filter((_, i) => !toRemove.has(i));
         return visibleMessages.length === 0 ? (
           <div style={{ textAlign: "center", color: t.textMuted, fontSize: 13, marginTop: 60 }}>暂无消息记录</div>
         ) : (

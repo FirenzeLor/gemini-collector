@@ -8,7 +8,7 @@ import json
 import sys
 from pathlib import Path
 
-from gemini_protocol import normalize_chat_id, email_to_account_id
+from gemini_protocol import normalize_chat_id, email_to_account_id, _coerce_epoch_seconds, _summary_to_epoch_seconds
 from gemini_cookies import get_cookies_from_local_browser, discover_email_authuser_mapping
 from gemini_storage import (
     _load_conversations_index,
@@ -23,6 +23,8 @@ from gemini_storage import (
     _normalize_conversation_status, _status_for_remote_summary,
     _build_lost_summary, _build_summary_from_chat_listing,
     CONVERSATION_STATUS_NORMAL, CONVERSATION_STATUS_LOST,
+    _dedupe_raw_turns_by_id,
+    _update_jsonl_media_failure_flags,
 )
 from gemini_media import _ensure_video_previews_from_turns
 from gemini_turn_parser import parse_turn, normalize_turn_media_first_seen
@@ -164,7 +166,7 @@ def export_all(exporter, output_dir=None, chat_ids=None):
             ]
             has_media = any(r.get("attachments") for r in msg_rows)
             has_failed_data = _rows_has_failed_data(msg_rows)
-            image_count, video_count = _count_media_types_from_rows(msg_rows)
+            image_count, video_count, _audio_count = _count_media_types_from_rows(msg_rows)
             last_text = ""
             for r in reversed(msg_rows):
                 if r.get("text"):
@@ -461,7 +463,7 @@ def export_incremental(exporter, output_dir=None):
         ]
         has_media = any(r.get("attachments") for r in all_msg_rows)
         has_failed_data = _rows_has_failed_data(all_msg_rows)
-        image_count, video_count = _count_media_types_from_rows(all_msg_rows)
+        image_count, video_count, _audio_count = _count_media_types_from_rows(all_msg_rows)
         last_text = ""
         for r in reversed(all_msg_rows):
             if r.get("text"):

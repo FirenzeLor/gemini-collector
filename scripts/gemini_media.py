@@ -104,6 +104,8 @@ def _infer_media_type(media_hint):
         return "image"
     if ext in {"mp4", "mov", "webm", "mkv", "m4v", "avi", "3gp"}:
         return "video"
+    if ext in {"mp3", "m4a", "wav", "aac", "flac", "ogg", "opus", "wma", "aiff"}:
+        return "audio"
     return "file"
 
 
