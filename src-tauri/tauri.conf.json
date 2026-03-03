@@ -35,7 +35,11 @@
     "targets": "all",
     "resources": [
       "../scripts/gemini_export.py",
-      "../scripts/gemini_worker.py"
+      "../scripts/gemini_worker.py",
+      {
+        "src": "../scripts/_vendor/**/*",
+        "dest": "_vendor/"
+      }
     ],
     "icon": [
       "icons/32x32.png",

@@ -26,3 +26,10 @@ dist-ssr
 test_data/
 src/data/*.json
 scripts/__pycache__/
+scripts/_vendor/
+
+# Rust build output
+src-tauri/target/
+
+# Claude Code local config
+.claude/
