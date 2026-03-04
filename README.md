@@ -51,7 +51,10 @@ macOS 原生应用 · 支持多账号 · 亮色 / 暗色主题
 
 **导出**
 - 支持按时间范围筛选（全部 / 最近 3 天 / 7 天 / 一个月）
-- 导出格式：原始数据 · [Kelivo](https://github.com/Chevey339/kelivo) · Kelivo 分包（将数据拆分为多个小包，解决 iOS 设备单次导入量有限的问题）
+- 导出格式：
+  - 原始数据
+  - [Kelivo](https://github.com/Chevey339/kelivo)
+  - [Kelivo](https://github.com/Chevey339/kelivo) 分包（将数据拆分为多个小包，解决 iOS 设备单次导入量有限的问题）
 - 导出前预览文件数量与体积
 
 ---
