@@ -763,3 +763,24 @@ def _build_summary_from_chat_listing(chat, existing=None):
         "remoteHash": remote_hash,
         "status": status,
     }
+
+
+def _filter_display_rows(msg_rows):
+    """过滤统计/展示用的消息列表：移除 action_card_content 消息及其前一条 user 消息。
+    规则与 Rust 导出侧保持一致。"""
+    to_remove = set()
+    for i, row in enumerate(msg_rows):
+        if not isinstance(row, dict):
+            continue
+        text = row.get("text") or ""
+        if "action_card_content" in text:
+            to_remove.add(i)
+            # 向前找最近的 user 消息一并移除
+            for j in range(i - 1, -1, -1):
+                role = msg_rows[j].get("role", "") if isinstance(msg_rows[j], dict) else ""
+                if role == "user":
+                    to_remove.add(j)
+                    break
+                if role == "model":
+                    break
+    return [row for i, row in enumerate(msg_rows) if i not in to_remove]

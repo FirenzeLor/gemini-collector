@@ -77,6 +77,7 @@ from gemini_storage import (
     _sort_parsed_turns_by_timestamp, _turns_to_jsonl_rows,
     _build_existing_turn_id_set_new, _count_message_rows_new,
     _count_media_types_from_rows, _rows_has_failed_data, _remote_hash_from_jsonl,
+    _filter_display_rows,
     _write_accounts_json, _write_account_meta,
     _write_conversations_index, _write_sync_state, _load_sync_state,
     _load_conversations_index,
@@ -1608,11 +1609,12 @@ class GeminiExporter:
                 all_msg_rows = [
                     r for r in rows_after if isinstance(r, dict) and r.get("type") == "message"
                 ]
-                has_media = any(r.get("attachments") for r in all_msg_rows)
-                has_failed_data = _rows_has_failed_data(all_msg_rows)
-                image_count, video_count, _audio_count = _count_media_types_from_rows(all_msg_rows)
+                display_rows = _filter_display_rows(all_msg_rows)
+                has_media = any(r.get("attachments") for r in display_rows)
+                has_failed_data = _rows_has_failed_data(display_rows)
+                image_count, video_count, _audio_count = _count_media_types_from_rows(display_rows)
                 last_text = ""
-                for r in reversed(all_msg_rows):
+                for r in reversed(display_rows):
                     if r.get("text"):
                         last_text = r["text"][:80]
                         break
@@ -1621,7 +1623,7 @@ class GeminiExporter:
                     "id": bare_id,
                     "title": title,
                     "lastMessage": last_text,
-                    "messageCount": len(all_msg_rows),
+                    "messageCount": len(display_rows),
                     "hasMedia": has_media,
                     "hasFailedData": has_failed_data,
                     "imageCount": image_count,
@@ -1706,11 +1708,12 @@ class GeminiExporter:
             msg_rows = [
                 r for r in rows_after if isinstance(r, dict) and r.get("type") == "message"
             ]
-            has_media = any(r.get("attachments") for r in msg_rows)
-            has_failed_data = _rows_has_failed_data(msg_rows)
-            image_count, video_count, _audio_count = _count_media_types_from_rows(msg_rows)
+            display_rows = _filter_display_rows(msg_rows)
+            has_media = any(r.get("attachments") for r in display_rows)
+            has_failed_data = _rows_has_failed_data(display_rows)
+            image_count, video_count, _audio_count = _count_media_types_from_rows(display_rows)
             last_text = ""
-            for r in reversed(msg_rows):
+            for r in reversed(display_rows):
                 if r.get("text"):
                     last_text = r["text"][:80]
                     break
@@ -1719,7 +1722,7 @@ class GeminiExporter:
                 "id": bare_id,
                 "title": title,
                 "lastMessage": last_text,
-                "messageCount": len(msg_rows),
+                "messageCount": len(display_rows),
                 "hasMedia": has_media,
                 "hasFailedData": has_failed_data,
                 "imageCount": image_count,
