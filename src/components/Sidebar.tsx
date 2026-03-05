@@ -357,7 +357,7 @@ export function Sidebar({
               onClick={(e) => e.stopPropagation()}
             >
               <div style={{ fontSize: 12, color: t.text, marginBottom: 8 }}>
-                {cancelConfirm === "list" ? "终止列表同步？" : "终止完全同步？"}
+                {cancelConfirm === "list" ? "终止同步？" : "终止同步？"}
               </div>
               <div style={{ display: "flex", gap: 6 }}>
                 <button
@@ -372,7 +372,7 @@ export function Sidebar({
                     fontSize: 12, fontWeight: 600, cursor: "pointer",
                   }}
                 >
-                  终止任务
+                  终止
                 </button>
                 <button
                   onClick={(e) => { e.stopPropagation(); setCancelConfirm(null); }}
@@ -383,7 +383,7 @@ export function Sidebar({
                     fontSize: 12, cursor: "pointer",
                   }}
                 >
-                  继续同步
+                  继续
                 </button>
               </div>
             </div>
