@@ -518,6 +518,9 @@ function App() {
             setFullSyncing(true);
           } else if (payload.state === "done" || payload.state === "failed" || payload.state === "cancelled") {
             setFullSyncing(false);
+            if (payload.state === "cancelled") {
+              setSyncingConversationIds([]);
+            }
           }
         } else if (payload.type === "sync_conversation") {
           const conversationId = payload.conversationId?.trim();
@@ -526,7 +529,7 @@ function App() {
             setSyncingConversationIds((prev) =>
               prev.includes(conversationId) ? prev : [...prev, conversationId],
             );
-          } else if (payload.state === "done" || payload.state === "failed") {
+          } else if (payload.state === "done" || payload.state === "failed" || payload.state === "cancelled") {
             setSyncingConversationIds((prev) =>
               prev.filter((id) => id !== conversationId),
             );
