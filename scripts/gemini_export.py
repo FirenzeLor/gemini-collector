@@ -1148,7 +1148,7 @@ class GeminiExporter:
                     "conversationsFailed": [],
                     "completedAt": now_iso if phase == "done" else None,
                     "errorMessage": error,
-                    "baselineIds": baseline_existing_ids,
+                    "baselineIds": baseline_existing_ids if phase != "done" else None,
                     "lostCount": lost_count if phase == "done" else None,
                 },
                 "pendingConversations": pending_conversations,

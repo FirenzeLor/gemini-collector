@@ -472,6 +472,14 @@ function ConversationItem({ conversation, selected, onClick, syncing, onSync, on
       onMouseEnter={(e) => { if (!selected) (e.currentTarget as HTMLElement).style.background = t.hover; }}
       onMouseLeave={(e) => { if (!selected) (e.currentTarget as HTMLElement).style.background = "transparent"; }}
     >
+      {isLost && (
+        <span
+          title="该会话在远端已不存在"
+          style={{ fontSize: 12, lineHeight: 1, flexShrink: 0 }}
+        >
+          ❌
+        </span>
+      )}
       {conversation.hasFailedData && (
         <span
           title="该会话存在失败数据（通常是媒体下载失败）"
