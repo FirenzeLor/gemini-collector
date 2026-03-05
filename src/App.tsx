@@ -271,6 +271,8 @@ function App() {
   const [fullSyncing, setFullSyncing] = useState(false);
   const [preparingExportData, setPreparingExportData] = useState(false);
   const [exportingAccountData, setExportingAccountData] = useState(false);
+  const [importingAccountData, setImportingAccountData] = useState(false);
+  const [importNotice, setImportNotice] = useState<{ title: string; lines: string[] } | null>(null);
   const [showExportModal, setShowExportModal] = useState(false);
   const [exportTimeRange, setExportTimeRange] = useState<"all" | "3d" | "7d" | "30d">("all");
   const [exportFormat, setExportFormat] = useState<"zip" | "kelivo" | "kelivo-split">("zip");
@@ -730,6 +732,37 @@ function App() {
     }
   }
 
+  async function handleImport() {
+    if (!currentAccount || importingAccountData || exportingAccountData || preparingExportData || clearingAccountData) return;
+    const selected = await open({ directory: false, multiple: false, title: "选择要导入的 ZIP 压缩包", filters: [{ name: "ZIP 压缩包", extensions: ["zip"] }] });
+    if (!selected) return;
+    const zipPath = Array.isArray(selected) ? selected[0] : selected;
+    if (!zipPath || typeof zipPath !== "string") return;
+    setImportingAccountData(true);
+    try {
+      const accountId = currentAccount.id;
+      const json = await invoke<string>("import_account_zip", { accountId, zipPath });
+      const parsed: unknown = JSON.parse(json);
+      const r = (parsed && typeof parsed === "object") ? parsed as Record<string, unknown> : {};
+      const impConv = Number(r.importedConversations ?? 0);
+      const mergedConv = Number(r.mergedConversations ?? 0);
+      const impMedia = Number(r.importedMedia ?? 0);
+      const skipMedia = Number(r.skippedMedia ?? 0);
+      await loadSummaries(accountId);
+      setImportNotice({
+        title: "导入完成",
+        lines: [
+          `新增对话: ${impConv}，合并（已存在 ID）: ${mergedConv}`,
+          `新增媒体: ${impMedia}，已跳过（已存在）: ${skipMedia}`,
+        ],
+      });
+    } catch (e) {
+      setImportNotice({ title: "导入失败", lines: [e instanceof Error ? e.message : String(e)] });
+    } finally {
+      setImportingAccountData(false);
+    }
+  }
+
   async function loadExportRangeBytes(range: "all" | "3d" | "7d" | "30d") {
     if (!currentAccount) return;
     if (exportRangeBytesCache.has(range)) return;
@@ -881,13 +914,15 @@ function App() {
         setSelectedConversation(null);
       }
       setConversationSummaries(prev => prev.filter(c => c.id !== convId));
+      const refreshed = await reloadAccounts();
+      setCurrentAccount(prev => refreshed.find(a => a.id === accountId) ?? prev);
     } catch (e) {
       console.error("删除对话失败:", e);
     }
   }
 
   const anySyncTaskRunning =
-    listSyncing || fullSyncing || syncingConversationIds.length > 0 || exportingAccountData || preparingExportData;
+    listSyncing || fullSyncing || syncingConversationIds.length > 0 || exportingAccountData || preparingExportData || importingAccountData;
   const visibleConversationSummaries = useMemo(() => {
     const visibleItems = conversationSummaries.filter((c) => !isHiddenSummary(c));
     return sortConversationSummaries(visibleItems, conversationSortMode);
@@ -951,6 +986,8 @@ function App() {
           fullSyncing={fullSyncing}
           onSyncList={handleSyncList}
           onSyncFull={handleSyncAll}
+          importingAccountData={importingAccountData}
+          onImport={() => { void handleImport(); }}
           exportingAccountData={exportingAccountData || preparingExportData}
           onOpenExportModal={handleOpenExportModal}
           clearingAccountData={clearingAccountData}
@@ -993,6 +1030,7 @@ function App() {
               setSelectedId(null);
               setScreen("account-picker");
             }}
+            authuser={currentAccount.authuser}
           />
           <ChatView conversation={selectedConversation} mediaDir={mediaDir} mediaVersion={mediaVersion} />
         </div>
@@ -1060,6 +1098,57 @@ function App() {
             <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 14 }}>
               <button onClick={() => { setShowExportModal(false); setExportStats(null); setExportRangeBytesCache(new Map()); }} style={{ padding: "7px 16px", borderRadius: 8, border: "none", background: theme.btnHoverBg, color: theme.text, fontSize: 13, cursor: "pointer" }}>取消</button>
               <button onClick={() => { void confirmExport(); }} disabled={exportingAccountData} style={{ padding: "7px 16px", borderRadius: 8, border: "none", background: "#0071e3", color: "#fff", fontSize: 13, fontWeight: 600, cursor: exportingAccountData ? "default" : "pointer", opacity: exportingAccountData ? 0.6 : 1 }}>开始导出</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {importNotice && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 10001,
+            background: "rgba(0,0,0,0.32)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <div
+            style={{
+              width: 430,
+              maxWidth: "calc(100vw - 32px)",
+              borderRadius: 12,
+              background: clearDialogBg,
+              border: `1px solid ${clearDialogBorder}`,
+              boxShadow: theme.isDark ? "0 18px 40px rgba(0,0,0,0.45)" : "0 18px 40px rgba(0,0,0,0.2)",
+              padding: 16,
+            }}
+          >
+            <div style={{ fontSize: 15, fontWeight: 700, color: theme.text, marginBottom: 8 }}>
+              {importNotice.title}
+            </div>
+            <div style={{ fontSize: 12, color: theme.textSub, lineHeight: 1.6, marginBottom: 14 }}>
+              {importNotice.lines.map((line, idx) => (
+                <div key={`${idx}_${line}`}>{line}</div>
+              ))}
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end" }}>
+              <button
+                onClick={() => setImportNotice(null)}
+                style={{
+                  border: "none",
+                  background: "#0071e3",
+                  color: "#fff",
+                  borderRadius: 8,
+                  padding: "7px 12px",
+                  fontSize: 12,
+                  fontWeight: 600,
+                  cursor: "pointer",
+                }}
+              >
+                知道了
+              </button>
             </div>
           </div>
         </div>

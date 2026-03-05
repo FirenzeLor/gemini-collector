@@ -1,4 +1,5 @@
 import React from "react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { Conversation, ConversationSummary } from "../data/types";
 import { useTheme } from "../theme";
 
@@ -25,6 +26,7 @@ interface TopBarProps {
   onToggleDark: () => void;
   disableLogout?: boolean;
   onLogout: () => void;
+  authuser?: string | null;
 }
 
 export function TopBar({
@@ -33,6 +35,7 @@ export function TopBar({
   sidebarCollapsed,
   onToggleSidebar,
   isDark, onToggleDark, disableLogout = false, onLogout,
+  authuser = null,
 }: TopBarProps) {
   const t = useTheme();
   const imageCount = Math.max(0, selectedSummary?.imageCount ?? 0);
@@ -120,8 +123,26 @@ export function TopBar({
         </div>
       )}
 
-      {/* Right: dark mode toggle + logout */}
+      {/* Right: open in browser + dark mode toggle + logout */}
       <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 4 }}>
+        {/* Open in Gemini */}
+        {selectedConversation && (
+          <button
+            onClick={() => {
+              const bareId = selectedConversation.id.startsWith("c_")
+                ? selectedConversation.id.slice(2)
+                : selectedConversation.id;
+              const au = authuser ?? "0";
+              void openUrl(`https://gemini.google.com/u/${au}/app/${bareId}`);
+            }}
+            title="在浏览器中打开"
+            style={iconBtn(t.btnHoverBg)}
+            onMouseEnter={(e) => ((e.currentTarget as HTMLElement).style.background = t.btnHoverBg)}
+            onMouseLeave={(e) => ((e.currentTarget as HTMLElement).style.background = "transparent")}
+          >
+            <ExternalLinkIcon color={t.textSub} />
+          </button>
+        )}
         {/* Dark mode toggle */}
         <button
           onClick={onToggleDark}
@@ -200,6 +221,16 @@ function SunIcon({ color }: { color: string }) {
       <line x1="21" y1="12" x2="23" y2="12" />
       <line x1="4.22" y1="19.78" x2="5.64" y2="18.36" />
       <line x1="18.36" y1="5.64" x2="19.78" y2="4.22" />
+    </svg>
+  );
+}
+
+function ExternalLinkIcon({ color }: { color: string }) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+      <polyline points="15 3 21 3 21 9" />
+      <line x1="10" y1="14" x2="21" y2="3" />
     </svg>
   );
 }

@@ -14,6 +14,8 @@ interface SidebarProps {
   fullSyncing: boolean;
   onSyncList: () => void;
   onSyncFull: () => void;
+  importingAccountData?: boolean;
+  onImport?: () => void;
   exportingAccountData?: boolean;
   onOpenExportModal?: () => void;
   clearingAccountData: boolean;
@@ -48,6 +50,7 @@ export function Sidebar({
   conversations, selectedId, onSelect, collapsed,
   conversationSortMode = "updated_desc", onToggleConversationSort,
   listSyncing, fullSyncing, onSyncList, onSyncFull, clearingAccountData, onClearAccountData,
+  importingAccountData = false, onImport,
   exportingAccountData = false, onOpenExportModal,
   disableClearAccountData = false,
   currentAccount, accounts, onSwitchAccount,
@@ -111,6 +114,36 @@ export function Sidebar({
             对话历史
           </span>
           <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            {/* 导入按钮 */}
+            <button
+              title="导入 ZIP 压缩包到当前账号"
+              onClick={(e) => {
+                e.stopPropagation();
+                onImport?.();
+              }}
+              style={{
+                width: 22,
+                height: 22,
+                borderRadius: 6,
+                border: "none",
+                background: "transparent",
+                cursor: importingAccountData ? "default" : "pointer",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                flexShrink: 0,
+                opacity: importingAccountData ? 0.62 : 1,
+                transition: "background 0.12s",
+              }}
+              onMouseEnter={(e) => {
+                if (!importingAccountData) (e.currentTarget as HTMLElement).style.background = t.btnHoverBg;
+              }}
+              onMouseLeave={(e) => {
+                (e.currentTarget as HTMLElement).style.background = "transparent";
+              }}
+            >
+              <ImportIcon spinning={importingAccountData} color={importingAccountData ? "#0071e3" : t.textMuted} />
+            </button>
             {/* 导出按钮 */}
             <button
               title="导出当前账号数据"
@@ -497,6 +530,18 @@ function PendingDot() {
   );
 }
 
+
+function ImportIcon({ spinning, color }: { spinning: boolean; color: string }) {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+      style={{ animation: spinning ? "spin 0.9s linear infinite" : "none" }}>
+      <style>{`@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}`}</style>
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+      <polyline points="17 8 12 3 7 8" />
+      <line x1="12" y1="3" x2="12" y2="15" />
+    </svg>
+  );
+}
 
 function ExportIcon({ spinning, color }: { spinning: boolean; color: string }) {
   return (
