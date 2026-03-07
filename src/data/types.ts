@@ -45,6 +45,15 @@ export interface ConversationSummary {
   remoteHash: string | null;
 }
 
+export interface SearchResult {
+  conversationId: string;
+  messageId: string;
+  title: string;
+  snippet: string;
+  role: string;
+  rank: number;
+}
+
 export interface Account {
   id: string;
   name: string;

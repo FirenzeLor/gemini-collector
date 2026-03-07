@@ -386,10 +386,6 @@ class GeminiExporter:
         else:
             self.fsid = "0"
 
-        print(f"  at: {self.at[:20]}...")
-        print(f"  bl: {self.bl}")
-        print(f"  f.sid: {self.fsid}")
-
     # ------------------------------------------------------------------
     # batchexecute 请求
     # ------------------------------------------------------------------
@@ -1024,7 +1020,6 @@ class GeminiExporter:
         media_dir.mkdir(parents=True, exist_ok=True)
         self._set_request_state_scope(account_dir)
 
-        print(f"[*] 账号: {mask_email(account_info['email']) or account_id}")
         print(f"[*] 仅同步列表到: {account_dir.absolute()}")
 
         existing_order, existing_index = _load_conversations_index(account_dir)
@@ -1271,7 +1266,6 @@ class GeminiExporter:
             "media_failed": 0,
         }
 
-        print(f"[*] 账号: {mask_email(account_info['email']) or account_id}")
         print(f"[*] 同步单会话: {conv_id}")
 
         retry_stats = self._retry_failed_media_for_conversation(

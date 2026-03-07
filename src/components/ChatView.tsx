@@ -619,17 +619,76 @@ interface ChatViewProps {
   conversation: Conversation | null;
   mediaDir?: string;  // path to accounts/{id}/media/
   mediaVersion?: number;
+  scrollToMessageId?: string | null;
+  onScrolledToMessage?: () => void;
 }
 
-export function ChatView({ conversation, mediaDir, mediaVersion = 0 }: ChatViewProps) {
+export function ChatView({ conversation, mediaDir, mediaVersion = 0, scrollToMessageId, onScrolledToMessage }: ChatViewProps) {
   const t = useTheme();
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const [scrollerEl, setScrollerEl] = useState<HTMLElement | null>(null);
   const [visibleRange, setVisibleRange] = useState({ startIndex: 0, endIndex: 0 });
+  const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
+  const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const scrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const onScrolledToMessageRef = useRef(onScrolledToMessage);
+  useEffect(() => { onScrolledToMessageRef.current = onScrolledToMessage; }, [onScrolledToMessage]);
+  // 记录上一次 effect 执行后的对话 id（独立 effect 保证 scroll effect 先读到旧值，再由本 effect 更新）
+  const mountedConvIdRef = useRef<string | undefined>(undefined);
   const parseWarning =
     conversation && typeof conversation.parseWarning === "string" && conversation.parseWarning.trim()
       ? conversation.parseWarning.trim()
       : "";
+
+  const visibleMessages = useMemo(() => {
+    if (!conversation) return [];
+    const toRemove = new Set<number>();
+    conversation.messages.forEach((msg, i) => {
+      if (msg.text.includes("action_card_content") || msg.text.trim() === "没问题，我可以帮忙。在这些媒体服务提供方中，你想使用哪个？") {
+        toRemove.add(i);
+        for (let j = i - 1; j >= 0; j--) {
+          if (conversation.messages[j].role === "user") { toRemove.add(j); break; }
+          if (conversation.messages[j].role === "model") break;
+        }
+      }
+    });
+    return conversation.messages.filter((_, i) => !toRemove.has(i));
+  }, [conversation]);
+
+  // 搜索跳转：对话加载后滚动到目标消息
+  useEffect(() => {
+    if (!scrollToMessageId || !conversation || visibleMessages.length === 0) return;
+    const idx = visibleMessages.findIndex((m) => m.id === scrollToMessageId);
+    if (idx < 0) return; // 消息不在当前对话中，等待正确对话加载后再触发
+
+    // mountedConvIdRef 由下方独立 effect 维护，此处读到的是上一次渲染后的值
+    const isNewConv = mountedConvIdRef.current !== conversation.id;
+    const targetId = scrollToMessageId;
+
+    const doScroll = () => {
+      virtuosoRef.current?.scrollToIndex({ index: idx, behavior: "auto", align: "center" });
+      if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
+      setHighlightedMessageId(targetId);
+      highlightTimerRef.current = setTimeout(() => setHighlightedMessageId(null), 1000);
+      onScrolledToMessageRef.current?.();
+    };
+
+    if (scrollTimerRef.current) clearTimeout(scrollTimerRef.current);
+    if (isNewConv) {
+      // 新对话：Virtuoso 刚挂载，initialTopMostItemIndex 已定位，给更多时间让列表渲染完毕再校正
+      scrollTimerRef.current = setTimeout(doScroll, 200);
+    } else {
+      // 同一对话：Virtuoso 已挂载，rAF 即可
+      requestAnimationFrame(doScroll);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scrollToMessageId, conversation, visibleMessages]);
+
+  // 独立 effect：在 scroll effect 执行完毕后更新 mountedConvIdRef，供下次判断
+  // 必须定义在 scroll effect 之后，确保 React 先执行 scroll effect 读到旧值，再由本 effect 更新
+  useEffect(() => {
+    mountedConvIdRef.current = conversation?.id;
+  }, [conversation]);
 
   if (!conversation) {
     return (
@@ -661,17 +720,6 @@ export function ChatView({ conversation, mediaDir, mediaVersion = 0 }: ChatViewP
         </div>
       )}
       {(() => {
-        const toRemove = new Set<number>();
-        conversation.messages.forEach((msg, i) => {
-          if (msg.text.includes("action_card_content")) {
-            toRemove.add(i);
-            for (let j = i - 1; j >= 0; j--) {
-              if (conversation.messages[j].role === "user") { toRemove.add(j); break; }
-              if (conversation.messages[j].role === "model") break;
-            }
-          }
-        });
-        const visibleMessages = conversation.messages.filter((_, i) => !toRemove.has(i));
         return visibleMessages.length === 0 ? (
           <div style={{ textAlign: "center", color: t.textMuted, fontSize: 13, marginTop: 60 }}>暂无消息记录</div>
         ) : (
@@ -691,12 +739,13 @@ export function ChatView({ conversation, mediaDir, mediaVersion = 0 }: ChatViewP
               key={`${conversation.id}:${conversation.updatedAt}:${mediaVersion}`}
               data={visibleMessages}
               followOutput="smooth"
-              initialTopMostItemIndex={visibleMessages.length - 1}
+              initialTopMostItemIndex={scrollToMessageId ? Math.max(0, visibleMessages.findIndex((m) => m.id === scrollToMessageId)) : visibleMessages.length - 1}
               itemContent={(_, msg) => (
                 <MessageBubble
                   message={msg}
                   mediaDir={mediaDir}
                   cacheKey={`${conversation.id}:${conversation.updatedAt}:${mediaVersion}`}
+                  isHighlighted={msg.id === highlightedMessageId}
                 />
               )}
               style={{ position: "absolute", inset: 0 }}
@@ -1036,10 +1085,12 @@ function MessageBubble({
   message,
   mediaDir,
   cacheKey,
+  isHighlighted,
 }: {
   message: ConvMessage;
   mediaDir?: string;
   cacheKey: string;
+  isHighlighted?: boolean;
 }) {
   const t = useTheme();
   const isUser = message.role === "user";
@@ -1065,7 +1116,10 @@ function MessageBubble({
             color: isUser ? "#fff" : t.text,
             fontSize: 14,
             lineHeight: 1.55,
-            boxShadow: isUser ? "0 2px 8px rgba(0,113,227,0.22)" : t.isDark ? "0 1px 3px rgba(0,0,0,0.3)" : "0 1px 3px rgba(0,0,0,0.07)",
+            boxShadow: isHighlighted
+              ? (isUser ? "0 0 0 2px rgba(0,113,227,0.8), 0 0 16px 4px rgba(0,113,227,0.5)" : t.isDark ? "0 0 0 2px rgba(99,179,255,0.7), 0 0 16px 4px rgba(99,179,255,0.35)" : "0 0 0 2px rgba(0,113,227,0.6), 0 0 16px 4px rgba(0,113,227,0.25)")
+              : isUser ? "0 2px 8px rgba(0,113,227,0.22)" : t.isDark ? "0 1px 3px rgba(0,0,0,0.3)" : "0 1px 3px rgba(0,0,0,0.07)",
+            transition: "box-shadow 0.3s ease",
             wordBreak: "break-word",
           }}>
             {isUser ? (

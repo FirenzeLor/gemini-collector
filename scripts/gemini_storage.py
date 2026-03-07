@@ -765,15 +765,20 @@ def _build_summary_from_chat_listing(chat, existing=None):
     }
 
 
+_PLAIN_ACTION_CARD_TEXT = "没问题，我可以帮忙。在这些媒体服务提供方中，你想使用哪个？"
+
+def _is_action_card_text(text):
+    return "action_card_content" in text or text.strip() == _PLAIN_ACTION_CARD_TEXT
+
 def _filter_display_rows(msg_rows):
-    """过滤统计/展示用的消息列表：移除 action_card_content 消息及其前一条 user 消息。
+    """过滤统计/展示用的消息列表：移除 action_card_content 消息（含纯文字版）及其前一条 user 消息。
     规则与 Rust 导出侧保持一致。"""
     to_remove = set()
     for i, row in enumerate(msg_rows):
         if not isinstance(row, dict):
             continue
         text = row.get("text") or ""
-        if "action_card_content" in text:
+        if _is_action_card_text(text):
             to_remove.add(i)
             # 向前找最近的 user 消息一并移除
             for j in range(i - 1, -1, -1):

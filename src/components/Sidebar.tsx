@@ -1,6 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
+import { createPortal } from "react-dom";
+import { invoke } from "@tauri-apps/api/core";
 import { Virtuoso } from "react-virtuoso";
-import { ConversationSummary, Account } from "../data/types";
+import { ConversationSummary, Account, SearchResult } from "../data/types";
 import { useTheme } from "../theme";
 
 interface SidebarProps {
@@ -8,7 +10,7 @@ interface SidebarProps {
   conversationSortMode?: "updated_desc" | "size_desc" | "media_desc";
   onToggleConversationSort?: () => void;
   selectedId: string | null;
-  onSelect: (id: string) => void;
+  onSelect: (id: string, messageId?: string) => void;
   collapsed: boolean;
   listSyncing: boolean;
   fullSyncing: boolean;
@@ -66,7 +68,86 @@ export function Sidebar({
   const [showSwitcher, setShowSwitcher] = useState(false);
   const [cancelConfirm, setCancelConfirm] = useState<"list" | "full" | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; convId: string } | null>(null);
+  const [showSearch, setShowSearch] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+  const [searching, setSearching] = useState(false);
+  const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const searchPanelRef = useRef<HTMLDivElement | null>(null);
   const syncingSet = new Set(syncingConversationIds);
+
+  const doSearch = useCallback(async (q: string) => {
+    if (!q.trim()) {
+      setSearchResults([]);
+      setSearching(false);
+      return;
+    }
+    setSearching(true);
+    try {
+      const raw = await invoke<string>("search_conversations", {
+        accountId: currentAccount.id,
+        query: q.trim(),
+        limit: 50,
+      });
+      setSearchResults(JSON.parse(raw) as SearchResult[]);
+    } catch (e) {
+      console.error("搜索失败:", e);
+      setSearchResults([]);
+    } finally {
+      setSearching(false);
+    }
+  }, [currentAccount.id]);
+
+  // debounced search
+  useEffect(() => {
+    if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
+    if (!searchQuery.trim()) {
+      setSearchResults([]);
+      return;
+    }
+    searchTimerRef.current = setTimeout(() => { void doSearch(searchQuery); }, 300);
+    return () => { if (searchTimerRef.current) clearTimeout(searchTimerRef.current); };
+  }, [searchQuery, doSearch]);
+
+  // 切换账号时清空搜索
+  useEffect(() => {
+    setShowSearch(false);
+    setSearchQuery("");
+    setSearchResults([]);
+  }, [currentAccount.id]);
+
+  // 搜索弹窗打开时聚焦输入框
+  useEffect(() => {
+    if (showSearch) {
+      requestAnimationFrame(() => searchInputRef.current?.focus());
+    }
+  }, [showSearch]);
+
+  // 点击弹窗外部关闭搜索
+  useEffect(() => {
+    if (!showSearch) return;
+    function handleClickOutside(e: MouseEvent) {
+      if (searchPanelRef.current && !searchPanelRef.current.contains(e.target as Node)) {
+        setShowSearch(false);
+        setSearchQuery("");
+        setSearchResults([]);
+      }
+    }
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        setShowSearch(false);
+        setSearchQuery("");
+        setSearchResults([]);
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [showSearch]);
   const otherAccounts = accounts.filter((a) => a.id !== currentAccount.id);
   const conversationSortTitle =
     conversationSortMode === "size_desc"
@@ -119,6 +200,35 @@ export function Sidebar({
             对话历史
           </span>
           <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            {/* 搜索按钮 */}
+            <button
+              title="搜索对话内容"
+              onClick={(e) => {
+                e.stopPropagation();
+                setShowSearch(true);
+              }}
+              style={{
+                width: 22,
+                height: 22,
+                borderRadius: 6,
+                border: "none",
+                background: "transparent",
+                cursor: "pointer",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                flexShrink: 0,
+                transition: "background 0.12s",
+              }}
+              onMouseEnter={(e) => {
+                (e.currentTarget as HTMLElement).style.background = t.btnHoverBg;
+              }}
+              onMouseLeave={(e) => {
+                (e.currentTarget as HTMLElement).style.background = "transparent";
+              }}
+            >
+              <SearchIcon color={t.textMuted} />
+            </button>
             {/* 导入按钮 */}
             <button
               title="导入 ZIP 压缩包到当前账号"
@@ -244,6 +354,115 @@ export function Sidebar({
             </button>
           </div>
         </div>
+        {/* 搜索弹窗 — Portal 到 body，全屏居中 */}
+        {showSearch && createPortal(
+          <div style={{
+            position: "fixed",
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            zIndex: 9000,
+            background: t.isDark ? "rgba(0,0,0,0.5)" : "rgba(0,0,0,0.22)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}>
+            <div
+              ref={searchPanelRef}
+              style={{
+                width: 480,
+                maxWidth: "90vw",
+                maxHeight: "70vh",
+                borderRadius: 14,
+                background: t.isDark ? "rgba(36,38,46,0.88)" : "rgba(255,255,255,0.85)",
+                border: `1px solid ${t.divider}`,
+                backdropFilter: "blur(40px) saturate(130%)",
+                WebkitBackdropFilter: "blur(40px) saturate(130%)",
+                boxShadow: t.isDark ? "0 16px 48px rgba(0,0,0,0.55)" : "0 16px 48px rgba(80,104,146,0.28)",
+                display: "flex",
+                flexDirection: "column",
+                overflow: "hidden",
+              }}
+            >
+              <div style={{ padding: "14px 14px 8px", position: "relative" }}>
+                <SearchIcon color={t.textMuted} style={{ position: "absolute", left: 24, top: "50%", transform: "translateY(-50%)", pointerEvents: "none" }} />
+                <style>{`.search-input::placeholder { color: ${t.textMuted}; opacity: 1; }`}</style>
+                <input
+                  ref={searchInputRef}
+                  className="search-input"
+                  type="text"
+                  placeholder="搜索对话内容..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  style={{
+                    width: "100%",
+                    height: 36,
+                    borderRadius: 10,
+                    border: `1px solid ${t.divider}`,
+                    background: t.isDark ? "rgba(255,255,255,0.12)" : "rgba(0,0,0,0.06)",
+                    color: t.text,
+                    fontSize: 13,
+                    paddingLeft: 32,
+                    paddingRight: searchQuery ? 30 : 10,
+                    outline: "none",
+                    boxSizing: "border-box",
+                  }}
+                />
+                {searchQuery && (
+                  <button
+                    onClick={() => setSearchQuery("")}
+                    style={{ position: "absolute", right: 18, top: "50%", transform: "translateY(-50%)", width: 20, height: 20, borderRadius: 6, border: "none", background: "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", color: t.textMuted, fontSize: 15 }}
+                  >
+                    ×
+                  </button>
+                )}
+              </div>
+              <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "0 8px 8px" }}>
+                {searchQuery.trim() ? (
+                  searching ? (
+                    <div style={{ padding: "12px 8px", fontSize: 13, color: t.textMuted }}>搜索中...</div>
+                  ) : searchResults.length === 0 ? (
+                    <div style={{ padding: "12px 8px", fontSize: 13, color: t.textMuted }}>无匹配结果</div>
+                  ) : (
+                    searchResults.map((r, i) => (
+                      <div
+                        key={`${r.conversationId}-${r.messageId}-${i}`}
+                        onClick={() => {
+                          onSelect(r.conversationId, r.messageId);
+                          setShowSearch(false);
+                          setSearchQuery("");
+                          setSearchResults([]);
+                        }}
+                        style={{
+                          padding: "10px 10px",
+                          borderRadius: 8,
+                          margin: "1px 0",
+                          cursor: "pointer",
+                          background: "transparent",
+                          transition: "background 0.12s",
+                        }}
+                        onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = t.hover; }}
+                        onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = "transparent"; }}
+                      >
+                        <div style={{ fontSize: 13, fontWeight: 600, color: t.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginBottom: 4 }}>
+                          {r.title || r.conversationId}
+                        </div>
+                        <div
+                          style={{ fontSize: 12, color: t.textMuted, lineHeight: 1.5, overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}
+                          dangerouslySetInnerHTML={{ __html: r.snippet }}
+                        />
+                      </div>
+                    ))
+                  )
+                ) : (
+                  <div style={{ padding: "12px 8px", fontSize: 13, color: t.textMuted }}>输入关键词搜索对话内容</div>
+                )}
+              </div>
+            </div>
+          </div>,
+          document.body
+        )}
         {conversations.length === 0 ? (
           <div style={{ padding: "10px 14px", fontSize: 12, color: t.textMuted }}>
             暂无列表数据，点击底部列表同步按钮拉取
@@ -661,6 +880,15 @@ function CheckIcon({ color }: { color: string }) {
   return (
     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round">
       <polyline points="20 6 9 17 4 12" />
+    </svg>
+  );
+}
+
+function SearchIcon({ color, style }: { color: string; style?: React.CSSProperties }) {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" style={style}>
+      <circle cx="11" cy="11" r="8" />
+      <line x1="21" y1="21" x2="16.65" y2="16.65" />
     </svg>
   );
 }
