@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef } from "react";
+import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -262,6 +262,8 @@ function App() {
   const [currentAccount, setCurrentAccount] = useState<Account | null>(null);
   const [conversationSummaries, setConversationSummaries] = useState<ConversationSummary[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [scrollToMessageId, setScrollToMessageId] = useState<string | null>(null);
+  const handleScrolledToMessage = useCallback(() => setScrollToMessageId(null), []);
   const [selectedConversation, setSelectedConversation] = useState<Conversation | null>(null);
   const [mediaDir, setMediaDir] = useState<string | undefined>(undefined);
   const [mediaVersion, setMediaVersion] = useState(0);
@@ -995,7 +997,7 @@ function App() {
             })
           }
           selectedId={selectedId}
-          onSelect={setSelectedId}
+          onSelect={(id, messageId) => { setSelectedId(id); setScrollToMessageId(messageId ?? null); }}
           collapsed={sidebarCollapsed}
           listSyncing={listSyncing}
           fullSyncing={fullSyncing}
@@ -1049,7 +1051,7 @@ function App() {
             }}
             authuser={currentAccount.authuser}
           />
-          <ChatView conversation={selectedConversation} mediaDir={mediaDir} mediaVersion={mediaVersion} />
+          <ChatView conversation={selectedConversation} mediaDir={mediaDir} mediaVersion={mediaVersion} scrollToMessageId={scrollToMessageId} onScrolledToMessage={handleScrolledToMessage} />
         </div>
       </div>
       {showExportModal && exportStats && (

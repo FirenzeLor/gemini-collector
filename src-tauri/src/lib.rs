@@ -1,3 +1,4 @@
+mod search;
 mod worker_host;
 
 use std::io::Write;
@@ -659,19 +660,8 @@ fn parse_kelivo_jsonl(path: &Path, media_dir: &Path, after_date: Option<&str>) -
     let mut message_ids: Vec<serde_json::Value> = Vec::new();
     let mut media_ids: Vec<String> = Vec::new();
 
-    // 预先标记需要过滤的索引：含 action_card_content 的消息及其前一条 user 消息
-    let mut to_remove: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    for (i, msg) in messages.iter().enumerate() {
-        let text = msg.get("text").and_then(|v| v.as_str()).unwrap_or("");
-        if text.contains("action_card_content") {
-            to_remove.insert(i);
-            for j in (0..i).rev() {
-                let role = messages[j].get("role").and_then(|v| v.as_str()).unwrap_or("");
-                if role == "user" { to_remove.insert(j); break; }
-                if role == "model" { break; }
-            }
-        }
-    }
+    // 标记需要过滤的索引（规则与搜索索引、前端展示保持一致）
+    let to_remove = search::action_card_indices_to_remove(&messages);
 
     for (i, msg) in messages.iter().enumerate() {
         if to_remove.contains(&i) { continue; }
@@ -1294,11 +1284,26 @@ async fn import_account_zip(
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let zip = PathBuf::from(&zip_path);
 
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         import_account_zip_impl(&data_dir, &account_id, &zip)
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())??;
+
+    // 导入完成后重建搜索索引
+    let data_dir2 = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let account_id2 = serde_json::from_str::<serde_json::Value>(&result)
+        .ok()
+        .and_then(|v| v.get("accountId").and_then(|a| a.as_str()).map(|s| s.to_string()));
+    if let Some(aid) = account_id2 {
+        let account_dir = data_dir2.join("accounts").join(&aid);
+        let conversations_dir = account_dir.join("conversations");
+        if let Ok(conn) = search::open_search_db(&account_dir) {
+            let _ = search::index_all(&conn, &conversations_dir);
+        }
+    }
+
+    Ok(result)
 }
 
 #[tauri::command]
@@ -1355,6 +1360,11 @@ fn delete_conversation(
         }
     }
 
+    // 清理搜索索引
+    if let Ok(conn) = search::open_search_db(&account_dir) {
+        let _ = search::remove_conversation(&conn, &bare_id);
+    }
+
     Ok(())
 }
 
@@ -1393,6 +1403,13 @@ fn clear_account_data(
     }
     if media_manifest_file.exists() {
         std::fs::remove_file(&media_manifest_file).map_err(|e| e.to_string())?;
+    }
+    // 清理搜索索引
+    for suffix in ["", "-wal", "-shm"] {
+        let p = account_dir.join(format!("search.db{}", suffix));
+        if p.exists() {
+            let _ = std::fs::remove_file(&p);
+        }
     }
 
     std::fs::create_dir_all(&conversations_dir).map_err(|e| e.to_string())?;
@@ -1684,6 +1701,73 @@ fn get_account_media_dir(app: tauri::AppHandle, account_id: String) -> Result<St
     Ok(media_dir.to_string_lossy().to_string())
 }
 
+// ── 全文搜索 ──────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn update_search_index(
+    app: tauri::AppHandle,
+    account_id: String,
+    conversation_ids: Vec<String>,
+) -> Result<String, String> {
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let account_dir = data_dir.join("accounts").join(&account_id);
+    let conversations_dir = account_dir.join("conversations");
+
+    let conn = search::open_search_db(&account_dir)?;
+    let mut indexed = 0u32;
+    for cid in &conversation_ids {
+        let bare = normalize_conversation_id(cid);
+        let jsonl = conversations_dir.join(format!("{}.jsonl", bare));
+        if jsonl.exists() {
+            search::index_conversation(&conn, &bare, &jsonl)?;
+            indexed += 1;
+        }
+    }
+    Ok(serde_json::json!({ "indexed": indexed }).to_string())
+}
+
+#[tauri::command]
+fn search_conversations(
+    app: tauri::AppHandle,
+    account_id: String,
+    query: String,
+    limit: Option<u32>,
+) -> Result<String, String> {
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let account_dir = data_dir.join("accounts").join(&account_id);
+    let conversations_dir = account_dir.join("conversations");
+
+    let conn = search::open_search_db(&account_dir)?;
+    // 确保索引是最新的
+    search::index_all(&conn, &conversations_dir)?;
+    let results = search::search_messages(&conn, &query, limit.unwrap_or(50))?;
+    serde_json::to_string(&results).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn rebuild_search_index(app: tauri::AppHandle, account_id: String) -> Result<String, String> {
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let account_dir = data_dir.join("accounts").join(&account_id);
+    let conversations_dir = account_dir.join("conversations");
+
+    // 删除旧 db 强制重建
+    let db_path = account_dir.join("search.db");
+    if db_path.exists() {
+        std::fs::remove_file(&db_path).map_err(|e| e.to_string())?;
+    }
+    // 清理 WAL/SHM
+    for suffix in ["-wal", "-shm"] {
+        let p = account_dir.join(format!("search.db{}", suffix));
+        if p.exists() {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+
+    let conn = search::open_search_db(&account_dir)?;
+    let count = search::index_all(&conn, &conversations_dir)?;
+    Ok(serde_json::json!({ "indexed": count }).to_string())
+}
+
 /// Read one conversation JSONL detail file and return a Conversation object JSON or `null`.
 #[tauri::command]
 fn load_conversation_detail(
@@ -1868,7 +1952,10 @@ pub fn run() {
             delete_conversation,
             load_conversation_summaries,
             get_account_media_dir,
-            load_conversation_detail
+            load_conversation_detail,
+            search_conversations,
+            rebuild_search_index,
+            update_search_index
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
