@@ -548,7 +548,7 @@ function App() {
         const payload = event.payload;
         if (!payload || !payload.type || !payload.state) return;
 
-        if (payload.type === "sync_list") {
+        if (payload.type === "sync_list" || payload.type === "sync_incremental") {
           if (payload.state === "queued" || payload.state === "running") {
             setListSyncing(true);
           } else if (payload.state === "done" || payload.state === "failed" || payload.state === "cancelled") {
@@ -709,11 +709,11 @@ function App() {
     setListSyncing(true);
     try {
       await enqueueJob({
-        type: "sync_list",
+        type: "sync_incremental",
         accountId: currentAccount.id,
       });
     } catch (e) {
-      console.error("同步列表失败:", e);
+      console.error("增量同步失败:", e);
       setListSyncing(false);
     }
   }

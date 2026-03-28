@@ -617,7 +617,7 @@ export function Sidebar({
               }
               if (!fullSyncing) onSyncList();
             }}
-            title={listSyncing ? "点击终止列表同步" : "同步列表"}
+            title={listSyncing ? "点击终止增量同步" : "增量同步（只补最近变化）"}
             style={{
               height: 22,
               borderRadius: 6,
@@ -641,7 +641,7 @@ export function Sidebar({
               (e.currentTarget as HTMLElement).style.background = "transparent";
             }}
           >
-            <span style={{ fontSize: 11, fontWeight: 700, lineHeight: 1, letterSpacing: 0.4 }}>List</span>
+            <span style={{ fontSize: 11, fontWeight: 700, lineHeight: 1, letterSpacing: 0.4 }}>INC</span>
             <SyncIcon spinning={listSyncing} color={listSyncing ? "#0071e3" : t.textSub} small />
           </button>
           <button
@@ -822,5 +822,4 @@ function PendingDot() {
     />
   );
 }
-
 
