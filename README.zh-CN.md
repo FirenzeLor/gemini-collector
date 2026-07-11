@@ -16,6 +16,8 @@ macOS & Windows 原生应用 · 支持多账号 · 亮色 / 暗色主题
 
 </div>
 
+Gemini Collector 将你的全部 **Gemini 聊天记录**——每一条对话、上传的附件，以及 AI 生成的图片、音乐、视频和报告——完整备份为本地离线归档，随时浏览、一键导出。相比 Google Takeout 更省心的 Gemini 数据备份与导出方案。
+
 ---
 
 ## 界面预览

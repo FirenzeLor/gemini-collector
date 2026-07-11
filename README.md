@@ -16,6 +16,8 @@ Native desktop app for macOS & Windows · Multi-account · Light / Dark theme
 
 </div>
 
+Gemini Collector turns your entire **Gemini chat history** into a local offline archive — every conversation, uploaded attachment, and AI-generated image, music track, video, and report is saved to your machine, ready to browse and export anytime. A one-click alternative to Google Takeout for backing up Gemini.
+
 ---
 
 ## Screenshots
